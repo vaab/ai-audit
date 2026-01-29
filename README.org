@@ -1,0 +1,107 @@
+#+TITLE: ai-audit
+
+* Description
+
+CLI tool to audit and monitor AI assistant sessions. Supports Claude Code
+and OpenCode.
+
+* Installation
+
+#+begin_src bash
+cargo install --path .
+#+end_src
+
+This installs the =ai-audit= binary to =~/.cargo/bin/=.
+
+* Usage
+
+** List Sessions
+
+List all available sessions from both Claude Code and OpenCode:
+
+#+begin_src bash
+# List all sessions (chronological order)
+ai-audit list-sessions
+
+# Filter by type
+ai-audit list-sessions -t claudecode
+ai-audit list-sessions -t opencode
+
+# JSON output
+ai-audit list-sessions --json
+#+end_src
+
+Output format (tab-separated):
+#+begin_example
+2026-01-19T14:18:18.363+00:00	ses_42964fa7effeVBExFbcGLmC6Hv	opencode
+2026-01-20T00:42:31.010+00:00	5593c91e-7bcd-4dff-b52f-f6266899f2d4	claudecode
+#+end_example
+
+** Permissions
+
+List permission events for a session (claudecode or opencode):
+
+#+begin_src bash
+# Claude Code session (UUID format)
+ai-audit permissions 5593c91e-7bcd-4dff-b52f-f6266899f2d4
+
+# OpenCode session (ses_ prefix)
+ai-audit permissions ses_426e8c1ceffecECQZeKXvtWNoo
+#+end_src
+
+OpenCode output shows tool calls with permission decisions:
+#+begin_example
+2026-01-20 01:49:03      ASK      bash         axdfguij
+#+end_example
+
+* Output Formats
+
+** Human-readable (default)
+
+#+begin_example
+2026-01-15 00:26:31      INIT         userSettings (41 pre-existing rules loaded)
+2026-01-15 00:28:16      REQUEST      Bash: ls -la ~/.claude/
+2026-01-15 00:28:22      GRANTED      [session] Read(//home/user/work/**)
+2026-01-15 00:32:41      DIR_ACCESS   [session] dirs: /home/user/project
+2026-01-15 00:32:41      MODE         mode -> acceptEdits
+2026-01-15 01:34:57      REQUEST      Edit: /home/user/project/src/main.rs
+2026-01-15 01:35:09      GRANTED      [session] Read(//home/user/.claude/**)
+#+end_example
+
+REQUEST events show the tool name and relevant details (command for Bash,
+file path for Read/Write/Edit, pattern for Glob/Grep) when available.
+
+** NUL-separated (=-0=)
+
+Tab-delimited fields, NUL-terminated records.
+
+| Field     | Description                                       |
+|-----------+---------------------------------------------------|
+| timestamp | UTC float seconds since epoch                     |
+| type      | REQUEST, GRANTED, DIR_ACCESS, MODE                |
+| details   | Type-specific (see below)                         |
+
+Details format by type:
+- REQUEST: =tool\tcommand_or_path= (e.g., =Bash\tls -la=)
+- GRANTED: =destination\trules= (comma-separated)
+- DIR_ACCESS: =destination\tdirectories= (comma-separated)
+- MODE: =mode_value=
+
+** NDJSON (=-j=)
+
+One JSON object per line. Fields by event type:
+
+| Field       | Types                          | Description                          |
+|-------------+--------------------------------+--------------------------------------|
+| timestamp   | all                            | UTC float seconds since epoch        |
+| type        | all                            | request/granted/dir_access/mode_change |
+| tool        | request                        | Tool name (Glob, Grep, Bash, etc.)   |
+| input       | request (optional)             | Full tool input object (command, file_path, etc.) |
+| destination | granted, dir_access            | session/localSettings/userSettings   |
+| rules       | granted                        | Array of permission rules            |
+| directories | dir_access                     | Array of directory paths             |
+| mode        | mode_change                    | New mode value                       |
+
+* License
+
+MIT
