@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod claudecode;
+pub mod cli;
 pub mod config;
 pub mod opencode;
 pub mod rate;

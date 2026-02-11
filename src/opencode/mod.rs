@@ -1,4 +1,6 @@
+pub mod cache;
 pub mod permissions;
+pub mod run;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -53,6 +55,111 @@ struct SessionFile {
     updated_at: i64,
 }
 
+/// Check if a session's messages contain the given text (case-insensitive).
+///
+/// Walks message/<session_id>/ to find message IDs, then checks
+/// part/<msg_id>/ for text parts containing the needle.
+pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
+    let storage_dir = storage_dir();
+    let part_dir = storage_dir.parent().unwrap_or(&storage_dir).join("part");
+    let message_dir = storage_dir
+        .parent()
+        .unwrap_or(&storage_dir)
+        .join("message")
+        .join(session_id);
+
+    session_contains_text_in_dirs(&message_dir, &part_dir, needle)
+}
+
+/// Internal: check message/part dirs for text match (case-insensitive).
+///
+/// Only reads part file contents (not message JSON — the message ID comes
+/// from the filename). Uses a raw text pre-filter to skip JSON parsing on
+/// part files that cannot possibly match.
+fn session_contains_text_in_dirs(
+    message_dir: &std::path::Path,
+    part_dir: &std::path::Path,
+    needle: &str,
+) -> bool {
+    if !message_dir.exists() {
+        return false;
+    }
+
+    let needle_lower = needle.to_lowercase();
+
+    let msg_entries = match fs::read_dir(message_dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    for msg_entry in msg_entries {
+        let msg_entry = match msg_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let msg_path = msg_entry.path();
+        if msg_path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+
+        // Message ID is the filename stem — no need to read the JSON.
+        let msg_id = match msg_path.file_stem() {
+            Some(s) => s.to_string_lossy().to_string(),
+            None => continue,
+        };
+
+        // Check parts for this message
+        let msg_part_dir = part_dir.join(&msg_id);
+        if !msg_part_dir.exists() {
+            continue;
+        }
+
+        let part_entries = match fs::read_dir(&msg_part_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for part_entry in part_entries {
+            let part_entry = match part_entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let part_path = part_entry.path();
+            if part_path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+
+            let raw = match fs::read_to_string(&part_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Fast pre-filter: skip files where needle can't appear.
+            if !raw.to_lowercase().contains(&needle_lower) {
+                continue;
+            }
+
+            // Confirm match is in a text part's "text" field.
+            let part: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if part.get("type").and_then(|t| t.as_str()) != Some("text") {
+                continue;
+            }
+
+            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                if text.to_lowercase().contains(&needle_lower) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     let storage_dir = storage_dir();
     if !storage_dir.exists() {
@@ -64,7 +171,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     for entry in fs::read_dir(&storage_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "json") {
+        if path.extension().is_some_and(|e| e == "json") {
             if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(session_file) = serde_json::from_str::<SessionFile>(&content) {
                     let timestamp = Utc
@@ -82,4 +189,143 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
 
     sessions.sort_by_key(|s| s.timestamp);
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create OpenCode message+part structure for a session.
+    fn create_session_with_messages(
+        base_dir: &std::path::Path,
+        session_id: &str,
+        messages: &[(&str, &[(&str, &str)])], // (msg_id, parts: [(part_id, text)])
+    ) {
+        let message_dir = base_dir.join("message").join(session_id);
+        let part_dir = base_dir.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        for (msg_id, parts) in messages {
+            // Create message file
+            let msg_json = format!(
+                r#"{{"id":"{}","sessionID":"{}","role":"user","time":{{"created":1700000000000}}}}"#,
+                msg_id, session_id
+            );
+            fs::write(message_dir.join(format!("{}.json", msg_id)), msg_json).unwrap();
+
+            // Create parts
+            let msg_part_dir = part_dir.join(msg_id);
+            fs::create_dir_all(&msg_part_dir).unwrap();
+
+            for (part_id, text) in *parts {
+                let part_json = format!(
+                    r#"{{"id":"{}","sessionID":"{}","messageID":"{}","type":"text","text":"{}"}}"#,
+                    part_id, session_id, msg_id, text
+                );
+                fs::write(msg_part_dir.join(format!("{}.json", part_id)), part_json).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_session_contains_text_match() {
+        let temp = tempfile::tempdir().unwrap();
+        create_session_with_messages(
+            temp.path(),
+            "ses_abc",
+            &[("msg_1", &[("prt_1", "Hello world")])],
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "hello"
+        ));
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "WORLD"
+        ));
+        assert!(!session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "goodbye"
+        ));
+    }
+
+    #[test]
+    fn test_session_contains_text_multiple_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        create_session_with_messages(
+            temp.path(),
+            "ses_abc",
+            &[
+                ("msg_1", &[("prt_1", "first message")]),
+                ("msg_2", &[("prt_2", "second with target")]),
+            ],
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "target"
+        ));
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "first"
+        ));
+    }
+
+    #[test]
+    fn test_session_contains_text_no_match() {
+        let temp = tempfile::tempdir().unwrap();
+        create_session_with_messages(
+            temp.path(),
+            "ses_abc",
+            &[("msg_1", &[("prt_1", "some content")])],
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(!session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "absent"
+        ));
+    }
+
+    #[test]
+    fn test_session_contains_text_empty_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        assert!(!session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "anything"
+        ));
+    }
+
+    #[test]
+    fn test_session_contains_text_nonexistent_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let message_dir = temp.path().join("message/ses_missing");
+        let part_dir = temp.path().join("part");
+
+        assert!(!session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "anything"
+        ));
+    }
 }

@@ -53,7 +53,7 @@ pub fn parse_events(session_id: &str) -> Result<Vec<PermissionEvent>> {
         for part_entry in fs::read_dir(&msg_path)? {
             let part_entry = part_entry?;
             let part_path = part_entry.path();
-            if !part_path.extension().map_or(false, |e| e == "json") {
+            if part_path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
 
@@ -150,7 +150,7 @@ fn load_log_decisions() -> Result<Vec<LogDecision>> {
     let mut log_files: Vec<_> = fs::read_dir(&log_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "log"))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
         .collect();
     log_files.sort();
 
@@ -186,15 +186,7 @@ fn find_permission_decision(
     pattern: &str,
     timestamp: DateTime<Utc>,
 ) -> Option<String> {
-    let permission_type = match tool {
-        "bash" => "bash",
-        "read" => "read",
-        "write" => "write",
-        "edit" => "edit",
-        "glob" => "glob",
-        "grep" => "grep",
-        _ => tool,
-    };
+    let permission_type = tool;
 
     // Find a matching decision within a 5-second window
     let tolerance = chrono::Duration::seconds(5);

@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct ToolUse {
@@ -37,7 +37,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
         for file_entry in fs::read_dir(&project_path)? {
             let file_entry = file_entry?;
             let file_path = file_entry.path();
-            if file_path.extension().map_or(false, |e| e == "jsonl") {
+            if file_path.extension().is_some_and(|e| e == "jsonl") {
                 if let Some(stem) = file_path.file_stem() {
                     let session_id = stem.to_string_lossy().to_string();
                     if let Ok(ts) = get_session_first_timestamp(&file_path) {
@@ -55,7 +55,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     Ok(sessions)
 }
 
-fn get_session_first_timestamp(path: &PathBuf) -> Result<DateTime<Utc>> {
+fn get_session_first_timestamp(path: &Path) -> Result<DateTime<Utc>> {
     let file = fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;
@@ -74,6 +74,93 @@ fn get_session_first_timestamp(path: &PathBuf) -> Result<DateTime<Utc>> {
         }
     }
     anyhow::bail!("No timestamp found in session file")
+}
+
+/// Check if a session's messages contain the given text (case-insensitive).
+///
+/// Scans user and assistant message content blocks in the JSONL file.
+pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
+    let session_file = match find_session_file(session_id) {
+        Some(f) => f,
+        None => return false,
+    };
+    file_contains_text(&session_file, needle)
+}
+
+/// Check if a session JSONL file contains the given text in message content (case-insensitive).
+///
+/// Uses a two-pass strategy: first a raw string search to skip files that
+/// cannot possibly match, then a proper JSON parse to confirm the match is
+/// inside a message content field (not metadata).
+fn file_contains_text(path: &Path, needle: &str) -> bool {
+    use std::io::BufRead;
+
+    // Fast path: read raw bytes and check if needle appears at all.
+    // This skips JSON parsing for the vast majority of files.
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let needle_lower = needle.to_lowercase();
+    if !raw.to_lowercase().contains(&needle_lower) {
+        return false;
+    }
+
+    // Slow path: needle is somewhere in the file — confirm it's in message content.
+    let reader = std::io::BufReader::new(raw.as_bytes());
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Quick per-line pre-filter: skip lines that can't contain the needle.
+        if !line.to_lowercase().contains(&needle_lower) {
+            continue;
+        }
+
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only check user and assistant messages
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type != "user" && entry_type != "assistant" {
+            continue;
+        }
+
+        let content = match entry.get("message").and_then(|m| m.get("content")) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        match content {
+            serde_json::Value::String(s) => {
+                if s.to_lowercase().contains(&needle_lower) {
+                    return true;
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for block in arr {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            if text.to_lowercase().contains(&needle_lower) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 pub fn find_session_file(session_uuid: &str) -> Option<PathBuf> {
@@ -174,4 +261,75 @@ pub fn load_tool_uses(session_uuid: &str) -> Result<Vec<ToolUse>> {
     let content = fs::read_to_string(&session_file).context("Failed to read session file")?;
 
     parse_tool_uses(&content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_file_contains_text_user_string_content() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"Hello world"}}}}"#
+        )
+        .unwrap();
+
+        assert!(file_contains_text(file.path(), "hello"));
+        assert!(file_contains_text(file.path(), "WORLD"));
+        assert!(!file_contains_text(file.path(), "goodbye"));
+    }
+
+    #[test]
+    fn test_file_contains_text_assistant_array_content() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"some unique phrase"}}]}}}}"#
+        )
+        .unwrap();
+
+        assert!(file_contains_text(file.path(), "unique phrase"));
+        assert!(!file_contains_text(file.path(), "missing text"));
+    }
+
+    #[test]
+    fn test_file_contains_text_skips_non_message_types() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"summary","summary":"needle in summary"}}"#
+        )
+        .unwrap();
+
+        assert!(!file_contains_text(file.path(), "needle"));
+    }
+
+    #[test]
+    fn test_file_contains_text_multiple_entries() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"first message"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:01.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"second message with target"}}]}}}}"#
+        )
+        .unwrap();
+
+        assert!(file_contains_text(file.path(), "target"));
+        assert!(file_contains_text(file.path(), "first"));
+        assert!(!file_contains_text(file.path(), "absent"));
+    }
+
+    #[test]
+    fn test_file_contains_text_empty_file() {
+        let file = NamedTempFile::new().unwrap();
+        assert!(!file_contains_text(file.path(), "anything"));
+    }
 }

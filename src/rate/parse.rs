@@ -24,10 +24,8 @@ pub struct TestCase {
     pub name: String,
     /// Parsed timespan
     pub timespan: Timespan,
-    /// Content to prepend (may be empty)
-    pub prepend: String,
-    /// Content to append (may be empty)
-    pub append: String,
+    /// Prompt template (with {{TIMESPAN}}, {{DATE}}, etc. variables)
+    pub prompt: String,
     /// List of checklist items (checkbox text without the `- [ ]` prefix)
     pub checklist: Vec<String>,
 }
@@ -54,14 +52,13 @@ pub fn parse_test_file(path: &Path) -> Result<TestCase> {
 /// Parse test content string (used by parse_test_file and tests).
 fn parse_test_content(content: &str) -> Result<TestCase> {
     let (name, timespan) = parse_header(content)?;
-    let (prepend, append) = parse_input_parameters(content)?;
+    let prompt = parse_prompt(content)?;
     let checklist = parse_checklist(content)?;
 
     Ok(TestCase {
         name,
         timespan,
-        prepend,
-        append,
+        prompt,
         checklist,
     })
 }
@@ -128,41 +125,24 @@ fn parse_timespan(s: &str) -> Result<Timespan> {
     })
 }
 
-/// Parse the Input Parameters section to extract Prepend and Append content.
-fn parse_input_parameters(content: &str) -> Result<(String, String)> {
+/// Parse the Prompt section to extract the prompt template.
+fn parse_prompt(content: &str) -> Result<String> {
     let lines: Vec<&str> = content.lines().collect();
 
-    // Find Input Parameters section
-    let input_params_idx = lines
+    // Find Prompt section
+    let prompt_idx = lines
         .iter()
-        .position(|l| l.starts_with("### Input Parameters"))
-        .ok_or_else(|| anyhow::anyhow!("Missing '### Input Parameters' section"))?;
+        .position(|l| l.starts_with("### Prompt"))
+        .ok_or_else(|| anyhow::anyhow!("Missing '### Prompt' section"))?;
 
-    // Find Prepend marker
-    let prepend_marker_idx = lines
-        .iter()
-        .skip(input_params_idx)
-        .position(|l| l.starts_with("**Prepend:**"))
-        .map(|i| i + input_params_idx);
+    // Extract the code block after the Prompt header
+    let prompt = extract_code_block(&lines, prompt_idx + 1)?;
 
-    // Find Append marker
-    let append_marker_idx = lines
-        .iter()
-        .skip(input_params_idx)
-        .position(|l| l.starts_with("**Append:**"))
-        .map(|i| i + input_params_idx);
+    if prompt.is_empty() {
+        bail!("Empty prompt in '### Prompt' section");
+    }
 
-    let prepend = match prepend_marker_idx {
-        Some(idx) => extract_code_block(&lines, idx + 1)?,
-        None => String::new(),
-    };
-
-    let append = match append_marker_idx {
-        Some(idx) => extract_code_block(&lines, idx + 1)?,
-        None => String::new(),
-    };
-
-    Ok((prepend, append))
+    Ok(prompt)
 }
 
 /// Extract content from a code block starting at the given line index.
@@ -171,8 +151,8 @@ fn parse_input_parameters(content: &str) -> Result<(String, String)> {
 fn extract_code_block(lines: &[&str], start_idx: usize) -> Result<String> {
     // Find the opening ```
     let mut block_start = None;
-    for i in start_idx..lines.len() {
-        let line = lines[i].trim();
+    for (i, line) in lines.iter().enumerate().skip(start_idx) {
+        let line = line.trim();
         if line.starts_with("```") {
             block_start = Some(i + 1);
             break;
@@ -190,8 +170,8 @@ fn extract_code_block(lines: &[&str], start_idx: usize) -> Result<String> {
 
     // Find the closing ```
     let mut block_end = None;
-    for i in block_start..lines.len() {
-        if lines[i].trim().starts_with("```") {
+    for (i, line) in lines.iter().enumerate().skip(block_start) {
+        if line.trim().starts_with("```") {
             block_end = Some(i);
             break;
         }
@@ -266,14 +246,8 @@ Verify that deep-segmentation correctly separates different projects.
 
 ## Test Case: Mixed Projects | 2025-06-10 08:04:53..08:16:12
 
-### Input Parameters
+### Prompt
 
-**Prepend:**
-```
-Some prepend content
-```
-
-**Append:**
 ```
 Perform deep segmentation for timespan: {{TIMESPAN}}
 Use date: {{DATE}} start: {{START}} end: {{END}}
@@ -341,32 +315,40 @@ Count passing checkboxes to rate.
     }
 
     #[test]
-    fn test_parse_input_parameters() {
-        let (prepend, append) = parse_input_parameters(SAMPLE_TEST_FILE).unwrap();
+    fn test_parse_prompt() {
+        let prompt = parse_prompt(SAMPLE_TEST_FILE).unwrap();
 
-        assert_eq!(prepend, "Some prepend content");
-        assert!(append.contains("{{TIMESPAN}}"));
-        assert!(append.contains("{{DATE}}"));
+        assert!(prompt.contains("{{TIMESPAN}}"));
+        assert!(prompt.contains("{{DATE}}"));
+        assert!(prompt.contains("{{START}}"));
+        assert!(prompt.contains("{{END}}"));
     }
 
     #[test]
-    fn test_parse_input_parameters_empty_prepend() {
+    fn test_parse_prompt_empty() {
         let content = r#"
-### Input Parameters
+### Prompt
 
-**Prepend:**
 ```
-```
-
-**Append:**
-```
-Some append
 ```
 "#;
-        let (prepend, append) = parse_input_parameters(content).unwrap();
+        let result = parse_prompt(content);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Empty prompt"));
+    }
 
-        assert_eq!(prepend, "");
-        assert_eq!(append, "Some append");
+    #[test]
+    fn test_parse_prompt_missing() {
+        let content = r#"
+### Something Else
+
+```
+content
+```
+"#;
+        let result = parse_prompt(content);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Missing"));
     }
 
     #[test]
@@ -399,8 +381,8 @@ No checkboxes here, just text.
         assert_eq!(test_case.timespan.date, "2025-06-10");
         assert_eq!(test_case.timespan.start, "08:04:53");
         assert_eq!(test_case.timespan.end, "08:16:12");
-        assert_eq!(test_case.prepend, "Some prepend content");
-        assert!(test_case.append.contains("{{TIMESPAN}}"));
+        assert!(test_case.prompt.contains("{{TIMESPAN}}"));
+        assert!(test_case.prompt.contains("{{DATE}}"));
         assert_eq!(test_case.checklist.len(), 3);
     }
 

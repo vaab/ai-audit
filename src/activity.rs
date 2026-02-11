@@ -4,7 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::config::Config;
 
@@ -89,7 +89,7 @@ struct MessageContent {
 
 /// Parse user messages from a Claude Code session JSONL file
 pub fn parse_claudecode_messages(
-    session_path: &PathBuf,
+    session_path: &Path,
     config: &Config,
 ) -> Result<Vec<ActivityEvent>> {
     let file = fs::File::open(session_path)
@@ -178,8 +178,8 @@ pub fn parse_claudecode_messages(
 
 /// Parse permission grants from a Claude Code debug log
 pub fn parse_claudecode_permissions(
-    debug_path: &PathBuf,
-    session_path: Option<&PathBuf>,
+    debug_path: &Path,
+    session_path: Option<&Path>,
     config: &Config,
 ) -> Result<Vec<ActivityEvent>> {
     let content = fs::read_to_string(debug_path)
@@ -233,7 +233,7 @@ pub fn parse_claudecode_permissions(
 }
 
 /// Get project path from first entry in session file
-fn get_project_path_from_session(session_path: &PathBuf, config: &Config) -> Result<String> {
+fn get_project_path_from_session(session_path: &Path, config: &Config) -> Result<String> {
     let file = fs::File::open(session_path)?;
     let reader = BufReader::new(file);
 
@@ -259,7 +259,7 @@ fn get_project_path_from_session(session_path: &PathBuf, config: &Config) -> Res
 /// Try to infer project path from debug file path
 /// Debug files are in ~/.claude/debug/<session-id>.txt
 /// We can try to find the corresponding session file
-fn get_project_path_from_debug_path(debug_path: &PathBuf, config: &Config) -> Option<String> {
+fn get_project_path_from_debug_path(debug_path: &Path, config: &Config) -> Option<String> {
     let session_id = debug_path.file_stem()?.to_string_lossy();
     let session_file = crate::claudecode::session::find_session_file(&session_id)?;
 
@@ -275,6 +275,7 @@ fn get_project_path_from_debug_path(debug_path: &PathBuf, config: &Config) -> Op
 struct OpenCodeSession {
     id: String,
     directory: Option<String>,
+    #[allow(dead_code)]
     time: OpenCodeTime,
 }
 
@@ -282,6 +283,7 @@ struct OpenCodeSession {
 #[derive(Debug, Deserialize)]
 struct OpenCodeMessage {
     id: String,
+    #[allow(dead_code)]
     #[serde(rename = "sessionID")]
     session_id: String,
     role: Option<String>,
@@ -294,8 +296,10 @@ struct OpenCodePart {
     #[serde(rename = "type")]
     part_type: Option<String>,
     text: Option<String>,
+    #[allow(dead_code)]
     #[serde(rename = "messageID")]
     message_id: String,
+    #[allow(dead_code)]
     #[serde(rename = "sessionID")]
     session_id: String,
 }
@@ -303,6 +307,7 @@ struct OpenCodePart {
 #[derive(Debug, Deserialize)]
 struct OpenCodeTime {
     created: i64,
+    #[allow(dead_code)]
     #[serde(default)]
     updated: Option<i64>,
 }
@@ -316,7 +321,7 @@ pub fn parse_opencode_messages(config: &Config) -> Result<Vec<ActivityEvent>> {
 /// Parse user messages from OpenCode storage at a specific directory
 /// (Internal function, also used for testing)
 fn parse_opencode_messages_from_dir(
-    storage_dir: &PathBuf,
+    storage_dir: &Path,
     config: &Config,
 ) -> Result<Vec<ActivityEvent>> {
     let message_dir = storage_dir.join("message");
@@ -342,7 +347,7 @@ fn parse_opencode_messages_from_dir(
             for session_file in fs::read_dir(&project_path)? {
                 let session_file = session_file?;
                 let path = session_file.path();
-                if path.extension().map_or(false, |e| e == "json") {
+                if path.extension().is_some_and(|e| e == "json") {
                     if let Ok(content) = fs::read_to_string(&path) {
                         if let Ok(session) = serde_json::from_str::<OpenCodeSession>(&content) {
                             if let Some(dir) = session.directory {
@@ -378,7 +383,7 @@ fn parse_opencode_messages_from_dir(
         for msg_entry in fs::read_dir(&session_path)? {
             let msg_entry = msg_entry?;
             let msg_path = msg_entry.path();
-            if !msg_path.extension().map_or(false, |e| e == "json") {
+            if msg_path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
 
@@ -428,7 +433,7 @@ fn parse_opencode_messages_from_dir(
 }
 
 /// Get message content from OpenCode parts
-fn get_opencode_message_content(part_dir: &PathBuf, message_id: &str) -> Result<String> {
+fn get_opencode_message_content(part_dir: &Path, message_id: &str) -> Result<String> {
     let msg_part_dir = part_dir.join(message_id);
     if !msg_part_dir.exists() {
         return Ok(String::new());
@@ -439,7 +444,7 @@ fn get_opencode_message_content(part_dir: &PathBuf, message_id: &str) -> Result<
     for part_entry in fs::read_dir(&msg_part_dir)? {
         let part_entry = part_entry?;
         let part_path = part_entry.path();
-        if !part_path.extension().map_or(false, |e| e == "json") {
+        if part_path.extension().is_none_or(|e| e != "json") {
             continue;
         }
 
@@ -484,7 +489,7 @@ fn list_opencode_identifiers(config: &Config, identifiers: &mut Vec<String>) -> 
         for session_file in fs::read_dir(&project_path)? {
             let session_file = session_file?;
             let path = session_file.path();
-            if !path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
 
@@ -580,8 +585,8 @@ fn decode_project_dir_name(name: &str) -> String {
     let with_hidden = name.replace("--", "\x00HIDDEN\x00");
 
     // Replace leading - with /
-    let path = if with_hidden.starts_with('-') {
-        format!("/{}", &with_hidden[1..])
+    let path = if let Some(stripped) = with_hidden.strip_prefix('-') {
+        format!("/{}", stripped)
     } else {
         with_hidden
     };
@@ -623,11 +628,11 @@ pub fn fetch_activities(
                 for file_entry in fs::read_dir(&project_path)? {
                     let file_entry = file_entry?;
                     let file_path = file_entry.path();
-                    if file_path.extension().map_or(false, |e| e == "jsonl") {
+                    if file_path.extension().is_some_and(|e| e == "jsonl") {
                         // Skip subagent directories
                         if file_path
                             .parent()
-                            .map_or(false, |p| p.file_name().map_or(false, |n| n == "subagents"))
+                            .is_some_and(|p| p.file_name().is_some_and(|n| n == "subagents"))
                         {
                             continue;
                         }
@@ -657,14 +662,14 @@ pub fn fetch_activities(
                 for entry in fs::read_dir(&debug_dir)? {
                     let entry = entry?;
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "txt") {
+                    if path.extension().is_some_and(|e| e == "txt") {
                         let session_id = path.file_stem().map(|s| s.to_string_lossy().to_string());
                         let session_file = session_id
                             .as_ref()
                             .and_then(|id| crate::claudecode::session::find_session_file(id));
 
                         if let Ok(events) =
-                            parse_claudecode_permissions(&path, session_file.as_ref(), config)
+                            parse_claudecode_permissions(&path, session_file.as_deref(), config)
                         {
                             for event in events {
                                 if event.timestamp >= start_ts
@@ -682,16 +687,14 @@ pub fn fetch_activities(
     }
 
     // OpenCode sessions
-    if filter.include_opencode {
-        if filter.include_messages {
-            if let Ok(events) = parse_opencode_messages(config) {
-                for event in events {
-                    if event.timestamp >= start_ts
-                        && event.timestamp <= end_ts
-                        && filter.matches_ident(&event.ident)
-                    {
-                        all_events.push(event);
-                    }
+    if filter.include_opencode && filter.include_messages {
+        if let Ok(events) = parse_opencode_messages(config) {
+            for event in events {
+                if event.timestamp >= start_ts
+                    && event.timestamp <= end_ts
+                    && filter.matches_ident(&event.ident)
+                {
+                    all_events.push(event);
                 }
             }
         }
@@ -798,7 +801,7 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
 pub fn format_timestamp_display(ts: i64) -> String {
     let dt = DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.with_timezone(&chrono::Local))
-        .unwrap_or_else(|| chrono::Local::now());
+        .unwrap_or_else(chrono::Local::now);
 
     dt.format("%Y-%m-%dT%H:%M:%S%z").to_string()
 }
