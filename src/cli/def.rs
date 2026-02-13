@@ -78,6 +78,10 @@ pub enum Commands {
         #[arg(short, long)]
         search: Option<String>,
 
+        /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
+        #[arg(long)]
+        timespan: Option<String>,
+
         #[command(flatten)]
         output: OutputOpts,
     },

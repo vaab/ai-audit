@@ -16,12 +16,38 @@ struct SessionRecord {
     session_type: &'static str,
 }
 
+/// Parsed timespan bounds as UTC epoch seconds.
+struct TimespanFilter {
+    start: i64,
+    end: i64,
+}
+
+impl TimespanFilter {
+    fn contains(&self, timestamp_secs: f64) -> bool {
+        let ts = timestamp_secs as i64;
+        ts >= self.start && ts <= self.end
+    }
+}
+
 pub fn run(
     session_type: Option<SessionType>,
     search: Option<&str>,
+    timespan: Option<&str>,
     format: OutputFormat,
     quiet: bool,
 ) -> Result<()> {
+    let ts_filter = match timespan {
+        Some(ts_str) => {
+            let (start, end) = kal_time::parse_timespan(ts_str)
+                .map_err(|e| anyhow::anyhow!("Failed to parse timespan '{}': {}", ts_str, e))?;
+            Some(TimespanFilter {
+                start: start.timestamp(),
+                end: end.timestamp(),
+            })
+        }
+        None => None,
+    };
+
     let mut sessions: Vec<SessionRecord> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -32,14 +58,20 @@ pub fn run(
         match claudecode::session::list_sessions() {
             Ok(cc_sessions) => {
                 for s in cc_sessions {
+                    let ts = s.timestamp.timestamp() as f64
+                        + s.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                    if let Some(ref filter) = ts_filter {
+                        if !filter.contains(ts) {
+                            continue;
+                        }
+                    }
                     if let Some(needle) = search {
                         if !claudecode::session::session_contains_text(&s.session_id, needle) {
                             continue;
                         }
                     }
                     sessions.push(SessionRecord {
-                        timestamp: s.timestamp.timestamp() as f64
-                            + s.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0,
+                        timestamp: ts,
                         session_id: s.session_id,
                         session_type: "claudecode",
                     });
@@ -55,14 +87,20 @@ pub fn run(
         match opencode::list_sessions() {
             Ok(oc_sessions) => {
                 for s in oc_sessions {
+                    let ts = s.timestamp.timestamp() as f64
+                        + s.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                    if let Some(ref filter) = ts_filter {
+                        if !filter.contains(ts) {
+                            continue;
+                        }
+                    }
                     if let Some(needle) = search {
                         if !opencode::session_contains_text(&s.session_id, needle) {
                             continue;
                         }
                     }
                     sessions.push(SessionRecord {
-                        timestamp: s.timestamp.timestamp() as f64
-                            + s.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0,
+                        timestamp: ts,
                         session_id: s.session_id,
                         session_type: "opencode",
                     });

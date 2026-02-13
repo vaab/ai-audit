@@ -15,8 +15,15 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
         Commands::ListSessions {
             session_type,
             search,
+            timespan,
             output,
-        } => list_sessions::run(session_type, search.as_deref(), output.format(), quiet),
+        } => list_sessions::run(
+            session_type,
+            search.as_deref(),
+            timespan.as_deref(),
+            output.format(),
+            quiet,
+        ),
         Commands::Activity { action } => activity::run(action),
         Commands::Rate {
             instruction,
