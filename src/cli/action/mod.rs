@@ -50,6 +50,32 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             let session_id = resolve_session(session)?;
             transcript::run(&session_id, last, output.format(), _verbose)
         }
+        Commands::CurrentSession { output } => {
+            let detected = crate::session_detect::detect_current_session()?;
+            let format = output.format();
+            match format {
+                crate::OutputFormat::Json => {
+                    let provider = match detected.provider {
+                        crate::session_detect::Provider::OpenCode => "opencode",
+                        crate::session_detect::Provider::ClaudeCode => "claudecode",
+                    };
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "session_id": detected.session_id,
+                            "provider": provider,
+                        })
+                    );
+                }
+                crate::OutputFormat::Nul => {
+                    print!("{}\0", detected.session_id);
+                }
+                crate::OutputFormat::Human => {
+                    println!("{}", detected.session_id);
+                }
+            }
+            Ok(())
+        }
         Commands::Activity { action } => activity::run(action),
         Commands::Rate {
             instruction,

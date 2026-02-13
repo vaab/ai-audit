@@ -107,6 +107,11 @@ pub enum Commands {
         #[command(flatten)]
         output: OutputOpts,
     },
+    /// Detect and print the current AI session ID
+    CurrentSession {
+        #[command(flatten)]
+        output: OutputOpts,
+    },
     /// Rate agent instructions against test cases
     Rate {
         /// Path to agent instruction file (system prompt)
