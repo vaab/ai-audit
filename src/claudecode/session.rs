@@ -73,6 +73,11 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
 /// Since `-` is ambiguous (could be path separator or literal `-` in
 /// directory names), we resolve by checking if the decoded path exists
 /// on the filesystem, trying the longest segments first.
+/// Public wrapper for `decode_project_dir_name` (used by session detection).
+pub fn decode_project_dir_name_pub(encoded: &str) -> String {
+    decode_project_dir_name(encoded)
+}
+
 fn decode_project_dir_name(encoded: &str) -> String {
     // Strip leading '-' which represents the root '/'
     let stripped = encoded.strip_prefix('-').unwrap_or(encoded);

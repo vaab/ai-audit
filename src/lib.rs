@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod opencode;
 pub mod rate;
+pub mod session_detect;
 pub mod transcript;
 
 use std::path::PathBuf;

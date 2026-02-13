@@ -96,8 +96,9 @@ pub enum Commands {
     },
     /// Display full session transcript
     Transcript {
-        /// Session ID (UUID for Claude Code, ses_* for OpenCode)
-        session: String,
+        /// Session ID (UUID for Claude Code, ses_* for OpenCode).
+        /// If omitted, auto-detects the current session.
+        session: Option<String>,
 
         /// Show only the last N entries
         #[arg(short = 'n', long)]

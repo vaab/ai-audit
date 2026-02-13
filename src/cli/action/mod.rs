@@ -10,6 +10,21 @@ use anyhow::Result;
 
 use super::def::Commands;
 
+/// Resolve a session ID: use explicit value if given, else auto-detect.
+fn resolve_session(explicit: Option<String>) -> Result<String> {
+    match explicit {
+        Some(id) => Ok(id),
+        None => {
+            let detected = crate::session_detect::detect_current_session()?;
+            eprintln!(
+                "Auto-detected session: {} ({:?})",
+                detected.session_id, detected.provider
+            );
+            Ok(detected.session_id)
+        }
+    }
+}
+
 pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
     match cmd {
         Commands::Permissions { session, output } => permissions::run(&session, output.format()),
@@ -31,7 +46,10 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             session,
             last,
             output,
-        } => transcript::run(&session, last, output.format(), _verbose),
+        } => {
+            let session_id = resolve_session(session)?;
+            transcript::run(&session_id, last, output.format(), _verbose)
+        }
         Commands::Activity { action } => activity::run(action),
         Commands::Rate {
             instruction,
