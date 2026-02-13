@@ -55,7 +55,7 @@ struct SessionFile {
     updated_at: i64,
 }
 
-/// Check if a session's messages contain the given text (case-insensitive).
+/// Check if a session's messages contain the given text.
 ///
 /// Walks message/<session_id>/ to find message IDs, then checks
 /// part/<msg_id>/ for text parts containing the needle.
@@ -71,7 +71,7 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     session_contains_text_in_dirs(&message_dir, &part_dir, needle)
 }
 
-/// Internal: check message/part dirs for text match (case-insensitive).
+/// Internal: check message/part dirs for text match.
 ///
 /// Only reads part file contents (not message JSON — the message ID comes
 /// from the filename). Uses a raw text pre-filter to skip JSON parsing on
@@ -84,8 +84,6 @@ fn session_contains_text_in_dirs(
     if !message_dir.exists() {
         return false;
     }
-
-    let needle_lower = needle.to_lowercase();
 
     let msg_entries = match fs::read_dir(message_dir) {
         Ok(entries) => entries,
@@ -135,7 +133,7 @@ fn session_contains_text_in_dirs(
             };
 
             // Fast pre-filter: skip files where needle can't appear.
-            if !raw.to_lowercase().contains(&needle_lower) {
+            if !raw.contains(needle) {
                 continue;
             }
 
@@ -150,7 +148,7 @@ fn session_contains_text_in_dirs(
             }
 
             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                if text.to_lowercase().contains(&needle_lower) {
+                if text.contains(needle) {
                     return true;
                 }
             }
@@ -242,9 +240,14 @@ mod tests {
         assert!(session_contains_text_in_dirs(
             &message_dir,
             &part_dir,
-            "hello"
+            "Hello"
         ));
         assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "world"
+        ));
+        assert!(!session_contains_text_in_dirs(
             &message_dir,
             &part_dir,
             "WORLD"

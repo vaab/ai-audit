@@ -76,7 +76,7 @@ fn get_session_first_timestamp(path: &Path) -> Result<DateTime<Utc>> {
     anyhow::bail!("No timestamp found in session file")
 }
 
-/// Check if a session's messages contain the given text (case-insensitive).
+/// Check if a session's messages contain the given text.
 ///
 /// Scans user and assistant message content blocks in the JSONL file.
 pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
@@ -87,7 +87,7 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     file_contains_text(&session_file, needle)
 }
 
-/// Check if a session JSONL file contains the given text in message content (case-insensitive).
+/// Check if a session JSONL file contains the given text in message content.
 ///
 /// Uses a two-pass strategy: first a raw string search to skip files that
 /// cannot possibly match, then a proper JSON parse to confirm the match is
@@ -101,8 +101,7 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
         Ok(r) => r,
         Err(_) => return false,
     };
-    let needle_lower = needle.to_lowercase();
-    if !raw.to_lowercase().contains(&needle_lower) {
+    if !raw.contains(needle) {
         return false;
     }
 
@@ -119,7 +118,7 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
         }
 
         // Quick per-line pre-filter: skip lines that can't contain the needle.
-        if !line.to_lowercase().contains(&needle_lower) {
+        if !line.contains(needle) {
             continue;
         }
 
@@ -141,7 +140,7 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
 
         match content {
             serde_json::Value::String(s) => {
-                if s.to_lowercase().contains(&needle_lower) {
+                if s.contains(needle) {
                     return true;
                 }
             }
@@ -149,7 +148,7 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
                 for block in arr {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            if text.to_lowercase().contains(&needle_lower) {
+                            if text.contains(needle) {
                                 return true;
                             }
                         }
@@ -278,8 +277,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(file_contains_text(file.path(), "hello"));
-        assert!(file_contains_text(file.path(), "WORLD"));
+        assert!(file_contains_text(file.path(), "Hello"));
+        assert!(file_contains_text(file.path(), "world"));
+        assert!(!file_contains_text(file.path(), "WORLD"));
         assert!(!file_contains_text(file.path(), "goodbye"));
     }
 
