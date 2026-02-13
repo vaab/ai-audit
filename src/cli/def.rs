@@ -141,6 +141,10 @@ pub enum ActivityAction {
         #[arg(name = "IDENT")]
         identifiers: Vec<String>,
 
+        /// Filter by session ID(s) (can be repeated)
+        #[arg(short, long = "session")]
+        sessions: Vec<String>,
+
         #[command(flatten)]
         output: OutputOpts,
     },

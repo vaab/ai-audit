@@ -31,6 +31,8 @@ pub struct ActivityEvent {
     pub timestamp: i64,
     /// Identifier: CLIENT-TYPE@PROJECT_PATH (e.g., claude-msg@rs/ai-audit)
     pub ident: String,
+    /// Session ID (UUID for Claude Code, ses_* for OpenCode)
+    pub session_id: String,
     /// Activity type
     pub activity_type: ActivityType,
     /// The activity data (for JSON output)
@@ -96,6 +98,11 @@ pub fn parse_claudecode_messages(
         .with_context(|| format!("Failed to open session file: {}", session_path.display()))?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
+
+    let session_id = session_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     for line in reader.lines() {
         let line = line?;
@@ -168,6 +175,7 @@ pub fn parse_claudecode_messages(
         events.push(ActivityEvent {
             timestamp,
             ident,
+            session_id: session_id.clone(),
             activity_type: ActivityType::Message,
             data: ActivityData::Message { content },
         });
@@ -198,6 +206,11 @@ pub fn parse_claudecode_permissions(
         .or_else(|| get_project_path_from_debug_path(debug_path, config))
         .unwrap_or_else(|| "unknown".to_string());
 
+    let session_id = debug_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
     for cap in re.captures_iter(&content) {
         let timestamp_str = &cap[1];
         let rules_str = &cap[2];
@@ -224,6 +237,7 @@ pub fn parse_claudecode_permissions(
         events.push(ActivityEvent {
             timestamp,
             ident,
+            session_id: session_id.clone(),
             activity_type: ActivityType::Permission,
             data: ActivityData::Permission { rules },
         });
@@ -421,6 +435,7 @@ fn parse_opencode_messages_from_dir(
             events.push(ActivityEvent {
                 timestamp,
                 ident,
+                session_id: session_id.clone(),
                 activity_type: ActivityType::Message,
                 data: ActivityData::Message {
                     content: msg_content,
@@ -604,6 +619,7 @@ pub fn fetch_activities(
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
     identifiers: &[String],
+    session_ids: &[String],
 ) -> Result<Vec<ActivityEvent>> {
     let start_ts = start.timestamp();
     let end_ts = end.timestamp();
@@ -698,6 +714,11 @@ pub fn fetch_activities(
                 }
             }
         }
+    }
+
+    // Apply session ID filter
+    if !session_ids.is_empty() {
+        all_events.retain(|e| session_ids.iter().any(|sid| e.session_id == *sid));
     }
 
     // Sort by timestamp
@@ -932,6 +953,7 @@ mod tests {
         let event = ActivityEvent {
             timestamp: 0,
             ident: "test".to_string(),
+            session_id: "test-session".to_string(),
             activity_type: ActivityType::Message,
             data: ActivityData::Message {
                 content: "Hello world".to_string(),
@@ -946,6 +968,7 @@ mod tests {
         let event = ActivityEvent {
             timestamp: 0,
             ident: "test".to_string(),
+            session_id: "test-session".to_string(),
             activity_type: ActivityType::Message,
             data: ActivityData::Message {
                 content: long_content,
@@ -961,6 +984,7 @@ mod tests {
         let event = ActivityEvent {
             timestamp: 0,
             ident: "test".to_string(),
+            session_id: "test-session".to_string(),
             activity_type: ActivityType::Message,
             data: ActivityData::Message {
                 content: "Line 1\nLine 2\nLine 3".to_string(),
@@ -975,6 +999,7 @@ mod tests {
         let event = ActivityEvent {
             timestamp: 0,
             ident: "test".to_string(),
+            session_id: "test-session".to_string(),
             activity_type: ActivityType::Permission,
             data: ActivityData::Permission {
                 rules: vec!["rule1".to_string(), "rule2".to_string()],
@@ -1482,5 +1507,182 @@ mod tests {
         assert_eq!(events.len(), 1);
         // Should use "unknown" as project path
         assert!(events[0].ident.contains("unknown"));
+    }
+
+    // =========================================================================
+    // Session ID population tests
+    // =========================================================================
+
+    #[test]
+    fn test_claudecode_messages_session_id_from_filename() {
+        let config = default_config();
+        let dir = tempdir().unwrap();
+        let session_file = dir.path().join("abc-def-1234.jsonl");
+
+        fs::write(
+            &session_file,
+            r#"{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{"role":"user","content":"Hello"},"cwd":"/project"}"#,
+        )
+        .unwrap();
+
+        let events = parse_claudecode_messages(&session_file, &config).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "abc-def-1234");
+    }
+
+    #[test]
+    fn test_claudecode_permissions_session_id_from_filename() {
+        let config = default_config();
+        let dir = tempdir().unwrap();
+        let debug_file = dir.path().join("my-session-uuid.txt");
+
+        fs::write(
+            &debug_file,
+            r#"2024-01-15T10:30:00.123Z [DEBUG] Applying permission update: Adding 1 allow rule(s) for this session: ["Bash(git:*)"]"#,
+        )
+        .unwrap();
+
+        let events = parse_claudecode_permissions(&debug_file, None, &config).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "my-session-uuid");
+    }
+
+    #[test]
+    fn test_opencode_messages_session_id() {
+        let config = default_config();
+        let temp = tempdir().unwrap();
+
+        create_opencode_storage(
+            temp.path(),
+            "ses_abc123",
+            "/home/user/project",
+            &[("msg_001", "user", 1705314600000, vec![("prt_001", "Hello")])],
+        )
+        .unwrap();
+
+        let events =
+            parse_opencode_messages_from_dir(&temp.path().join("storage"), &config).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "ses_abc123");
+    }
+
+    #[test]
+    fn test_session_filter_retains_matching() {
+        let events = vec![
+            ActivityEvent {
+                timestamp: 100,
+                ident: "claudecode-msg@project".to_string(),
+                session_id: "session-A".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "msg A".to_string(),
+                },
+            },
+            ActivityEvent {
+                timestamp: 200,
+                ident: "claudecode-msg@project".to_string(),
+                session_id: "session-B".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "msg B".to_string(),
+                },
+            },
+            ActivityEvent {
+                timestamp: 300,
+                ident: "claudecode-msg@project".to_string(),
+                session_id: "session-A".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "msg A2".to_string(),
+                },
+            },
+        ];
+
+        // Filter to session-A only
+        let session_ids = vec!["session-A".to_string()];
+        let mut filtered = events.clone();
+        filtered.retain(|e| session_ids.iter().any(|sid| e.session_id == *sid));
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].session_id, "session-A");
+        assert_eq!(filtered[1].session_id, "session-A");
+    }
+
+    #[test]
+    fn test_session_filter_empty_keeps_all() {
+        let events = vec![
+            ActivityEvent {
+                timestamp: 100,
+                ident: "test".to_string(),
+                session_id: "session-A".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "msg".to_string(),
+                },
+            },
+            ActivityEvent {
+                timestamp: 200,
+                ident: "test".to_string(),
+                session_id: "session-B".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "msg".to_string(),
+                },
+            },
+        ];
+
+        // Empty filter keeps all
+        let session_ids: Vec<String> = vec![];
+        let mut filtered = events.clone();
+        if !session_ids.is_empty() {
+            filtered.retain(|e| session_ids.iter().any(|sid| e.session_id == *sid));
+        }
+
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_session_filter_multiple_session_ids() {
+        let events = vec![
+            ActivityEvent {
+                timestamp: 100,
+                ident: "test".to_string(),
+                session_id: "session-A".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "a".to_string(),
+                },
+            },
+            ActivityEvent {
+                timestamp: 200,
+                ident: "test".to_string(),
+                session_id: "session-B".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "b".to_string(),
+                },
+            },
+            ActivityEvent {
+                timestamp: 300,
+                ident: "test".to_string(),
+                session_id: "session-C".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "c".to_string(),
+                },
+            },
+        ];
+
+        // Filter to A and C
+        let session_ids = vec!["session-A".to_string(), "session-C".to_string()];
+        let mut filtered = events.clone();
+        filtered.retain(|e| session_ids.iter().any(|sid| e.session_id == *sid));
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].session_id, "session-A");
+        assert_eq!(filtered[1].session_id, "session-C");
     }
 }

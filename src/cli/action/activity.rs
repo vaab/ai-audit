@@ -13,6 +13,7 @@ struct ActivityRecord<'a> {
     /// UTC timestamp as float seconds since epoch
     timestamp: f64,
     ident: &'a str,
+    session_id: &'a str,
     #[serde(flatten)]
     data: &'a crate::activity::ActivityData,
 }
@@ -48,12 +49,13 @@ pub fn run(action: ActivityAction) -> Result<()> {
         ActivityAction::Get {
             timespan,
             identifiers,
+            sessions,
             output,
         } => {
             let (start, end) = kal_time::parse_timespan(&timespan)
                 .map_err(|e| anyhow::anyhow!("Failed to parse timespan '{}': {}", timespan, e))?;
 
-            let events = activity::fetch_activities(&config, start, end, &identifiers)?;
+            let events = activity::fetch_activities(&config, start, end, &identifiers, &sessions)?;
             let format = output.format();
 
             let stdout = io::stdout();
@@ -65,23 +67,33 @@ pub fn run(action: ActivityAction) -> Result<()> {
                         let record = ActivityRecord {
                             timestamp: event.timestamp as f64,
                             ident: &event.ident,
+                            session_id: &event.session_id,
                             data: &event.data,
                         };
                         writeln!(handle, "{}", serde_json::to_string(&record)?)?;
                     }
                 }
                 OutputFormat::Nul => {
-                    // Format: timestamp\0ident\0json_data\0
+                    // Format: timestamp\0ident\0session_id\0json_data\0
                     for event in events {
                         let json = serde_json::to_string(&event.data)?;
-                        write!(handle, "{}\0{}\0{}\0", event.timestamp, event.ident, json)?;
+                        write!(
+                            handle,
+                            "{}\0{}\0{}\0{}\0",
+                            event.timestamp, event.ident, event.session_id, json
+                        )?;
                     }
                 }
                 OutputFormat::Human => {
                     for event in events {
                         let timestamp_str = activity::format_timestamp_display(event.timestamp);
                         let summary = activity::activity_summary(&event);
-                        writeln!(handle, "{} {} {}", timestamp_str, event.ident, summary)?;
+                        let short_session = truncate_session_id(&event.session_id);
+                        writeln!(
+                            handle,
+                            "{} {} [{}] {}",
+                            timestamp_str, event.ident, short_session, summary
+                        )?;
                     }
                 }
             }
@@ -89,4 +101,45 @@ pub fn run(action: ActivityAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Truncate a session ID for human-readable display.
+///
+/// UUIDs are shortened to their first 8 characters; other formats
+/// (e.g., OpenCode `ses_*`) are kept as-is.
+fn truncate_session_id(session_id: &str) -> &str {
+    // UUIDs are 36 chars (8-4-4-4-12 with dashes)
+    if session_id.len() == 36 && session_id.chars().nth(8) == Some('-') {
+        &session_id[..8]
+    } else {
+        session_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_uuid() {
+        assert_eq!(
+            truncate_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+            "a1b2c3d4"
+        );
+    }
+
+    #[test]
+    fn test_truncate_opencode_session_id() {
+        assert_eq!(truncate_session_id("ses_abc123"), "ses_abc123");
+    }
+
+    #[test]
+    fn test_truncate_short_id() {
+        assert_eq!(truncate_session_id("short"), "short");
+    }
+
+    #[test]
+    fn test_truncate_empty() {
+        assert_eq!(truncate_session_id(""), "");
+    }
 }
