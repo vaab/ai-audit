@@ -191,7 +191,7 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
             Err(_) => continue,
         };
 
-        // Only check user and assistant messages
+        // Check user and assistant messages (text, tool_use, tool_result)
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if entry_type != "user" && entry_type != "assistant" {
             continue;
@@ -210,12 +210,8 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
             }
             serde_json::Value::Array(arr) => {
                 for block in arr {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            if text.contains(needle) {
-                                return true;
-                            }
-                        }
+                    if content_block_contains(block, needle) {
+                        return true;
                     }
                 }
             }
@@ -224,6 +220,57 @@ fn file_contains_text(path: &Path, needle: &str) -> bool {
     }
 
     false
+}
+
+/// Check if a content block (text, tool_use, or tool_result) contains the needle.
+fn content_block_contains(block: &serde_json::Value, needle: &str) -> bool {
+    let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match block_type {
+        "text" => block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains(needle)),
+        "tool_use" => {
+            // Check tool name
+            if block
+                .get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.contains(needle))
+            {
+                return true;
+            }
+            // Check input (serialized as string for search)
+            if let Some(input) = block.get("input") {
+                let input_str = input.to_string();
+                if input_str.contains(needle) {
+                    return true;
+                }
+            }
+            false
+        }
+        "tool_result" => {
+            // tool_result content can be a string or array of blocks
+            if let Some(content) = block.get("content") {
+                match content {
+                    serde_json::Value::String(s) => return s.contains(needle),
+                    serde_json::Value::Array(arr) => {
+                        for item in arr {
+                            if item
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|t| t.contains(needle))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 pub fn find_session_file(session_uuid: &str) -> Option<PathBuf> {
@@ -395,5 +442,45 @@ mod tests {
     fn test_file_contains_text_empty_file() {
         let file = NamedTempFile::new().unwrap();
         assert!(!file_contains_text(file.path(), "anything"));
+    }
+
+    #[test]
+    fn test_file_contains_text_tool_use_name() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{"command":"cargo build"}}}}]}}}}"#
+        )
+        .unwrap();
+
+        assert!(file_contains_text(file.path(), "Bash"));
+        assert!(file_contains_text(file.path(), "cargo build"));
+        assert!(!file_contains_text(file.path(), "npm"));
+    }
+
+    #[test]
+    fn test_file_contains_text_tool_result() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"abc","content":"Compiling ai-audit v0.1.0"}}]}}}}"#
+        )
+        .unwrap();
+
+        assert!(file_contains_text(file.path(), "Compiling ai-audit"));
+        assert!(!file_contains_text(file.path(), "error"));
+    }
+
+    #[test]
+    fn test_file_contains_text_tool_result_array_content() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"abc","content":[{{"type":"text","text":"test result output"}}]}}]}}}}"#
+        )
+        .unwrap();
+
+        assert!(file_contains_text(file.path(), "test result output"));
+        assert!(!file_contains_text(file.path(), "missing"));
     }
 }

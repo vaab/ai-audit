@@ -96,6 +96,46 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     session_contains_text_in_dirs(&message_dir, &part_dir, needle)
 }
 
+/// Check if an OpenCode part JSON contains the needle in searchable fields.
+///
+/// Searches:
+/// - `text` parts: the `text` field
+/// - `tool` parts: the tool name and `state.input` (serialized)
+/// - `tool` parts with output: `state.output` (serialized)
+fn part_contains_needle(part: &serde_json::Value, needle: &str) -> bool {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match part_type {
+        "text" => part
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains(needle)),
+        "tool" => {
+            // Check tool name
+            if part
+                .get("tool")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains(needle))
+            {
+                return true;
+            }
+            // Check state.input (serialized)
+            if let Some(input) = part.get("state").and_then(|s| s.get("input")) {
+                if input.to_string().contains(needle) {
+                    return true;
+                }
+            }
+            // Check state.output (serialized)
+            if let Some(output) = part.get("state").and_then(|s| s.get("output")) {
+                if output.to_string().contains(needle) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Internal: check message/part dirs for text match.
 ///
 /// Only reads part file contents (not message JSON — the message ID comes
@@ -162,20 +202,14 @@ fn session_contains_text_in_dirs(
                 continue;
             }
 
-            // Confirm match is in a text part's "text" field.
+            // Confirm match is in a searchable field of the part.
             let part: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            if part.get("type").and_then(|t| t.as_str()) != Some("text") {
-                continue;
-            }
-
-            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                if text.contains(needle) {
-                    return true;
-                }
+            if part_contains_needle(&part, needle) {
+                return true;
             }
         }
     }
@@ -368,6 +402,113 @@ mod tests {
             &message_dir,
             &part_dir,
             "anything"
+        ));
+    }
+
+    /// Helper to create a raw part file with arbitrary JSON content.
+    fn create_raw_part(
+        base_dir: &std::path::Path,
+        session_id: &str,
+        msg_id: &str,
+        part_id: &str,
+        part_json: &str,
+    ) {
+        let message_dir = base_dir.join("message").join(session_id);
+        let part_dir = base_dir.join("part").join(msg_id);
+        fs::create_dir_all(&message_dir).unwrap();
+        fs::create_dir_all(&part_dir).unwrap();
+
+        // Create message file if it doesn't exist
+        let msg_file = message_dir.join(format!("{}.json", msg_id));
+        if !msg_file.exists() {
+            fs::write(
+                &msg_file,
+                format!(
+                    r#"{{"id":"{}","sessionID":"{}","role":"assistant","time":{{"created":1700000000000}}}}"#,
+                    msg_id, session_id
+                ),
+            )
+            .unwrap();
+        }
+
+        fs::write(part_dir.join(format!("{}.json", part_id)), part_json).unwrap();
+    }
+
+    #[test]
+    fn test_session_search_finds_tool_name() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls -la"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "bash"
+        ));
+        assert!(!session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "grep"
+        ));
+    }
+
+    #[test]
+    fn test_session_search_finds_tool_input() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"cargo test --release"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "cargo test"
+        ));
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "--release"
+        ));
+        assert!(!session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "npm install"
+        ));
+    }
+
+    #[test]
+    fn test_session_search_finds_tool_output() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"echo hello"},"output":"hello world output"}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_contains_text_in_dirs(
+            &message_dir,
+            &part_dir,
+            "hello world output"
         ));
     }
 }
