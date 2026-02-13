@@ -25,9 +25,12 @@ struct TimespanFilter {
 }
 
 impl TimespanFilter {
-    fn contains(&self, timestamp_secs: f64) -> bool {
-        let ts = timestamp_secs as i64;
-        ts >= self.start && ts <= self.end
+    /// Check if a session's [started, updated] range overlaps with the filter.
+    /// A session is included if any of its activity falls within the timespan.
+    fn overlaps(&self, started_secs: f64, updated_secs: f64) -> bool {
+        let started = started_secs as i64;
+        let updated = updated_secs as i64;
+        started <= self.end && updated >= self.start
     }
 }
 
@@ -78,15 +81,18 @@ pub fn run(
         match claudecode::session::list_sessions() {
             Ok(cc_sessions) => {
                 for s in cc_sessions {
-                    let ts = s.timestamp.timestamp() as f64
-                        + s.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    if let Some(ref filter) = ts_filter {
-                        if !filter.contains(ts) {
+                    // Filters: cheapest first (project, timespan, then search)
+                    if let Some(ref expected) = project_path {
+                        if s.project_dir != *expected {
                             continue;
                         }
                     }
-                    if let Some(ref expected) = project_path {
-                        if s.project_dir != *expected {
+                    let started = s.started_at.timestamp() as f64
+                        + s.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                    let updated = s.updated_at.timestamp() as f64
+                        + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                    if let Some(ref filter) = ts_filter {
+                        if !filter.overlaps(started, updated) {
                             continue;
                         }
                     }
@@ -96,7 +102,7 @@ pub fn run(
                         }
                     }
                     sessions.push(SessionRecord {
-                        timestamp: ts,
+                        timestamp: started,
                         session_id: s.session_id,
                         session_type: "claudecode",
                         project_dir: s.project_dir,
@@ -113,15 +119,18 @@ pub fn run(
         match opencode::list_sessions() {
             Ok(oc_sessions) => {
                 for s in oc_sessions {
-                    let ts = s.timestamp.timestamp() as f64
-                        + s.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    if let Some(ref filter) = ts_filter {
-                        if !filter.contains(ts) {
+                    // Filters: cheapest first (project, timespan, then search)
+                    if let Some(ref expected) = project_path {
+                        if s.project_dir != *expected {
                             continue;
                         }
                     }
-                    if let Some(ref expected) = project_path {
-                        if s.project_dir != *expected {
+                    let started = s.started_at.timestamp() as f64
+                        + s.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                    let updated = s.updated_at.timestamp() as f64
+                        + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                    if let Some(ref filter) = ts_filter {
+                        if !filter.overlaps(started, updated) {
                             continue;
                         }
                     }
@@ -131,7 +140,7 @@ pub fn run(
                         }
                     }
                     sessions.push(SessionRecord {
-                        timestamp: ts,
+                        timestamp: started,
                         session_id: s.session_id,
                         session_type: "opencode",
                         project_dir: s.project_dir,

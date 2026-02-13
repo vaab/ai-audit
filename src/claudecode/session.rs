@@ -16,7 +16,10 @@ pub struct ToolUse {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub session_id: String,
-    pub timestamp: DateTime<Utc>,
+    /// Timestamp of the first entry in the session
+    pub started_at: DateTime<Utc>,
+    /// Timestamp of the last entry in the session
+    pub updated_at: DateTime<Utc>,
     /// Project directory path (decoded from folder name)
     pub project_dir: String,
 }
@@ -49,10 +52,13 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
             if file_path.extension().is_some_and(|e| e == "jsonl") {
                 if let Some(stem) = file_path.file_stem() {
                     let session_id = stem.to_string_lossy().to_string();
-                    if let Ok(ts) = get_session_first_timestamp(&file_path) {
+                    if let Ok(started_at) = get_session_first_timestamp(&file_path) {
+                        let updated_at =
+                            get_session_last_timestamp(&file_path).unwrap_or(started_at);
                         sessions.push(SessionInfo {
                             session_id,
-                            timestamp: ts,
+                            started_at,
+                            updated_at,
                             project_dir: project_dir.clone(),
                         });
                     }
@@ -61,7 +67,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
         }
     }
 
-    sessions.sort_by_key(|s| s.timestamp);
+    sessions.sort_by_key(|s| s.started_at);
     Ok(sessions)
 }
 
@@ -117,6 +123,42 @@ fn decode_project_dir_name(encoded: &str) -> String {
     }
 
     result
+}
+
+/// Get the last timestamp from a session JSONL file.
+///
+/// Reads the last non-empty lines from the end of the file looking for a
+/// timestamp. This is efficient because JSONL entries are appended, so the
+/// last entry has the most recent timestamp.
+fn get_session_last_timestamp(path: &Path) -> Result<DateTime<Utc>> {
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+
+    // Read the last 8KB — enough to contain the last few entries
+    let read_from = file_len.saturating_sub(8192);
+    let mut reader = std::io::BufReader::new(file);
+    reader.seek(SeekFrom::Start(read_from))?;
+
+    let mut last_ts: Option<DateTime<Utc>> = None;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(ts_str) = entry.get("timestamp").and_then(|v| v.as_str()) {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
+                    last_ts = Some(dt.with_timezone(&Utc));
+                }
+            }
+        }
+    }
+    last_ts.ok_or_else(|| anyhow::anyhow!("No timestamp found in session file"))
 }
 
 fn get_session_first_timestamp(path: &Path) -> Result<DateTime<Utc>> {

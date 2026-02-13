@@ -38,7 +38,8 @@ pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
 
     Ok(SessionInfo {
         session_id: session_data.session_id,
-        timestamp,
+        started_at: timestamp,
+        updated_at: timestamp,
         project_dir: session_data.directory,
     })
 }
@@ -46,7 +47,10 @@ pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub session_id: String,
-    pub timestamp: DateTime<Utc>,
+    /// Timestamp of session creation
+    pub started_at: DateTime<Utc>,
+    /// Timestamp of last update
+    pub updated_at: DateTime<Utc>,
     /// Project directory path
     pub project_dir: String,
 }
@@ -239,18 +243,21 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
             }
             if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(session) = serde_json::from_str::<FullSessionFile>(&content) {
-                    let ts_millis = if session.time.updated > 0 {
-                        session.time.updated
-                    } else {
-                        session.time.created
-                    };
-                    let timestamp = Utc
-                        .timestamp_millis_opt(ts_millis)
+                    let started_at = Utc
+                        .timestamp_millis_opt(session.time.created)
                         .single()
                         .unwrap_or_else(Utc::now);
+                    let updated_at = if session.time.updated > 0 {
+                        Utc.timestamp_millis_opt(session.time.updated)
+                            .single()
+                            .unwrap_or(started_at)
+                    } else {
+                        started_at
+                    };
                     sessions.push(SessionInfo {
                         session_id: session.id,
-                        timestamp,
+                        started_at,
+                        updated_at,
                         project_dir: session.directory,
                     });
                 }
@@ -258,7 +265,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
         }
     }
 
-    sessions.sort_by_key(|s| s.timestamp);
+    sessions.sort_by_key(|s| s.started_at);
     Ok(sessions)
 }
 
