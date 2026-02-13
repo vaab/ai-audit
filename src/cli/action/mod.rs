@@ -17,20 +17,22 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             session_type,
             search,
             timespan,
+            project,
             output,
         } => list_sessions::run(
             session_type,
             search.as_deref(),
             timespan.as_deref(),
+            project.as_deref(),
             output.format(),
             quiet,
         ),
-        Commands::Activity { action } => activity::run(action),
         Commands::Transcript {
             session,
             last,
             output,
         } => transcript::run(&session, last, output.format(), _verbose),
+        Commands::Activity { action } => activity::run(action),
         Commands::Rate {
             instruction,
             test,

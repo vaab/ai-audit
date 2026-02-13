@@ -82,6 +82,10 @@ pub enum Commands {
         #[arg(long)]
         timespan: Option<String>,
 
+        /// Filter by project path (substring match, e.g., "ai-audit")
+        #[arg(short, long)]
+        project: Option<String>,
+
         #[command(flatten)]
         output: OutputOpts,
     },

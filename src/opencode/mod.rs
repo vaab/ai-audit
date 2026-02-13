@@ -39,6 +39,7 @@ pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
     Ok(SessionInfo {
         session_id: session_data.session_id,
         timestamp,
+        project_dir: session_data.directory,
     })
 }
 
@@ -46,14 +47,37 @@ pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
 pub struct SessionInfo {
     pub session_id: String,
     pub timestamp: DateTime<Utc>,
+    /// Project directory path
+    pub project_dir: String,
 }
 
+/// Session file from `storage/directory-agents/` (minimal metadata).
 #[derive(Deserialize)]
 struct SessionFile {
     #[serde(rename = "sessionID")]
     session_id: String,
     #[serde(rename = "updatedAt")]
     updated_at: i64,
+    #[serde(default)]
+    directory: String,
+}
+
+/// Full session file from `storage/session/<project_hash>/` (has directory, title, etc.).
+#[derive(Deserialize)]
+struct FullSessionFile {
+    id: String,
+    #[serde(default)]
+    directory: String,
+    #[serde(default)]
+    time: SessionTime,
+}
+
+#[derive(Deserialize, Default)]
+struct SessionTime {
+    #[serde(default)]
+    created: i64,
+    #[serde(default)]
+    updated: i64,
 }
 
 /// Check if a session's messages contain the given text.
@@ -160,26 +184,40 @@ fn session_contains_text_in_dirs(
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
-    let storage_dir = storage_dir();
-    if !storage_dir.exists() {
+    let session_base = crate::opencode_data_dir().join("storage/session");
+    if !session_base.exists() {
         return Ok(Vec::new());
     }
 
     let mut sessions = Vec::new();
 
-    for entry in fs::read_dir(&storage_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
+    // Scan storage/session/<project_hash>/ses_*.json
+    for project_entry in fs::read_dir(&session_base)? {
+        let project_entry = project_entry?;
+        if !project_entry.path().is_dir() {
+            continue;
+        }
+        for file_entry in fs::read_dir(project_entry.path())? {
+            let file_entry = file_entry?;
+            let path = file_entry.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
             if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(session_file) = serde_json::from_str::<SessionFile>(&content) {
+                if let Ok(session) = serde_json::from_str::<FullSessionFile>(&content) {
+                    let ts_millis = if session.time.updated > 0 {
+                        session.time.updated
+                    } else {
+                        session.time.created
+                    };
                     let timestamp = Utc
-                        .timestamp_millis_opt(session_file.updated_at)
+                        .timestamp_millis_opt(ts_millis)
                         .single()
                         .unwrap_or_else(Utc::now);
                     sessions.push(SessionInfo {
-                        session_id: session_file.session_id,
+                        session_id: session.id,
                         timestamp,
+                        project_dir: session.directory,
                     });
                 }
             }

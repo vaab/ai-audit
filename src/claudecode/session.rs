@@ -17,6 +17,8 @@ pub struct ToolUse {
 pub struct SessionInfo {
     pub session_id: String,
     pub timestamp: DateTime<Utc>,
+    /// Project directory path (decoded from folder name)
+    pub project_dir: String,
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
@@ -34,6 +36,13 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
             continue;
         }
 
+        let project_dir = decode_project_dir_name(
+            &project_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+        );
+
         for file_entry in fs::read_dir(&project_path)? {
             let file_entry = file_entry?;
             let file_path = file_entry.path();
@@ -44,6 +53,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
                         sessions.push(SessionInfo {
                             session_id,
                             timestamp: ts,
+                            project_dir: project_dir.clone(),
                         });
                     }
                 }
@@ -53,6 +63,55 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
 
     sessions.sort_by_key(|s| s.timestamp);
     Ok(sessions)
+}
+
+/// Decode a Claude Code project directory name back to a filesystem path.
+///
+/// Claude Code encodes paths by replacing `/` with `-`, e.g.
+/// `-home-vaab-dev-rs-ai-audit` → `/home/vaab/dev/rs/ai-audit`.
+///
+/// Since `-` is ambiguous (could be path separator or literal `-` in
+/// directory names), we resolve by checking if the decoded path exists
+/// on the filesystem, trying the longest segments first.
+fn decode_project_dir_name(encoded: &str) -> String {
+    // Strip leading '-' which represents the root '/'
+    let stripped = encoded.strip_prefix('-').unwrap_or(encoded);
+    let parts: Vec<&str> = stripped.split('-').collect();
+    if parts.is_empty() {
+        return encoded.to_string();
+    }
+
+    // Greedy left-to-right: try to merge parts into path components
+    // by checking if the resulting path prefix exists
+    let mut result = String::from("/");
+    let mut i = 0;
+
+    while i < parts.len() {
+        // Try merging from current position: longest match first
+        let mut best_end = i + 1;
+        for end in (i + 1..=parts.len()).rev() {
+            let candidate_component = parts[i..end].join("-");
+            let candidate_path = if result == "/" {
+                format!("/{}", candidate_component)
+            } else {
+                format!("{}/{}", result, candidate_component)
+            };
+            if std::path::Path::new(&candidate_path).exists() {
+                best_end = end;
+                break;
+            }
+        }
+
+        let component = parts[i..best_end].join("-");
+        if result == "/" {
+            result = format!("/{}", component);
+        } else {
+            result = format!("{}/{}", result, component);
+        }
+        i = best_end;
+    }
+
+    result
 }
 
 fn get_session_first_timestamp(path: &Path) -> Result<DateTime<Utc>> {

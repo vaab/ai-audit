@@ -14,6 +14,7 @@ struct SessionRecord {
     session_id: String,
     #[serde(rename = "type")]
     session_type: &'static str,
+    project_dir: String,
 }
 
 /// Parsed timespan bounds as UTC epoch seconds.
@@ -33,6 +34,7 @@ pub fn run(
     session_type: Option<SessionType>,
     search: Option<&str>,
     timespan: Option<&str>,
+    project: Option<&str>,
     format: OutputFormat,
     quiet: bool,
 ) -> Result<()> {
@@ -65,6 +67,11 @@ pub fn run(
                             continue;
                         }
                     }
+                    if let Some(needle) = project {
+                        if !s.project_dir.contains(needle) {
+                            continue;
+                        }
+                    }
                     if let Some(needle) = search {
                         if !claudecode::session::session_contains_text(&s.session_id, needle) {
                             continue;
@@ -74,6 +81,7 @@ pub fn run(
                         timestamp: ts,
                         session_id: s.session_id,
                         session_type: "claudecode",
+                        project_dir: s.project_dir,
                     });
                 }
             }
@@ -94,6 +102,11 @@ pub fn run(
                             continue;
                         }
                     }
+                    if let Some(needle) = project {
+                        if !s.project_dir.contains(needle) {
+                            continue;
+                        }
+                    }
                     if let Some(needle) = search {
                         if !opencode::session_contains_text(&s.session_id, needle) {
                             continue;
@@ -103,6 +116,7 @@ pub fn run(
                         timestamp: ts,
                         session_id: s.session_id,
                         session_type: "opencode",
+                        project_dir: s.project_dir,
                     });
                 }
             }
@@ -127,11 +141,11 @@ pub fn run(
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             for s in &sessions {
-                // Format: timestamp\0session_id\0type\0
+                // Format: timestamp\0session_id\0type\0project_dir\0
                 write!(
                     handle,
-                    "{}\0{}\0{}\0",
-                    s.timestamp, s.session_id, s.session_type
+                    "{}\0{}\0{}\0{}\0",
+                    s.timestamp, s.session_id, s.session_type, s.project_dir
                 )?;
             }
         }
@@ -143,7 +157,13 @@ pub fn run(
                     ((s.timestamp.fract()) * 1_000_000_000.0) as u32,
                 )
                 .unwrap_or_default();
-                println!("{}\t{}\t{}", dt.to_rfc3339(), s.session_id, s.session_type);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    dt.to_rfc3339(),
+                    s.session_id,
+                    s.session_type,
+                    s.project_dir
+                );
             }
         }
     }
