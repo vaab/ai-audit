@@ -90,6 +90,18 @@ pub enum Commands {
         #[command(subcommand)]
         action: ActivityAction,
     },
+    /// Display full session transcript
+    Transcript {
+        /// Session ID (UUID for Claude Code, ses_* for OpenCode)
+        session: String,
+
+        /// Show only the last N entries
+        #[arg(short = 'n', long)]
+        last: Option<usize>,
+
+        #[command(flatten)]
+        output: OutputOpts,
+    },
     /// Rate agent instructions against test cases
     Rate {
         /// Path to agent instruction file (system prompt)

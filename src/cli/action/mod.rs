@@ -4,6 +4,7 @@ mod activity;
 mod list_sessions;
 mod permissions;
 mod rate;
+mod transcript;
 
 use anyhow::Result;
 
@@ -25,6 +26,11 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             quiet,
         ),
         Commands::Activity { action } => activity::run(action),
+        Commands::Transcript {
+            session,
+            last,
+            output,
+        } => transcript::run(&session, last, output.format(), _verbose),
         Commands::Rate {
             instruction,
             test,

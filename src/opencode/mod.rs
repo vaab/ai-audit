@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod permissions;
 pub mod run;
+pub mod transcript;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
