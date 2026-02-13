@@ -82,7 +82,7 @@ pub enum Commands {
         #[arg(long)]
         timespan: Option<String>,
 
-        /// Filter by project path (substring match, e.g., "ai-audit")
+        /// Filter by project path (exact match; can be relative, e.g., "." or "../fyl")
         #[arg(short, long)]
         project: Option<String>,
 

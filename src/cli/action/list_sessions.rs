@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
+use std::path::PathBuf;
 
 use super::super::def::SessionType;
 use crate::{claudecode, opencode, OutputFormat};
@@ -50,6 +51,23 @@ pub fn run(
         None => None,
     };
 
+    // Resolve --project to an absolute path for exact matching
+    let project_path: Option<String> = match project {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            let abs = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            // Canonicalize to resolve symlinks and ../ components;
+            // fall back to the joined path if the directory doesn't exist.
+            let resolved = abs.canonicalize().unwrap_or(abs);
+            Some(resolved.to_string_lossy().to_string())
+        }
+        None => None,
+    };
+
     let mut sessions: Vec<SessionRecord> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -67,8 +85,8 @@ pub fn run(
                             continue;
                         }
                     }
-                    if let Some(needle) = project {
-                        if !s.project_dir.contains(needle) {
+                    if let Some(ref expected) = project_path {
+                        if s.project_dir != *expected {
                             continue;
                         }
                     }
@@ -102,8 +120,8 @@ pub fn run(
                             continue;
                         }
                     }
-                    if let Some(needle) = project {
-                        if !s.project_dir.contains(needle) {
+                    if let Some(ref expected) = project_path {
+                        if s.project_dir != *expected {
                             continue;
                         }
                     }
