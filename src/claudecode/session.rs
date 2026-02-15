@@ -22,7 +22,12 @@ pub struct SessionInfo {
     pub updated_at: DateTime<Utc>,
     /// Project directory path (decoded from folder name)
     pub project_dir: String,
+    /// Title derived from the first user message (truncated)
+    pub title: String,
 }
+
+/// Maximum character length for session titles extracted from first user message.
+const MAX_TITLE_LEN: usize = 80;
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     let projects_dir = crate::claudecode::projects_dir();
@@ -55,11 +60,13 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
                     if let Ok(started_at) = get_session_first_timestamp(&file_path) {
                         let updated_at =
                             get_session_last_timestamp(&file_path).unwrap_or(started_at);
+                        let title = get_first_user_message_text(&file_path).unwrap_or_default();
                         sessions.push(SessionInfo {
                             session_id,
                             started_at,
                             updated_at,
                             project_dir: project_dir.clone(),
+                            title,
                         });
                     }
                 }
@@ -180,6 +187,83 @@ fn get_session_first_timestamp(path: &Path) -> Result<DateTime<Utc>> {
         }
     }
     anyhow::bail!("No timestamp found in session file")
+}
+
+/// Extract the text of the first user message from a session JSONL file.
+///
+/// Reads lines from the beginning until a `"type":"user"` entry is found,
+/// then extracts its text content. The result is truncated to [`MAX_TITLE_LEN`]
+/// characters at a word boundary and suffixed with "..." if truncated.
+/// Newlines within the text are replaced with spaces.
+fn get_first_user_message_text(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Quick pre-filter: only parse lines that look like user messages
+        if !line.contains("\"type\":\"user\"") {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if entry.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let content = match entry.get("message").and_then(|m| m.get("content")) {
+            Some(c) => c,
+            None => continue,
+        };
+        let text = extract_user_text(content);
+        if text.is_empty() {
+            continue;
+        }
+        return Ok(truncate_title(&text));
+    }
+    anyhow::bail!("No user message found in session file")
+}
+
+/// Extract plain text from a Claude Code message content field.
+///
+/// Content may be a plain string or an array of content blocks.
+fn extract_user_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.replace('\n', " "),
+        serde_json::Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if block_type == "text" {
+                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                        parts.push(text.replace('\n', " "));
+                    }
+                }
+            }
+            parts.join(" ")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Truncate a title to [`MAX_TITLE_LEN`] characters at a word boundary.
+///
+/// If the title exceeds the limit, it is cut at the last space before the
+/// limit and "..." is appended.
+fn truncate_title(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= MAX_TITLE_LEN {
+        return trimmed.to_string();
+    }
+    // Find last space before the limit
+    let truncated = &trimmed[..MAX_TITLE_LEN];
+    let cut_at = truncated.rfind(' ').unwrap_or(MAX_TITLE_LEN);
+    format!("{}...", &trimmed[..cut_at])
 }
 
 /// Check if a session's messages contain the given text.
@@ -678,6 +762,114 @@ mod tests {
     fn test_file_tail_contains_text_empty_file() {
         let file = NamedTempFile::new().unwrap();
         assert!(!file_tail_contains_text(file.path(), "anything", 5));
+    }
+
+    // === Title extraction tests ===
+
+    #[test]
+    fn test_get_first_user_message_string_content() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"Hello, can you help me with Rust?"}}}}"#
+        )
+        .unwrap();
+
+        let title = get_first_user_message_text(file.path()).unwrap();
+        assert_eq!(title, "Hello, can you help me with Rust?");
+    }
+
+    #[test]
+    fn test_get_first_user_message_array_content() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"Add dark mode to the app"}}]}}}}"#
+        )
+        .unwrap();
+
+        let title = get_first_user_message_text(file.path()).unwrap();
+        assert_eq!(title, "Add dark mode to the app");
+    }
+
+    #[test]
+    fn test_get_first_user_message_skips_non_user_entries() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, r#"{{"type":"summary","summary":"some summary"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"assistant text"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:01.000Z","message":{{"role":"user","content":"actual user question"}}}}"#
+        )
+        .unwrap();
+
+        let title = get_first_user_message_text(file.path()).unwrap();
+        assert_eq!(title, "actual user question");
+    }
+
+    #[test]
+    fn test_get_first_user_message_returns_first_only() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"first question"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:01.000Z","message":{{"role":"user","content":"second question"}}}}"#
+        )
+        .unwrap();
+
+        let title = get_first_user_message_text(file.path()).unwrap();
+        assert_eq!(title, "first question");
+    }
+
+    #[test]
+    fn test_get_first_user_message_empty_file() {
+        let file = NamedTempFile::new().unwrap();
+        assert!(get_first_user_message_text(file.path()).is_err());
+    }
+
+    #[test]
+    fn test_get_first_user_message_replaces_newlines() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"line one\nline two\nline three"}}}}"#
+        )
+        .unwrap();
+
+        let title = get_first_user_message_text(file.path()).unwrap();
+        assert_eq!(title, "line one line two line three");
+    }
+
+    #[test]
+    fn test_truncate_title_short_text() {
+        assert_eq!(truncate_title("short title"), "short title");
+    }
+
+    #[test]
+    fn test_truncate_title_exact_limit() {
+        let text = "a".repeat(MAX_TITLE_LEN);
+        assert_eq!(truncate_title(&text), text);
+    }
+
+    #[test]
+    fn test_truncate_title_long_text_at_word_boundary() {
+        let text = format!("{} {}", "word".repeat(15), "end".repeat(10));
+        let result = truncate_title(&text);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= MAX_TITLE_LEN + 3); // +3 for "..."
+    }
+
+    #[test]
+    fn test_truncate_title_trims_whitespace() {
+        assert_eq!(truncate_title("  hello world  "), "hello world");
     }
 
     #[test]

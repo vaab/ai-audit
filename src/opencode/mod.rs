@@ -41,6 +41,7 @@ pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
         started_at: timestamp,
         updated_at: timestamp,
         project_dir: session_data.directory,
+        title: String::new(),
     })
 }
 
@@ -53,6 +54,8 @@ pub struct SessionInfo {
     pub updated_at: DateTime<Utc>,
     /// Project directory path
     pub project_dir: String,
+    /// Session title (from session metadata)
+    pub title: String,
 }
 
 /// Session file from `storage/directory-agents/` (minimal metadata).
@@ -72,6 +75,8 @@ struct FullSessionFile {
     id: String,
     #[serde(default)]
     directory: String,
+    #[serde(default)]
+    title: String,
     #[serde(default)]
     time: SessionTime,
 }
@@ -294,6 +299,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
                         started_at,
                         updated_at,
                         project_dir: session.directory,
+                        title: session.title,
                     });
                 }
             }

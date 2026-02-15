@@ -16,6 +16,7 @@ struct SessionRecord {
     #[serde(rename = "type")]
     session_type: &'static str,
     project_dir: String,
+    title: String,
 }
 
 /// Parsed timespan bounds as UTC epoch seconds.
@@ -106,6 +107,7 @@ pub fn run(
                         session_id: s.session_id,
                         session_type: "claudecode",
                         project_dir: s.project_dir,
+                        title: s.title,
                     });
                 }
             }
@@ -144,6 +146,7 @@ pub fn run(
                         session_id: s.session_id,
                         session_type: "opencode",
                         project_dir: s.project_dir,
+                        title: s.title,
                     });
                 }
             }
@@ -168,29 +171,72 @@ pub fn run(
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             for s in &sessions {
-                // Format: timestamp\0session_id\0type\0project_dir\0
+                // Format: timestamp\0session_id\0type\0project_dir\0title\0
                 write!(
                     handle,
-                    "{}\0{}\0{}\0{}\0",
-                    s.timestamp, s.session_id, s.session_type, s.project_dir
+                    "{}\0{}\0{}\0{}\0{}\0",
+                    s.timestamp, s.session_id, s.session_type, s.project_dir, s.title
                 )?;
             }
         }
         OutputFormat::Human => {
+            let home_dir = dirs::home_dir().unwrap_or_default();
+            let home_prefix = format!("{}/", home_dir.display());
+            // Convert to local timezone for human display
+            let to_local = |ts: f64| -> chrono::DateTime<chrono::Local> {
+                chrono::DateTime::from_timestamp(ts as i64, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Local)
+            };
+            // Show time only when the timespan filter covers a single calendar day
+            // (checked in local time since kal_time produces local boundaries),
+            // or when all sessions happen to fall on the same local day.
+            let same_day = if let Some(ref filter) = ts_filter {
+                let start_local = to_local(filter.start as f64);
+                // end is exclusive (start of next day), so subtract 1 second
+                let end_local = to_local((filter.end - 1) as f64);
+                start_local.date_naive() == end_local.date_naive()
+            } else if sessions.len() > 1 {
+                let first = to_local(sessions[0].timestamp);
+                let last = to_local(sessions[sessions.len() - 1].timestamp);
+                first.date_naive() == last.date_naive()
+            } else {
+                sessions.len() == 1
+            };
+            let ts_fmt = if same_day {
+                "%H:%M:%S"
+            } else {
+                "%Y-%m-%dT%H:%M:%S"
+            };
+            // Hide columns that are forced via CLI or where all values are identical
+            let show_type = session_type.is_none()
+                && sessions
+                    .iter()
+                    .any(|s| s.session_type != sessions[0].session_type);
+            let show_dir = project.is_none()
+                && sessions
+                    .iter()
+                    .any(|s| s.project_dir != sessions[0].project_dir);
             for s in &sessions {
-                // Human-readable uses ISO timestamp
-                let dt = chrono::DateTime::from_timestamp(
-                    s.timestamp as i64,
-                    ((s.timestamp.fract()) * 1_000_000_000.0) as u32,
-                )
-                .unwrap_or_default();
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    dt.to_rfc3339(),
-                    s.session_id,
-                    s.session_type,
-                    s.project_dir
-                );
+                let dt = to_local(s.timestamp);
+                let ts = dt.format(ts_fmt).to_string();
+                let mut parts = vec![ts, s.session_id.clone()];
+                if show_type {
+                    parts.push(s.session_type.to_string());
+                }
+                if show_dir {
+                    // Replace $HOME prefix with ~
+                    let dir = if s.project_dir.starts_with(&home_prefix) {
+                        format!("~/{}", &s.project_dir[home_prefix.len()..])
+                    } else if s.project_dir == home_dir.to_string_lossy() {
+                        "~".to_string()
+                    } else {
+                        s.project_dir.clone()
+                    };
+                    parts.push(dir);
+                }
+                parts.push(s.title.clone());
+                println!("{}", parts.join(" "));
             }
         }
     }
