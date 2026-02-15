@@ -221,7 +221,15 @@ pub fn find_session_by_pid(pid: u32, provider_filter: Option<Provider>) -> Resul
             provider,
         }),
         0 => {
-            // No fingerprint match — fall back to most recently updated
+            // Step 8: Tmux pane content matching before most-recent fallback
+            if is_tmux_available() {
+                if let Some(detected) = match_by_tmux_pane_content(&candidates, provider) {
+                    return Ok(detected);
+                }
+            }
+
+            // No fingerprint or tmux match — fall back to most recently updated
+            // PID detection is more lenient since the user explicitly asked for it
             let best = candidates
                 .iter()
                 .max_by_key(|c| c.updated_ms)
@@ -479,19 +487,41 @@ pub fn detect_current_session() -> Result<DetectedSession> {
             provider,
         }),
         0 => {
-            // No fingerprint match — fall back to most recently updated
-            // This can happen if the transcript hasn't been flushed yet
-            let best = candidates
-                .iter()
-                .max_by_key(|c| c.updated_ms)
-                .expect("candidates is non-empty");
-            Ok(DetectedSession {
-                session_id: best.session_id.clone(),
-                provider,
-            })
+            // Step 8: Tmux pane content matching
+            #[cfg(unix)]
+            {
+                if is_tmux_available() {
+                    if let Some(detected) = match_by_tmux_pane_content(&candidates, provider) {
+                        return Ok(detected);
+                    }
+                }
+            }
+
+            // All strategies exhausted — report candidates
+            let mut msg = String::from(
+                "Multiple sessions found for this directory. \
+                 Could not disambiguate via fingerprint",
+            );
+            #[cfg(unix)]
+            {
+                if is_tmux_available() {
+                    msg.push_str(" or tmux pane content");
+                } else {
+                    msg.push_str(". Tmux not detected for pane matching");
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                msg.push_str(". Tmux not available on this platform");
+            }
+            msg.push_str(". Use --session <id> to specify:");
+            for c in &candidates {
+                msg.push_str(&format!("\n  {}", c.session_id));
+            }
+            bail!("{}", msg);
         }
         _ => {
-            // Multiple matches — report ambiguity
+            // Multiple fingerprint matches — report ambiguity
             let mut msg = format!(
                 "Ambiguous: {} sessions match. Use --session <id> to specify:\n",
                 matched.len()
@@ -873,6 +903,359 @@ fn claudecode_transcript_has_fingerprint(session_id: &str, fingerprint: &str) ->
     }
 
     false
+}
+
+// === Tmux pane content matching (Step 8) ===
+
+/// Check if we're running inside a tmux session.
+#[cfg(unix)]
+fn is_tmux_available() -> bool {
+    env::var("TMUX").is_ok_and(|v| !v.is_empty())
+}
+
+/// List tmux panes running an opencode TUI (alternate screen active).
+///
+/// Returns `(pane_id, pane_pid)` pairs for panes where
+/// `alternate_on=1` and `pane_current_command=opencode`.
+#[cfg(unix)]
+fn list_opencode_tui_panes() -> Vec<(String, u32)> {
+    let output = match std::process::Command::new("tmux")
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{pane_pid} #{alternate_on} #{pane_current_command}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut result = Vec::new();
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Expected: %<id> <pid> <alternate_on> <command>
+        if parts.len() < 4 {
+            continue;
+        }
+        let pane_id = parts[0];
+        let alternate_on = parts[2];
+        let command = parts[3];
+
+        if alternate_on != "1" || command != "opencode" {
+            continue;
+        }
+
+        if let Ok(pid) = parts[1].parse::<u32>() {
+            result.push((pane_id.to_string(), pid));
+        }
+    }
+
+    result
+}
+
+/// Capture the alternate screen content of a tmux pane.
+#[cfg(unix)]
+fn capture_pane_content(pane_id: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["capture-pane", "-a", "-p", "-t", pane_id])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Safely truncate a string to at most `max_chars` characters,
+/// respecting UTF-8 char boundaries.
+fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Extract short user-message snippets from an OpenCode session.
+///
+/// Reads the last `max_messages` user messages, returning the first 60
+/// chars of each (minimum 12 chars to be useful for matching).
+fn get_opencode_user_snippets(session_id: &str, max_messages: usize) -> Vec<String> {
+    let storage_dir = crate::opencode_data_dir().join("storage");
+    get_opencode_user_snippets_in(&storage_dir, session_id, max_messages)
+}
+
+/// Testable variant that accepts a storage directory override.
+fn get_opencode_user_snippets_in(
+    storage_dir: &Path,
+    session_id: &str,
+    max_messages: usize,
+) -> Vec<String> {
+    let message_dir = storage_dir.join("message").join(session_id);
+    let part_dir = storage_dir.join("part");
+
+    if !message_dir.exists() {
+        return Vec::new();
+    }
+
+    // List message files, sorted by name (chronological)
+    let mut msg_files: Vec<_> = fs::read_dir(&message_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    msg_files.sort_by_key(|e| e.file_name());
+
+    let mut snippets = Vec::new();
+
+    // Walk from newest to oldest, collecting user messages
+    for msg_entry in msg_files.iter().rev() {
+        if snippets.len() >= max_messages {
+            break;
+        }
+
+        let raw = match fs::read_to_string(msg_entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let msg: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only user messages
+        if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+
+        let msg_id = msg_entry
+            .path()
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Read parts for this message to extract text
+        let msg_part_dir = part_dir.join(&msg_id);
+        if !msg_part_dir.exists() {
+            continue;
+        }
+
+        let part_files: Vec<_> = fs::read_dir(&msg_part_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+
+        for part_entry in &part_files {
+            let part_raw = match fs::read_to_string(part_entry.path()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let part: serde_json::Value = match serde_json::from_str(&part_raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if part.get("type").and_then(|v| v.as_str()) != Some("text") {
+                continue;
+            }
+
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                let trimmed = text.trim();
+                if trimmed.len() >= 12 {
+                    let snippet = safe_truncate(trimmed, 60).to_string();
+                    snippets.push(snippet);
+                    break; // one snippet per message
+                }
+            }
+        }
+    }
+
+    snippets
+}
+
+/// Extract short user-message snippets from a Claude Code session.
+///
+/// Reads the JSONL file, finds the last `max_messages` user (human)
+/// messages, returns the first 60 chars of each (minimum 12 chars).
+fn get_claudecode_user_snippets(session_id: &str, max_messages: usize) -> Vec<String> {
+    let session_file = match crate::claudecode::session::find_session_file(session_id) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    get_claudecode_user_snippets_in(&session_file, max_messages)
+}
+
+/// Testable variant that accepts a session file path directly.
+fn get_claudecode_user_snippets_in(session_file: &Path, max_messages: usize) -> Vec<String> {
+    let content = match fs::read_to_string(session_file) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Collect all human message texts, then take the last N
+    let mut all_texts: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if entry.get("type").and_then(|v| v.as_str()) != Some("human") {
+            continue;
+        }
+
+        // Content can be a string or an array of blocks
+        let message = match entry.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let content_val = match message.get("content") {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let text = match content_val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => {
+                // Find first text block
+                let mut found = String::new();
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            found = t.to_string();
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+            _ => continue,
+        };
+
+        let trimmed = text.trim();
+        if trimmed.len() >= 12 {
+            let snippet = safe_truncate(trimmed, 60).to_string();
+            all_texts.push(snippet);
+        }
+    }
+
+    // Return the last max_messages snippets
+    let start = all_texts.len().saturating_sub(max_messages);
+    all_texts[start..].to_vec()
+}
+
+/// Testable inner function: match candidate snippets against pane contents.
+///
+/// For each candidate, counts how many of its snippets appear in any pane.
+/// Returns the candidate with the most hits if it clearly wins (more hits
+/// than any other, minimum 1 hit).
+fn match_snippets_against_panes(
+    candidate_snippets: &[(String, Vec<String>)], // (session_id, snippets)
+    provider: Provider,
+    pane_contents: &[String],
+) -> Option<DetectedSession> {
+    if candidate_snippets.is_empty() || pane_contents.is_empty() {
+        return None;
+    }
+
+    // For each candidate, find the max hit count across all panes
+    let mut scores: Vec<(usize, &str)> = Vec::new(); // (max_hits, session_id)
+
+    for (session_id, snippets) in candidate_snippets {
+        if snippets.is_empty() {
+            scores.push((0, session_id));
+            continue;
+        }
+
+        let mut max_hits = 0usize;
+        for pane_content in pane_contents {
+            let hits = snippets
+                .iter()
+                .filter(|snippet| pane_content.contains(snippet.as_str()))
+                .count();
+            if hits > max_hits {
+                max_hits = hits;
+            }
+        }
+        scores.push((max_hits, session_id));
+    }
+
+    // Find the winner: must have at least 1 hit and strictly more than any other
+    scores.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let best = scores[0];
+    if best.0 == 0 {
+        return None;
+    }
+
+    // Check for tie
+    if scores.len() > 1 && scores[1].0 == best.0 {
+        return None; // ambiguous
+    }
+
+    Some(DetectedSession {
+        session_id: best.1.to_string(),
+        provider,
+    })
+}
+
+/// Disambiguate candidates by matching their user messages against
+/// tmux pane content.
+#[cfg(unix)]
+fn match_by_tmux_pane_content(
+    candidates: &[Candidate],
+    provider: Provider,
+) -> Option<DetectedSession> {
+    let tui_panes = list_opencode_tui_panes();
+    if tui_panes.is_empty() {
+        return None;
+    }
+
+    // Capture content from each TUI pane
+    let pane_contents: Vec<String> = tui_panes
+        .iter()
+        .filter_map(|(pane_id, _pid)| capture_pane_content(pane_id))
+        .collect();
+
+    if pane_contents.is_empty() {
+        return None;
+    }
+
+    // Gather snippets for each candidate
+    let candidate_snippets: Vec<(String, Vec<String>)> = candidates
+        .iter()
+        .map(|c| {
+            let snippets = match provider {
+                Provider::OpenCode => get_opencode_user_snippets(&c.session_id, 5),
+                Provider::ClaudeCode => get_claudecode_user_snippets(&c.session_id, 5),
+            };
+            (c.session_id.clone(), snippets)
+        })
+        .collect();
+
+    match_snippets_against_panes(&candidate_snippets, provider, &pane_contents)
 }
 
 #[cfg(test)]
@@ -1385,5 +1768,416 @@ mod tests {
         }
 
         false
+    }
+
+    // === Tmux pane content matching tests ===
+
+    #[test]
+    fn test_safe_truncate_ascii() {
+        assert_eq!(safe_truncate("hello world", 5), "hello");
+        assert_eq!(safe_truncate("hello", 10), "hello");
+        assert_eq!(safe_truncate("", 5), "");
+    }
+
+    #[test]
+    fn test_safe_truncate_utf8() {
+        // "café" is 4 chars but 5 bytes (é = 2 bytes)
+        assert_eq!(safe_truncate("café", 3), "caf");
+        assert_eq!(safe_truncate("café", 4), "café");
+        // Japanese: each char is 3 bytes
+        assert_eq!(safe_truncate("日本語テスト", 3), "日本語");
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_basic() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let session_id = "ses_snip1";
+        let message_dir = storage.join("message").join(session_id);
+        let part_dir = storage.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        // Create a user message with a text part
+        let msg_id = "msg_001";
+        fs::write(
+            message_dir.join(format!("{}.json", msg_id)),
+            r#"{"id":"msg_001","sessionID":"ses_snip1","role":"user","time":{"created":1000}}"#,
+        )
+        .unwrap();
+
+        let msg_part_dir = part_dir.join(msg_id);
+        fs::create_dir_all(&msg_part_dir).unwrap();
+        fs::write(
+            msg_part_dir.join("prt_001.json"),
+            r#"{"id":"prt_001","type":"text","text":"Please help me refactor the authentication module"}"#,
+        )
+        .unwrap();
+
+        let snippets = get_opencode_user_snippets_in(storage, session_id, 5);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(
+            snippets[0],
+            "Please help me refactor the authentication module"
+        );
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_skips_short_messages() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let session_id = "ses_snip2";
+        let message_dir = storage.join("message").join(session_id);
+        let part_dir = storage.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        // Short message (< 12 chars) should be skipped
+        let msg_id = "msg_001";
+        fs::write(
+            message_dir.join(format!("{}.json", msg_id)),
+            r#"{"id":"msg_001","sessionID":"ses_snip2","role":"user","time":{"created":1000}}"#,
+        )
+        .unwrap();
+
+        let msg_part_dir = part_dir.join(msg_id);
+        fs::create_dir_all(&msg_part_dir).unwrap();
+        fs::write(
+            msg_part_dir.join("prt_001.json"),
+            r#"{"id":"prt_001","type":"text","text":"yes"}"#,
+        )
+        .unwrap();
+
+        let snippets = get_opencode_user_snippets_in(storage, session_id, 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_skips_assistant_messages() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let session_id = "ses_snip3";
+        let message_dir = storage.join("message").join(session_id);
+        let part_dir = storage.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        // Assistant message should be skipped
+        let msg_id = "msg_001";
+        fs::write(
+            message_dir.join(format!("{}.json", msg_id)),
+            r#"{"id":"msg_001","sessionID":"ses_snip3","role":"assistant","time":{"created":1000}}"#,
+        )
+        .unwrap();
+
+        let msg_part_dir = part_dir.join(msg_id);
+        fs::create_dir_all(&msg_part_dir).unwrap();
+        fs::write(
+            msg_part_dir.join("prt_001.json"),
+            r#"{"id":"prt_001","type":"text","text":"Here is the refactored authentication module"}"#,
+        )
+        .unwrap();
+
+        let snippets = get_opencode_user_snippets_in(storage, session_id, 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_truncates_long_messages() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let session_id = "ses_snip4";
+        let message_dir = storage.join("message").join(session_id);
+        let part_dir = storage.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        let long_text = "A".repeat(200);
+        let msg_id = "msg_001";
+        fs::write(
+            message_dir.join(format!("{}.json", msg_id)),
+            r#"{"id":"msg_001","sessionID":"ses_snip4","role":"user","time":{"created":1000}}"#,
+        )
+        .unwrap();
+
+        let msg_part_dir = part_dir.join(msg_id);
+        fs::create_dir_all(&msg_part_dir).unwrap();
+        fs::write(
+            msg_part_dir.join("prt_001.json"),
+            format!(r#"{{"id":"prt_001","type":"text","text":"{}"}}"#, long_text),
+        )
+        .unwrap();
+
+        let snippets = get_opencode_user_snippets_in(storage, session_id, 5);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].chars().count(), 60);
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_respects_max_messages() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let session_id = "ses_snip5";
+        let message_dir = storage.join("message").join(session_id);
+        let part_dir = storage.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        // Create 5 user messages
+        for i in 1..=5 {
+            let msg_id = format!("msg_{:03}", i);
+            fs::write(
+                message_dir.join(format!("{}.json", msg_id)),
+                format!(
+                    r#"{{"id":"{}","sessionID":"ses_snip5","role":"user","time":{{"created":{}}}}}"#,
+                    msg_id,
+                    i * 1000
+                ),
+            )
+            .unwrap();
+
+            let msg_part_dir = part_dir.join(&msg_id);
+            fs::create_dir_all(&msg_part_dir).unwrap();
+            fs::write(
+                msg_part_dir.join("prt_001.json"),
+                format!(
+                    r#"{{"id":"prt_001","type":"text","text":"User message number {} with enough text"}}"#,
+                    i
+                ),
+            )
+            .unwrap();
+        }
+
+        // Request only 2
+        let snippets = get_opencode_user_snippets_in(storage, session_id, 2);
+        assert_eq!(snippets.len(), 2);
+        // Should be the most recent (msg_005, msg_004)
+        assert!(snippets[0].contains("number 5"));
+        assert!(snippets[1].contains("number 4"));
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_nonexistent_session() {
+        let temp = tempdir().unwrap();
+        let snippets = get_opencode_user_snippets_in(temp.path(), "ses_nonexistent", 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_get_claudecode_user_snippets_basic() {
+        let temp = tempdir().unwrap();
+        let session_file = temp.path().join("session.jsonl");
+
+        let lines = vec![
+            r#"{"type":"human","timestamp":"2024-01-15T10:00:00.000Z","message":{"role":"user","content":"Please help me refactor the authentication module"}}"#,
+        ];
+        fs::write(&session_file, lines.join("\n") + "\n").unwrap();
+
+        let snippets = get_claudecode_user_snippets_in(&session_file, 5);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(
+            snippets[0],
+            "Please help me refactor the authentication module"
+        );
+    }
+
+    #[test]
+    fn test_get_claudecode_user_snippets_array_content() {
+        let temp = tempdir().unwrap();
+        let session_file = temp.path().join("session.jsonl");
+
+        let line = r#"{"type":"human","timestamp":"2024-01-15T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Implement the new feature for user profiles"}]}}"#;
+        fs::write(&session_file, format!("{}\n", line)).unwrap();
+
+        let snippets = get_claudecode_user_snippets_in(&session_file, 5);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0], "Implement the new feature for user profiles");
+    }
+
+    #[test]
+    fn test_get_claudecode_user_snippets_skips_assistant() {
+        let temp = tempdir().unwrap();
+        let session_file = temp.path().join("session.jsonl");
+
+        let lines = vec![
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:00:00.000Z","message":{"role":"assistant","content":"Here is the refactored code for the module"}}"#,
+        ];
+        fs::write(&session_file, lines.join("\n") + "\n").unwrap();
+
+        let snippets = get_claudecode_user_snippets_in(&session_file, 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_get_claudecode_user_snippets_returns_last_n() {
+        let temp = tempdir().unwrap();
+        let session_file = temp.path().join("session.jsonl");
+
+        let mut lines = Vec::new();
+        for i in 1..=5 {
+            lines.push(format!(
+                r#"{{"type":"human","timestamp":"2024-01-15T10:{:02}:00.000Z","message":{{"role":"user","content":"User message number {} with enough text to pass minimum"}}}}"#,
+                i, i
+            ));
+        }
+        fs::write(&session_file, lines.join("\n") + "\n").unwrap();
+
+        let snippets = get_claudecode_user_snippets_in(&session_file, 2);
+        assert_eq!(snippets.len(), 2);
+        assert!(snippets[0].contains("number 4"));
+        assert!(snippets[1].contains("number 5"));
+    }
+
+    #[test]
+    fn test_get_claudecode_user_snippets_nonexistent_file() {
+        let snippets = get_claudecode_user_snippets_in(Path::new("/nonexistent/session.jsonl"), 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_single_clear_winner() {
+        let candidate_snippets = vec![
+            (
+                "ses_aaa".to_string(),
+                vec![
+                    "Please refactor the auth module".to_string(),
+                    "Add unit tests for login".to_string(),
+                ],
+            ),
+            (
+                "ses_bbb".to_string(),
+                vec![
+                    "Deploy to production server".to_string(),
+                    "Check the CI pipeline status".to_string(),
+                ],
+            ),
+        ];
+
+        let pane_contents = vec![
+            "... Please refactor the auth module ... Add unit tests for login ...".to_string(),
+        ];
+
+        let result =
+            match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.session_id, "ses_aaa");
+        assert_eq!(detected.provider, Provider::OpenCode);
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_no_matches() {
+        let candidate_snippets = vec![(
+            "ses_aaa".to_string(),
+            vec!["Some unique text snippet".to_string()],
+        )];
+
+        let pane_contents = vec!["Completely unrelated pane content here".to_string()];
+
+        let result =
+            match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_tie_returns_none() {
+        let candidate_snippets = vec![
+            (
+                "ses_aaa".to_string(),
+                vec!["shared snippet text here".to_string()],
+            ),
+            (
+                "ses_bbb".to_string(),
+                vec!["shared snippet text here".to_string()],
+            ),
+        ];
+
+        let pane_contents = vec!["... shared snippet text here ...".to_string()];
+
+        let result =
+            match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
+        assert!(result.is_none()); // tie → ambiguous
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_empty_inputs() {
+        // Empty candidates
+        let result =
+            match_snippets_against_panes(&[], Provider::OpenCode, &["content".to_string()]);
+        assert!(result.is_none());
+
+        // Empty panes
+        let candidate_snippets = vec![("ses_aaa".to_string(), vec!["some snippet".to_string()])];
+        let result = match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_multiple_panes() {
+        let candidate_snippets = vec![
+            (
+                "ses_aaa".to_string(),
+                vec!["refactor the auth module".to_string()],
+            ),
+            (
+                "ses_bbb".to_string(),
+                vec!["deploy to production now".to_string()],
+            ),
+        ];
+
+        // ses_bbb's snippet is in pane 2
+        let pane_contents = vec![
+            "pane 1: unrelated content here".to_string(),
+            "pane 2: deploy to production now please".to_string(),
+        ];
+
+        let result =
+            match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().session_id, "ses_bbb");
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_winner_by_count() {
+        // ses_aaa has 2 hits, ses_bbb has 1 hit → ses_aaa wins
+        let candidate_snippets = vec![
+            (
+                "ses_aaa".to_string(),
+                vec![
+                    "refactor the auth module".to_string(),
+                    "add tests for login flow".to_string(),
+                ],
+            ),
+            (
+                "ses_bbb".to_string(),
+                vec!["refactor the auth module".to_string()],
+            ),
+        ];
+
+        let pane_contents =
+            vec!["... refactor the auth module ... add tests for login flow ...".to_string()];
+
+        let result =
+            match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().session_id, "ses_aaa");
+    }
+
+    #[test]
+    fn test_match_snippets_against_panes_candidate_with_no_snippets() {
+        let candidate_snippets = vec![
+            ("ses_aaa".to_string(), vec![]),
+            (
+                "ses_bbb".to_string(),
+                vec!["deploy to production now".to_string()],
+            ),
+        ];
+
+        let pane_contents = vec!["deploy to production now".to_string()];
+
+        let result =
+            match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().session_id, "ses_bbb");
     }
 }
