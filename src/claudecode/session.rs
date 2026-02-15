@@ -193,6 +193,93 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     file_contains_text(&session_file, needle)
 }
 
+/// Check if the last `last_n` messages of a session contain the given text.
+///
+/// Like `session_contains_text` but only searches the most recent messages.
+pub fn session_tail_contains_text(session_id: &str, needle: &str, last_n: usize) -> bool {
+    let session_file = match find_session_file(session_id) {
+        Some(f) => f,
+        None => return false,
+    };
+    file_tail_contains_text(&session_file, needle, last_n)
+}
+
+/// Check if the last `last_n` message entries in a JSONL file contain the needle.
+///
+/// Reads lines from the end of the file, collects up to `last_n` user/assistant
+/// entries, and searches their content.
+fn file_tail_contains_text(path: &Path, needle: &str, last_n: usize) -> bool {
+    use std::io::BufRead;
+
+    // Fast path: read raw bytes and check if needle appears at all.
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !raw.contains(needle) {
+        return false;
+    }
+
+    // Collect all message lines, then take the last N
+    let reader = std::io::BufReader::new(raw.as_bytes());
+    let mut message_lines: Vec<String> = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Quick check: is this a user or assistant message?
+        if line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"") {
+            message_lines.push(line);
+        }
+    }
+
+    // Take only the last N
+    let start = message_lines.len().saturating_sub(last_n);
+    for line in &message_lines[start..] {
+        if !line.contains(needle) {
+            continue;
+        }
+
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type != "user" && entry_type != "assistant" {
+            continue;
+        }
+
+        let content = match entry.get("message").and_then(|m| m.get("content")) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        match content {
+            serde_json::Value::String(s) => {
+                if s.contains(needle) {
+                    return true;
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for block in arr {
+                    if content_block_contains(block, needle) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 /// Check if a session JSONL file contains the given text in message content.
 ///
 /// Uses a two-pass strategy: first a raw string search to skip files that
@@ -524,5 +611,92 @@ mod tests {
 
         assert!(file_contains_text(file.path(), "test result output"));
         assert!(!file_contains_text(file.path(), "missing"));
+    }
+
+    // === Tail search tests ===
+
+    #[test]
+    fn test_file_tail_contains_text_matches_recent_only() {
+        let mut file = NamedTempFile::new().unwrap();
+        // Write 5 messages; put the target in message 3 (not in last 2)
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"first old message"}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:01.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"second old message"}}]}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:02.000Z","message":{{"role":"user","content":"unique target phrase"}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:03.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"recent response"}}]}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:04.000Z","message":{{"role":"user","content":"latest message"}}}}"#
+        ).unwrap();
+
+        // Last 2 should NOT find "unique target phrase"
+        assert!(!file_tail_contains_text(
+            file.path(),
+            "unique target phrase",
+            2
+        ));
+        // Last 3 SHOULD find it
+        assert!(file_tail_contains_text(
+            file.path(),
+            "unique target phrase",
+            3
+        ));
+        // Last 2 should find "latest message"
+        assert!(file_tail_contains_text(file.path(), "latest message", 2));
+    }
+
+    #[test]
+    fn test_file_tail_contains_text_skips_non_messages() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"summary","summary":"needle in summary"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"clean message"}}}}"#
+        ).unwrap();
+
+        // "needle" is only in a summary entry, not in messages
+        assert!(!file_tail_contains_text(file.path(), "needle", 5));
+        assert!(file_tail_contains_text(file.path(), "clean message", 1));
+    }
+
+    #[test]
+    fn test_file_tail_contains_text_empty_file() {
+        let file = NamedTempFile::new().unwrap();
+        assert!(!file_tail_contains_text(file.path(), "anything", 5));
+    }
+
+    #[test]
+    fn test_file_tail_contains_text_tool_use_in_recent() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"old message"}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:01.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{"command":"cargo test"}}}}]}}}}"#
+        ).unwrap();
+
+        // "cargo test" is in the last message (tool_use input)
+        assert!(file_tail_contains_text(file.path(), "cargo test", 1));
+        // "old message" is NOT in the last 1 message
+        assert!(!file_tail_contains_text(file.path(), "old message", 1));
+        // But IS in the last 2
+        assert!(file_tail_contains_text(file.path(), "old message", 2));
     }
 }

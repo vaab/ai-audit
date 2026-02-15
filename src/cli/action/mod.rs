@@ -50,8 +50,35 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             let session_id = resolve_session(session)?;
             transcript::run(&session_id, last, output.format(), _verbose)
         }
-        Commands::CurrentSession { output } => {
-            let detected = crate::session_detect::detect_current_session()?;
+        Commands::CurrentSession {
+            r#match,
+            pid,
+            session_type,
+            last_messages,
+            project,
+            output,
+        } => {
+            let provider_filter = session_type.map(|t| match t {
+                super::def::SessionType::OpenCode => crate::session_detect::Provider::OpenCode,
+                super::def::SessionType::ClaudeCode => crate::session_detect::Provider::ClaudeCode,
+            });
+            let detected = if let Some(needle) = r#match {
+                // Match-based detection: search recent messages for the given text
+                crate::session_detect::find_session_by_match(
+                    &crate::session_detect::MatchOptions {
+                        needle,
+                        last_messages,
+                        provider_filter,
+                        project_dir: project,
+                    },
+                )?
+            } else if let Some(target_pid) = pid {
+                // PID-based detection: examine /proc/<pid>/
+                crate::session_detect::find_session_by_pid(target_pid, provider_filter)?
+            } else {
+                // Standard auto-detection (env vars, process tree, fingerprint)
+                crate::session_detect::detect_current_session()?
+            };
             let format = output.format();
             match format {
                 crate::OutputFormat::Json => {

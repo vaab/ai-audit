@@ -100,6 +100,22 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     session_contains_text_in_dirs(&message_dir, &part_dir, needle)
 }
 
+/// Check if the last `last_n` messages of a session contain the given text.
+///
+/// Like `session_contains_text` but only searches the most recent messages,
+/// which is much faster for large sessions.
+pub fn session_tail_contains_text(session_id: &str, needle: &str, last_n: usize) -> bool {
+    let storage_dir = storage_dir();
+    let part_dir = storage_dir.parent().unwrap_or(&storage_dir).join("part");
+    let message_dir = storage_dir
+        .parent()
+        .unwrap_or(&storage_dir)
+        .join("message")
+        .join(session_id);
+
+    session_contains_text_in_dirs_tail(&message_dir, &part_dir, needle, Some(last_n))
+}
+
 /// Check if an OpenCode part JSON contains the needle in searchable fields.
 ///
 /// Searches:
@@ -145,29 +161,48 @@ fn part_contains_needle(part: &serde_json::Value, needle: &str) -> bool {
 /// Only reads part file contents (not message JSON — the message ID comes
 /// from the filename). Uses a raw text pre-filter to skip JSON parsing on
 /// part files that cannot possibly match.
+///
+/// If `last_n` is `Some(n)`, only the last `n` messages (sorted by filename)
+/// are searched. If `None`, all messages are searched.
 fn session_contains_text_in_dirs(
     message_dir: &std::path::Path,
     part_dir: &std::path::Path,
     needle: &str,
 ) -> bool {
+    session_contains_text_in_dirs_tail(message_dir, part_dir, needle, None)
+}
+
+/// Like `session_contains_text_in_dirs`, but optionally limited to the
+/// last `last_n` messages only.
+fn session_contains_text_in_dirs_tail(
+    message_dir: &std::path::Path,
+    part_dir: &std::path::Path,
+    needle: &str,
+    last_n: Option<usize>,
+) -> bool {
     if !message_dir.exists() {
         return false;
     }
 
-    let msg_entries = match fs::read_dir(message_dir) {
-        Ok(entries) => entries,
+    let mut msg_files: Vec<_> = match fs::read_dir(message_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect(),
         Err(_) => return false,
     };
 
-    for msg_entry in msg_entries {
-        let msg_entry = match msg_entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    // Sort by filename (chronological order)
+    msg_files.sort_by_key(|e| e.file_name());
+
+    // Take only the last N messages if requested
+    let msg_iter: Box<dyn Iterator<Item = &fs::DirEntry>> = match last_n {
+        Some(n) => Box::new(msg_files.iter().rev().take(n)),
+        None => Box::new(msg_files.iter()),
+    };
+
+    for msg_entry in msg_iter {
         let msg_path = msg_entry.path();
-        if msg_path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
 
         // Message ID is the filename stem — no need to read the JSON.
         let msg_id = match msg_path.file_stem() {
@@ -439,6 +474,96 @@ mod tests {
         }
 
         fs::write(part_dir.join(format!("{}.json", part_id)), part_json).unwrap();
+    }
+
+    #[test]
+    fn test_session_tail_contains_text_matches_recent_only() {
+        let temp = tempfile::tempdir().unwrap();
+        // Create 5 messages, put the target in msg_3 (not in last 2)
+        create_session_with_messages(
+            temp.path(),
+            "ses_tail",
+            &[
+                ("msg_1", &[("prt_1", "old message")]),
+                ("msg_2", &[("prt_2", "another old")]),
+                ("msg_3", &[("prt_3", "unique target phrase")]),
+                ("msg_4", &[("prt_4", "recent message")]),
+                ("msg_5", &[("prt_5", "latest message")]),
+            ],
+        );
+
+        let message_dir = temp.path().join("message/ses_tail");
+        let part_dir = temp.path().join("part");
+
+        // Searching last 2 should NOT find "unique target phrase" (it's in msg_3)
+        assert!(!session_contains_text_in_dirs_tail(
+            &message_dir,
+            &part_dir,
+            "unique target phrase",
+            Some(2)
+        ));
+
+        // Searching last 3 SHOULD find it (msg_3 is 3rd from end)
+        assert!(session_contains_text_in_dirs_tail(
+            &message_dir,
+            &part_dir,
+            "unique target phrase",
+            Some(3)
+        ));
+
+        // Searching all messages should also find it
+        assert!(session_contains_text_in_dirs_tail(
+            &message_dir,
+            &part_dir,
+            "unique target phrase",
+            None
+        ));
+
+        // Searching last 2 should find "latest message"
+        assert!(session_contains_text_in_dirs_tail(
+            &message_dir,
+            &part_dir,
+            "latest message",
+            Some(2)
+        ));
+    }
+
+    #[test]
+    fn test_session_tail_contains_text_no_match() {
+        let temp = tempfile::tempdir().unwrap();
+        create_session_with_messages(
+            temp.path(),
+            "ses_tail2",
+            &[
+                ("msg_1", &[("prt_1", "first")]),
+                ("msg_2", &[("prt_2", "second")]),
+            ],
+        );
+
+        let message_dir = temp.path().join("message/ses_tail2");
+        let part_dir = temp.path().join("part");
+
+        assert!(!session_contains_text_in_dirs_tail(
+            &message_dir,
+            &part_dir,
+            "absent",
+            Some(5)
+        ));
+    }
+
+    #[test]
+    fn test_session_tail_contains_text_empty_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let message_dir = temp.path().join("message/ses_empty");
+        let part_dir = temp.path().join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        assert!(!session_contains_text_in_dirs_tail(
+            &message_dir,
+            &part_dir,
+            "anything",
+            Some(3)
+        ));
     }
 
     #[test]

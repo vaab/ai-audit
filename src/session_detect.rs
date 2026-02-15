@@ -1,11 +1,12 @@
 //! Auto-detect the current AI session that spawned this process.
 //!
-//! Detection strategy:
+//! Detection strategy (in priority order):
 //! 1. Check env vars for authoritative session ID (future-proof)
-//! 2. Detect provider from env + process tree
-//! 3. Gather candidate sessions for the current working directory
-//! 4. Filter to non-child, recently updated sessions
-//! 5. Fingerprint: check each candidate's transcript for our own
+//! 2. Parse ancestor process cmdline for `-s`/`--session` flag
+//! 3. Detect provider from env + process tree
+//! 4. Gather candidate sessions for the current working directory
+//! 5. Filter to non-child, recently updated sessions
+//! 6. Fingerprint: check each candidate's transcript for our own
 //!    invocation (the bash tool call that spawned us)
 //!
 //! If exactly one candidate matches, return it. Otherwise fail
@@ -39,6 +40,375 @@ struct Candidate {
     updated_ms: i64,
 }
 
+/// Options for match-based session detection.
+pub struct MatchOptions {
+    /// Text to search for in recent messages.
+    pub needle: String,
+    /// Number of recent messages to search.
+    pub last_messages: usize,
+    /// Optional provider filter.
+    pub provider_filter: Option<Provider>,
+    /// Optional project directory filter.
+    pub project_dir: Option<String>,
+}
+
+/// Find a session by matching text in its last N messages.
+///
+/// Gathers candidate sessions (optionally filtered by provider and project),
+/// then searches each one's recent messages for the needle.
+/// Returns the matching session, or an error if zero or multiple match.
+pub fn find_session_by_match(opts: &MatchOptions) -> Result<DetectedSession> {
+    // Resolve project dir to absolute path
+    let project_path: Option<String> = match &opts.project_dir {
+        Some(p) => {
+            let path = std::path::PathBuf::from(p);
+            let abs = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            let resolved = abs.canonicalize().unwrap_or(abs);
+            Some(resolved.to_string_lossy().to_string())
+        }
+        None => None,
+    };
+
+    let mut matches: Vec<DetectedSession> = Vec::new();
+
+    let include_opencode =
+        opts.provider_filter.is_none() || opts.provider_filter == Some(Provider::OpenCode);
+    let include_claudecode =
+        opts.provider_filter.is_none() || opts.provider_filter == Some(Provider::ClaudeCode);
+
+    if include_opencode {
+        if let Ok(sessions) = crate::opencode::list_sessions() {
+            for s in sessions {
+                if let Some(ref expected) = project_path {
+                    if s.project_dir != *expected {
+                        continue;
+                    }
+                }
+                if crate::opencode::session_tail_contains_text(
+                    &s.session_id,
+                    &opts.needle,
+                    opts.last_messages,
+                ) {
+                    matches.push(DetectedSession {
+                        session_id: s.session_id,
+                        provider: Provider::OpenCode,
+                    });
+                }
+            }
+        }
+    }
+
+    if include_claudecode {
+        if let Ok(sessions) = crate::claudecode::session::list_sessions() {
+            for s in sessions {
+                if let Some(ref expected) = project_path {
+                    if s.project_dir != *expected {
+                        continue;
+                    }
+                }
+                if crate::claudecode::session::session_tail_contains_text(
+                    &s.session_id,
+                    &opts.needle,
+                    opts.last_messages,
+                ) {
+                    matches.push(DetectedSession {
+                        session_id: s.session_id,
+                        provider: Provider::ClaudeCode,
+                    });
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => bail!(
+            "No session found matching \"{}\" in last {} messages",
+            opts.needle,
+            opts.last_messages
+        ),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => {
+            let mut msg = format!(
+                "Ambiguous: {} sessions match \"{}\". Use --type or --project to narrow:\n",
+                n, opts.needle
+            );
+            for m in &matches {
+                msg.push_str(&format!("  {} ({:?})\n", m.session_id, m.provider));
+            }
+            bail!("{}", msg.trim_end());
+        }
+    }
+}
+
+/// Find a session by examining a process identified by its PID.
+///
+/// Detection chain:
+/// 1. Read `/proc/<pid>/environ` for `OPENCODE_SESSION_ID` or `CLAUDE_SESSION_ID`
+/// 2. Check cmdline of the target PID and ancestors for `-s`/`--session` flag
+/// 3. Detect provider from the process name or its ancestors
+/// 4. Determine working directory from `/proc/<pid>/cwd` or `--dir` in cmdline
+/// 5. Gather candidate sessions for that directory
+/// 6. If one candidate → return it; if multiple → fingerprint then most-recent fallback
+#[cfg(unix)]
+pub fn find_session_by_pid(pid: u32, provider_filter: Option<Provider>) -> Result<DetectedSession> {
+    // Step 1: Check env vars in the target process
+    if let Some(detected) = check_process_env_vars(pid) {
+        // If a provider filter is set, ensure it matches
+        if provider_filter.is_none() || provider_filter == Some(detected.provider) {
+            return Ok(detected);
+        }
+    }
+
+    // Step 2: Check cmdline of the target PID and its ancestors for session ID
+    if let Some(detected) = find_session_from_ancestor_cmdline(pid) {
+        if provider_filter.is_none() || provider_filter == Some(detected.provider) {
+            return Ok(detected);
+        }
+    }
+
+    // Step 3: Detect provider from process name / ancestors
+    let provider = if let Some(p) = provider_filter {
+        p
+    } else {
+        detect_provider_from_pid(pid)
+            .with_context(|| format!("Cannot determine AI provider from PID {}", pid))?
+    };
+
+    // Step 4: Determine working directory
+    let cwd = get_process_cwd(pid)
+        .or_else(|| get_dir_from_cmdline(pid))
+        .with_context(|| format!("Cannot read working directory for PID {}", pid))?;
+
+    // Step 5: Gather candidates
+    let candidates = match provider {
+        Provider::OpenCode => gather_opencode_candidates(&cwd)?,
+        Provider::ClaudeCode => gather_claudecode_candidates(&cwd)?,
+    };
+
+    if candidates.is_empty() {
+        bail!(
+            "No sessions found for PID {} (directory: {})",
+            pid,
+            cwd.display()
+        );
+    }
+
+    // Step 6: Single candidate → return directly
+    if candidates.len() == 1 {
+        return Ok(DetectedSession {
+            session_id: candidates[0].session_id.clone(),
+            provider,
+        });
+    }
+
+    // Step 7: Fingerprint, then most-recent fallback
+    let fingerprint = build_fingerprint();
+    let mut matched: Vec<&Candidate> = Vec::new();
+
+    for c in &candidates {
+        if transcript_contains_fingerprint(&c.session_id, provider, &fingerprint) {
+            matched.push(c);
+        }
+    }
+
+    match matched.len() {
+        1 => Ok(DetectedSession {
+            session_id: matched[0].session_id.clone(),
+            provider,
+        }),
+        0 => {
+            // No fingerprint match — fall back to most recently updated
+            let best = candidates
+                .iter()
+                .max_by_key(|c| c.updated_ms)
+                .expect("candidates is non-empty");
+            Ok(DetectedSession {
+                session_id: best.session_id.clone(),
+                provider,
+            })
+        }
+        _ => {
+            let mut msg = format!(
+                "Ambiguous: {} sessions match for PID {}. Use --type to narrow:\n",
+                matched.len(),
+                pid
+            );
+            for c in &matched {
+                msg.push_str(&format!("  {}\n", c.session_id));
+            }
+            bail!("{}", msg.trim_end());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn find_session_by_pid(
+    _pid: u32,
+    _provider_filter: Option<Provider>,
+) -> Result<DetectedSession> {
+    bail!("--pid is only supported on Unix/Linux systems");
+}
+
+/// Read env vars from `/proc/<pid>/environ` looking for session IDs.
+#[cfg(unix)]
+fn check_process_env_vars(pid: u32) -> Option<DetectedSession> {
+    let environ = fs::read_to_string(format!("/proc/{}/environ", pid)).ok()?;
+    // environ is NUL-separated
+    for entry in environ.split('\0') {
+        if let Some(val) = entry.strip_prefix("OPENCODE_SESSION_ID=") {
+            if !val.is_empty() {
+                return Some(DetectedSession {
+                    session_id: val.to_string(),
+                    provider: Provider::OpenCode,
+                });
+            }
+        }
+        if let Some(val) = entry.strip_prefix("CLAUDE_SESSION_ID=") {
+            if !val.is_empty() {
+                return Some(DetectedSession {
+                    session_id: val.to_string(),
+                    provider: Provider::ClaudeCode,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Detect AI provider by checking the process name at `pid` and walking up.
+#[cfg(unix)]
+fn detect_provider_from_pid(pid: u32) -> Result<Provider> {
+    // Check the process itself first
+    if let Some(name) = get_process_name(pid) {
+        match name.as_str() {
+            "opencode" => return Ok(Provider::OpenCode),
+            "claude" => return Ok(Provider::ClaudeCode),
+            _ => {}
+        }
+    }
+
+    // Walk up the process tree
+    let mut current = pid;
+    for _ in 0..20 {
+        let ppid = match get_parent_pid(current) {
+            Some(p) if p > 1 => p,
+            _ => break,
+        };
+        if let Some(name) = get_process_name(ppid) {
+            match name.as_str() {
+                "opencode" => return Ok(Provider::OpenCode),
+                "claude" => return Ok(Provider::ClaudeCode),
+                _ => {}
+            }
+        }
+        current = ppid;
+    }
+
+    bail!(
+        "Cannot determine AI provider from PID {} or its ancestors",
+        pid
+    );
+}
+
+/// Read `/proc/<pid>/cwd` symlink.
+#[cfg(unix)]
+fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    fs::read_link(format!("/proc/{}/cwd", pid)).ok()
+}
+
+/// Try to extract `--dir <path>` from `/proc/<pid>/cmdline`.
+///
+/// OpenCode uses `opencode attach <url> --dir <path>`.
+#[cfg(unix)]
+fn get_dir_from_cmdline(pid: u32) -> Option<std::path::PathBuf> {
+    let raw = fs::read_to_string(format!("/proc/{}/cmdline", pid)).ok()?;
+    let args: Vec<&str> = raw.split('\0').collect();
+    // Look for --dir followed by a path
+    for window in args.windows(2) {
+        if window[0] == "--dir" && !window[1].is_empty() {
+            return Some(std::path::PathBuf::from(window[1]));
+        }
+    }
+    None
+}
+
+/// Extract session ID from a NUL-separated cmdline string.
+///
+/// Looks for `-s <session_id>` or `--session <session_id>` in the
+/// argument list.
+fn parse_session_from_cmdline_args(raw: &str) -> Option<String> {
+    let args: Vec<&str> = raw.split('\0').collect();
+    for window in args.windows(2) {
+        if (window[0] == "-s" || window[0] == "--session") && !window[1].is_empty() {
+            return Some(window[1].to_string());
+        }
+    }
+    None
+}
+
+/// Try to extract `-s <session_id>` or `--session <session_id>` from
+/// `/proc/<pid>/cmdline`.
+///
+/// OpenCode passes the session ID as `opencode -s ses_xxx` or
+/// `opencode attach <url> -s ses_xxx`.
+#[cfg(unix)]
+fn get_session_from_cmdline(pid: u32) -> Option<String> {
+    let raw = fs::read_to_string(format!("/proc/{}/cmdline", pid)).ok()?;
+    parse_session_from_cmdline_args(&raw)
+}
+
+/// Walk the process tree upward (starting from the given PID itself)
+/// looking for an opencode/claude process whose cmdline contains a
+/// `-s`/`--session` flag with the session ID.
+///
+/// This is more authoritative than fingerprinting: the session ID is
+/// directly available in the process's cmdline.
+#[cfg(unix)]
+fn find_session_from_ancestor_cmdline(start_pid: u32) -> Option<DetectedSession> {
+    // Check the start PID itself first — it may be the opencode process
+    if let Some(detected) = check_pid_cmdline_for_session(start_pid) {
+        return Some(detected);
+    }
+
+    let mut pid = start_pid;
+
+    for _ in 0..20 {
+        let ppid = get_parent_pid(pid)?;
+        if ppid <= 1 {
+            break;
+        }
+
+        if let Some(detected) = check_pid_cmdline_for_session(ppid) {
+            return Some(detected);
+        }
+
+        pid = ppid;
+    }
+
+    None
+}
+
+/// Check if a single PID is an opencode/claude process with `-s`/`--session`
+/// in its cmdline.
+#[cfg(unix)]
+fn check_pid_cmdline_for_session(pid: u32) -> Option<DetectedSession> {
+    let name = get_process_name(pid)?;
+    let provider = match name.as_str() {
+        "opencode" => Provider::OpenCode,
+        "claude" => Provider::ClaudeCode,
+        _ => return None,
+    };
+    let session_id = get_session_from_cmdline(pid)?;
+    Some(DetectedSession {
+        session_id,
+        provider,
+    })
+}
+
 /// Try to auto-detect the current session.
 ///
 /// Returns the session ID if exactly one candidate is found,
@@ -62,13 +432,20 @@ pub fn detect_current_session() -> Result<DetectedSession> {
         }
     }
 
-    // Step 2: Detect provider
+    // Step 2: Check ancestor process cmdline for session ID
+    // (e.g. `opencode -s ses_xxx` in the parent's cmdline)
+    #[cfg(unix)]
+    if let Some(detected) = find_session_from_ancestor_cmdline(std::process::id()) {
+        return Ok(detected);
+    }
+
+    // Step 3: Detect provider
     let provider = detect_provider()?;
 
-    // Step 3: Get current working directory
+    // Step 4: Get current working directory
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
-    // Step 4: Gather candidates
+    // Step 5: Gather candidates
     let candidates = match provider {
         Provider::OpenCode => gather_opencode_candidates(&cwd)?,
         Provider::ClaudeCode => gather_claudecode_candidates(&cwd)?,
@@ -78,7 +455,7 @@ pub fn detect_current_session() -> Result<DetectedSession> {
         bail!("No sessions found for directory: {}", cwd.display());
     }
 
-    // Step 5: If only one candidate, return it directly
+    // Step 6: If only one candidate, return it directly
     if candidates.len() == 1 {
         return Ok(DetectedSession {
             session_id: candidates[0].session_id.clone(),
@@ -86,7 +463,7 @@ pub fn detect_current_session() -> Result<DetectedSession> {
         });
     }
 
-    // Step 6: Fingerprint — find our own invocation in candidates' transcripts
+    // Step 7: Fingerprint — find our own invocation in candidates' transcripts
     let fingerprint = build_fingerprint();
     let mut matched: Vec<&Candidate> = Vec::new();
 
@@ -843,6 +1220,120 @@ mod tests {
         }
 
         false
+    }
+
+    // === PID-based detection tests ===
+
+    #[test]
+    fn test_get_process_cwd_current_process() {
+        // Current process has a valid cwd
+        let pid = std::process::id();
+        let cwd = get_process_cwd(pid);
+        assert!(cwd.is_some());
+        // Should match env::current_dir()
+        let expected = env::current_dir().unwrap();
+        assert_eq!(cwd.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_get_process_cwd_nonexistent_pid() {
+        // PID 999999999 almost certainly doesn't exist
+        let cwd = get_process_cwd(999_999_999);
+        assert!(cwd.is_none());
+    }
+
+    #[test]
+    fn test_check_process_env_vars_current_process() {
+        // Current process likely doesn't have OPENCODE_SESSION_ID set
+        // (it's not passed to subprocesses by opencode)
+        let result = check_process_env_vars(std::process::id());
+        // We don't assert true/false — just that it doesn't crash
+        // If OPENCODE_SESSION_ID is in env, it should return Some
+        if env::var("OPENCODE_SESSION_ID")
+            .ok()
+            .is_some_and(|v| !v.is_empty())
+        {
+            assert!(result.is_some());
+        }
+    }
+
+    #[test]
+    fn test_check_process_env_vars_nonexistent_pid() {
+        let result = check_process_env_vars(999_999_999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_dir_from_cmdline_nonexistent_pid() {
+        let result = get_dir_from_cmdline(999_999_999);
+        assert!(result.is_none());
+    }
+
+    // === Cmdline session ID extraction tests ===
+
+    #[test]
+    fn test_parse_session_from_cmdline_short_flag() {
+        let cmdline = "opencode\0-s\0ses_abc123\0";
+        assert_eq!(
+            parse_session_from_cmdline_args(cmdline),
+            Some("ses_abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_session_from_cmdline_long_flag() {
+        let cmdline = "opencode\0--session\0ses_def456\0";
+        assert_eq!(
+            parse_session_from_cmdline_args(cmdline),
+            Some("ses_def456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_session_from_cmdline_attach_mode() {
+        // opencode attach http://127.0.0.1:4096 -s ses_xxx --dir /some/path
+        let cmdline =
+            "opencode\0attach\0http://127.0.0.1:4096\0-s\0ses_attach789\0--dir\0/some/path\0";
+        assert_eq!(
+            parse_session_from_cmdline_args(cmdline),
+            Some("ses_attach789".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_session_from_cmdline_no_session() {
+        let cmdline = "opencode\0serve\0--hostname\0127.0.0.1\0--port\04096\0";
+        assert_eq!(parse_session_from_cmdline_args(cmdline), None);
+    }
+
+    #[test]
+    fn test_parse_session_from_cmdline_empty_value() {
+        let cmdline = "opencode\0-s\0\0";
+        assert_eq!(parse_session_from_cmdline_args(cmdline), None);
+    }
+
+    #[test]
+    fn test_get_session_from_cmdline_nonexistent_pid() {
+        let result = get_session_from_cmdline(999_999_999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_session_from_ancestor_cmdline_nonexistent_pid() {
+        let result = find_session_from_ancestor_cmdline(999_999_999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_provider_from_pid_nonexistent() {
+        let result = detect_provider_from_pid(999_999_999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_session_by_pid_nonexistent() {
+        let result = find_session_by_pid(999_999_999, None);
+        assert!(result.is_err());
     }
 
     fn claudecode_transcript_has_fingerprint_in(session_file: &Path, fingerprint: &str) -> bool {
