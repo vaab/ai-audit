@@ -37,6 +37,84 @@ Output format (tab-separated):
 2026-01-20T00:42:31.010+00:00	5593c91e-7bcd-4dff-b52f-f6266899f2d4	claudecode
 #+end_example
 
+** Search Sessions
+
+Filter sessions using text, time, and project filters:
+
+#+begin_src bash
+# Search by content (all messages)
+ai-audit list-sessions --search "some keyword"
+
+# Filter by time range
+ai-audit list-sessions --timespan today
+ai-audit list-sessions --timespan "2026-02-01..2026-02-11"
+
+# Filter by project directory
+ai-audit list-sessions --project .
+ai-audit list-sessions -p ../fyl
+
+# Combine filters
+ai-audit list-sessions --timespan today --search "keyword" -t opencode
+#+end_src
+
+** Current Session Detection
+
+Detect which AI session is running (or was running) in the current context:
+
+#+begin_src bash
+# Auto-detect (env vars, process tree, fingerprinting)
+ai-audit current-session
+
+# Identify session by matching text in last N messages
+# (useful after tmux-resurrect to find which session was active)
+ai-audit current-session --match "visible text from pane"
+ai-audit current-session --match "text" -t opencode -n 3
+
+# Identify session from a PID (e.g., an opencode process)
+ai-audit current-session --pid 286943
+ai-audit current-session --pid 286943 -t opencode
+
+# Output formats
+ai-audit current-session --json
+ai-audit current-session -0
+#+end_src
+
+Detection strategies (mutually exclusive):
+
+| Mode        | Flag        | Strategy                                          |
+|-------------+-------------+---------------------------------------------------|
+| Auto        | (default)   | Env vars → process tree → CWD + fingerprint       |
+| Text match  | =--match=   | Search last N messages for the given string        |
+| PID         | =--pid=     | Read =/proc/<pid>/= (env, cwd, provider detection) |
+
+Options:
+
+| Flag               | Description                                            |
+|--------------------+--------------------------------------------------------|
+| =-m, --match=      | Text to match in recent messages                       |
+| =--pid=            | PID of an AI assistant process                         |
+| =-t, --type=       | Filter by provider (=claudecode= or =opencode=)       |
+| =-n, --last-messages= | Messages to search with =--match= (default: 5)     |
+| =-p, --project=    | Filter by project path                                 |
+
+** Transcript
+
+Display the full conversation transcript of a session:
+
+#+begin_src bash
+# With explicit session ID
+ai-audit transcript <session-id>
+
+# Auto-detect current session
+ai-audit transcript
+
+# Show only the last N entries
+ai-audit transcript -n 20
+
+# Include thinking/reasoning blocks
+ai-audit transcript -v
+#+end_src
+
 ** Permissions
 
 List permission events for a session (claudecode or opencode):
