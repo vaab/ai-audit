@@ -41,6 +41,7 @@ pub fn run(
     search: Option<&str>,
     timespan: Option<&str>,
     project: Option<&str>,
+    all: bool,
     format: OutputFormat,
     quiet: bool,
 ) -> Result<()> {
@@ -127,7 +128,10 @@ pub fn run(
         match opencode::list_sessions() {
             Ok(oc_sessions) => {
                 for s in oc_sessions {
-                    // Filters: cheapest first (session_id, project, timespan, then search)
+                    // Filters: cheapest first (parent, session_id, project, timespan, then search)
+                    if !all && s.parent_id.is_some() {
+                        continue;
+                    }
                     if let Some(id) = session_id {
                         if s.session_id != id {
                             continue;
@@ -293,6 +297,42 @@ mod tests {
         match args.command {
             crate::cli::def::Commands::ListSessions { session_id, .. } => {
                 assert!(session_id.is_none());
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_all_flag_default_is_false() {
+        let args =
+            Args::try_parse_from(["ai-audit", "list-sessions"]).expect("bare list-sessions works");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { all, .. } => {
+                assert!(!all);
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_all_short_flag() {
+        let args = Args::try_parse_from(["ai-audit", "list-sessions", "-a"])
+            .expect("-a should be accepted");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { all, .. } => {
+                assert!(all);
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_all_long_flag() {
+        let args = Args::try_parse_from(["ai-audit", "list-sessions", "--all"])
+            .expect("--all should be accepted");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { all, .. } => {
+                assert!(all);
             }
             _ => panic!("expected ListSessions command"),
         }

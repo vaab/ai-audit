@@ -90,6 +90,10 @@ pub enum Commands {
         #[arg(short, long)]
         project: Option<String>,
 
+        /// Include sub-agent sessions (hidden by default)
+        #[arg(short, long)]
+        all: bool,
+
         #[command(flatten)]
         output: OutputOpts,
     },

@@ -42,6 +42,7 @@ pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
         updated_at: timestamp,
         project_dir: session_data.directory,
         title: String::new(),
+        parent_id: None,
     })
 }
 
@@ -56,6 +57,8 @@ pub struct SessionInfo {
     pub project_dir: String,
     /// Session title (from session metadata)
     pub title: String,
+    /// Parent session ID (present for sub-agent sessions)
+    pub parent_id: Option<String>,
 }
 
 /// Session file from `storage/directory-agents/` (minimal metadata).
@@ -79,6 +82,9 @@ struct FullSessionFile {
     title: String,
     #[serde(default)]
     time: SessionTime,
+    /// Present in sub-agent sessions; points to the parent session.
+    #[serde(rename = "parentID")]
+    parent_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -300,6 +306,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
                         updated_at,
                         project_dir: session.directory,
                         title: session.title,
+                        parent_id: session.parent_id,
                     });
                 }
             }
