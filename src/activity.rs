@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
@@ -40,7 +41,7 @@ pub struct ActivityEvent {
 }
 
 /// Activity data payload
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type")]
 pub enum ActivityData {
     #[serde(rename = "msg")]
@@ -73,6 +74,43 @@ impl ClientType {
     }
 }
 
+/// Per-session metadata — the single source of truth for child-session
+/// detection and project-directory resolution.
+#[derive(Debug)]
+struct SessionMeta {
+    /// Session identifier (UUID for Claude Code, `ses_*` for OpenCode).
+    id: String,
+    /// Simplified project directory (e.g. `DEV>rs/ai-audit`).
+    project_dir: String,
+    /// `true` when this session belongs to a subagent.
+    is_child: bool,
+    /// Provider that owns this session.
+    client_type: ClientType,
+    /// Path to the JSONL file (Claude Code only; `None` for OpenCode).
+    session_file: Option<PathBuf>,
+}
+
+/// Aggregated session index built from all providers.
+struct SessionIndex {
+    sessions: Vec<SessionMeta>,
+}
+
+impl SessionIndex {
+    /// Iterate over non-child (top-level) sessions.
+    fn non_child(&self) -> impl Iterator<Item = &SessionMeta> {
+        self.sessions.iter().filter(|s| !s.is_child)
+    }
+
+    /// Collect the IDs of all child sessions into a `HashSet`.
+    fn child_ids(&self) -> HashSet<String> {
+        self.sessions
+            .iter()
+            .filter(|s| s.is_child)
+            .map(|s| s.id.clone())
+            .collect()
+    }
+}
+
 /// Parsed session entry from JSONL
 #[derive(Debug, Deserialize)]
 struct SessionEntry {
@@ -81,6 +119,193 @@ struct SessionEntry {
     timestamp: Option<String>,
     message: Option<MessageContent>,
     cwd: Option<String>,
+}
+
+/// Check whether a Claude Code JSONL session file belongs to a subagent.
+///
+/// Subagent entries carry a ``sessionId`` field (pointing to the parent
+/// session).  We only need to inspect the first parseable line.
+fn is_claudecode_child_session(path: &Path) -> bool {
+    /// Minimal struct to probe for the parent-session indicator.
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(rename = "sessionId")]
+        parent_session_id: Option<String>,
+    }
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        return match serde_json::from_str::<Probe>(&line) {
+            Ok(p) => p.parent_session_id.is_some(),
+            Err(_) => false,
+        };
+    }
+    false
+}
+
+/// Scan all Claude Code session files and build `SessionMeta` entries.
+///
+/// For each `.jsonl` file under `~/.claude/projects/<encoded-path>/`:
+/// - `is_child` is determined via [`is_claudecode_child_session`].
+/// - `project_dir` is read from the first `cwd` entry in the JSONL,
+///   falling back to decoding the parent directory name.
+fn scan_claudecode_sessions(config: &Config) -> Vec<SessionMeta> {
+    let projects_dir = crate::claudecode::projects_dir();
+    let mut metas = Vec::new();
+
+    if !projects_dir.exists() {
+        return metas;
+    }
+
+    let project_entries = match fs::read_dir(&projects_dir) {
+        Ok(entries) => entries,
+        Err(_) => return metas,
+    };
+
+    for project_entry in project_entries {
+        let project_entry = match project_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+
+        // Resolve project_dir once per project directory: try reading cwd
+        // from the first session file, fall back to decoding the dir name.
+        let mut project_dir_cache: Option<String> = None;
+
+        let file_entries = match fs::read_dir(&project_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for file_entry in file_entries {
+            let file_entry = match file_entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let file_path = file_entry.path();
+            if file_path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+
+            let session_id = file_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let is_child = is_claudecode_child_session(&file_path);
+
+            // Populate project_dir_cache lazily from the first non-child
+            // session that yields a cwd.  Child sessions may have a
+            // different cwd, but the directory-level fallback is fine.
+            let project_dir = if let Some(ref cached) = project_dir_cache {
+                cached.clone()
+            } else {
+                let dir = get_project_path_from_session(&file_path, config)
+                    .ok()
+                    .unwrap_or_else(|| {
+                        let dir_name = project_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        config.simplify_path(&decode_project_dir_name(&dir_name))
+                    });
+                project_dir_cache = Some(dir.clone());
+                dir
+            };
+
+            metas.push(SessionMeta {
+                id: session_id,
+                project_dir,
+                is_child,
+                client_type: ClientType::Claude,
+                session_file: Some(file_path),
+            });
+        }
+    }
+
+    metas
+}
+
+/// Scan all OpenCode session files and build `SessionMeta` entries.
+///
+/// Replaces the former `scan_opencode_sessions` + `OpenCodeSessionIndex`.
+fn scan_opencode_sessions_to_meta(session_dir: &Path, config: &Config) -> Vec<SessionMeta> {
+    let mut metas = Vec::new();
+
+    if !session_dir.exists() {
+        return metas;
+    }
+
+    let project_entries = match fs::read_dir(session_dir) {
+        Ok(entries) => entries,
+        Err(_) => return metas,
+    };
+
+    for project_entry in project_entries {
+        let project_entry = match project_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+
+        let session_files = match fs::read_dir(&project_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for session_file in session_files {
+            let session_file = match session_file {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = session_file.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let session: OpenCodeSession = match serde_json::from_str(&content) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let project_dir = session
+                .directory
+                .as_deref()
+                .map(|d| config.simplify_path(d))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            metas.push(SessionMeta {
+                id: session.id,
+                project_dir,
+                is_child: session.parent_id.is_some(),
+                client_type: ClientType::Opencode,
+                session_file: None,
+            });
+        }
+    }
+
+    metas
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +405,11 @@ pub fn parse_claudecode_messages(
             data: ActivityData::Message { content },
         });
     }
+
+    // Claude Code JSONL files occasionally contain repeated entry blocks;
+    // deduplicate on (timestamp, data) within this single session.
+    events.sort_by_key(|e| e.timestamp);
+    events.dedup_by(|a, b| a.timestamp == b.timestamp && a.data == b.data);
 
     Ok(events)
 }
@@ -289,6 +519,9 @@ fn get_project_path_from_debug_path(debug_path: &Path, config: &Config) -> Optio
 struct OpenCodeSession {
     id: String,
     directory: Option<String>,
+    /// Present in subagent sessions; points to the parent session.
+    #[serde(rename = "parentID")]
+    parent_id: Option<String>,
     #[allow(dead_code)]
     time: OpenCodeTime,
 }
@@ -332,47 +565,45 @@ pub fn parse_opencode_messages(config: &Config) -> Result<Vec<ActivityEvent>> {
     parse_opencode_messages_from_dir(&storage_dir, config)
 }
 
-/// Parse user messages from OpenCode storage at a specific directory
-/// (Internal function, also used for testing)
+/// Parse user messages from OpenCode storage at a specific directory.
+///
+/// Builds a local session index to determine child sessions and project
+/// directories.  Used by tests and the public [`parse_opencode_messages`].
 fn parse_opencode_messages_from_dir(
     storage_dir: &Path,
     config: &Config,
 ) -> Result<Vec<ActivityEvent>> {
+    let session_dir = storage_dir.join("session");
+    let metas = scan_opencode_sessions_to_meta(&session_dir, config);
+    let index = SessionIndex { sessions: metas };
+    parse_opencode_messages_with_index(storage_dir, config, &index)
+}
+
+/// Parse user messages from OpenCode storage using a pre-built session index.
+///
+/// This is the "dumb" parser: it skips child sessions based on the
+/// provided index and resolves project directories from it.
+fn parse_opencode_messages_with_index(
+    storage_dir: &Path,
+    _config: &Config,
+    index: &SessionIndex,
+) -> Result<Vec<ActivityEvent>> {
     let message_dir = storage_dir.join("message");
     let part_dir = storage_dir.join("part");
-    let session_dir = storage_dir.join("session");
 
     if !message_dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut events = Vec::new();
+    let children = index.child_ids();
 
-    // Build session directory lookup (session_id -> directory path)
-    let mut session_dirs: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    if session_dir.exists() {
-        for project_entry in fs::read_dir(&session_dir)? {
-            let project_entry = project_entry?;
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
-            for session_file in fs::read_dir(&project_path)? {
-                let session_file = session_file?;
-                let path = session_file.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Ok(session) = serde_json::from_str::<OpenCodeSession>(&content) {
-                            if let Some(dir) = session.directory {
-                                session_dirs.insert(session.id, dir);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Build a session_id → project_dir lookup from the index.
+    let dir_map: std::collections::HashMap<&str, &str> = index
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.project_dir.as_str()))
+        .collect();
 
     // Process message directories (each is a session)
     for session_entry in fs::read_dir(&message_dir)? {
@@ -387,10 +618,15 @@ fn parse_opencode_messages_from_dir(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Skip subagent sessions
+        if children.contains(&session_id) {
+            continue;
+        }
+
         // Get project path for this session
-        let project_path = session_dirs
-            .get(&session_id)
-            .map(|d| config.simplify_path(d))
+        let project_path = dir_map
+            .get(session_id.as_str())
+            .map(|d| d.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         // Process each message file
@@ -485,101 +721,58 @@ fn get_opencode_message_content(part_dir: &Path, message_id: &str) -> Result<Str
     Ok(text_parts.join("\n"))
 }
 
-/// List OpenCode sessions for identifiers
-fn list_opencode_identifiers(config: &Config, identifiers: &mut Vec<String>) -> Result<()> {
-    let storage_dir = crate::opencode_data_dir().join("storage");
-    let session_dir = storage_dir.join("session");
-
-    if !session_dir.exists() {
-        return Ok(());
-    }
-
-    for project_entry in fs::read_dir(&session_dir)? {
-        let project_entry = project_entry?;
-        let project_path = project_entry.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-
-        for session_file in fs::read_dir(&project_path)? {
-            let session_file = session_file?;
-            let path = session_file.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(session) = serde_json::from_str::<OpenCodeSession>(&content) {
-                    if let Some(dir) = session.directory {
-                        let simplified = config.simplify_path(&dir);
-                        let msg_ident = format!(
-                            "{}-{}@{}",
-                            ClientType::Opencode.as_str(),
-                            ActivityType::Message.as_str(),
-                            simplified
-                        );
-
-                        if !identifiers.contains(&msg_ident) {
-                            identifiers.push(msg_ident);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// List all available activity identifiers
 pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
     let mut identifiers = Vec::new();
 
-    // Claude Code sessions
-    let projects_dir = crate::claudecode::projects_dir();
-    if projects_dir.exists() {
-        for project_entry in fs::read_dir(&projects_dir)? {
-            let project_entry = project_entry?;
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
+    // Build the combined session index
+    let mut all_sessions = scan_claudecode_sessions(config);
+    let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
+    all_sessions.extend(scan_opencode_sessions_to_meta(&oc_session_dir, config));
+    let index = SessionIndex {
+        sessions: all_sessions,
+    };
+
+    // Collect unique project_dir values per (client_type, project_dir),
+    // skipping child sessions.
+    for meta in index.non_child() {
+        match meta.client_type {
+            ClientType::Claude => {
+                // Claude Code produces both msg and perm identifiers
+                let msg_ident = format!(
+                    "{}-{}@{}",
+                    ClientType::Claude.as_str(),
+                    ActivityType::Message.as_str(),
+                    meta.project_dir
+                );
+                let perm_ident = format!(
+                    "{}-{}@{}",
+                    ClientType::Claude.as_str(),
+                    ActivityType::Permission.as_str(),
+                    meta.project_dir
+                );
+
+                if !identifiers.contains(&msg_ident) {
+                    identifiers.push(msg_ident);
+                }
+                if !identifiers.contains(&perm_ident) {
+                    identifiers.push(perm_ident);
+                }
             }
+            ClientType::Opencode => {
+                let msg_ident = format!(
+                    "{}-{}@{}",
+                    ClientType::Opencode.as_str(),
+                    ActivityType::Message.as_str(),
+                    meta.project_dir
+                );
 
-            // Get simplified project path from directory name
-            // Directory names are URL-encoded paths like -home-vaab-dev-rs-ai-audit
-            let dir_name = project_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let decoded_path = decode_project_dir_name(&dir_name);
-            let simplified = config.simplify_path(&decoded_path);
-
-            // Add both msg and perm identifiers
-            let msg_ident = format!(
-                "{}-{}@{}",
-                ClientType::Claude.as_str(),
-                ActivityType::Message.as_str(),
-                simplified
-            );
-            let perm_ident = format!(
-                "{}-{}@{}",
-                ClientType::Claude.as_str(),
-                ActivityType::Permission.as_str(),
-                simplified
-            );
-
-            if !identifiers.contains(&msg_ident) {
-                identifiers.push(msg_ident);
-            }
-            if !identifiers.contains(&perm_ident) {
-                identifiers.push(perm_ident);
+                if !identifiers.contains(&msg_ident) {
+                    identifiers.push(msg_ident);
+                }
             }
         }
     }
-
-    // OpenCode sessions
-    list_opencode_identifiers(config, &mut identifiers)?;
 
     identifiers.sort();
     identifiers.dedup();
@@ -629,71 +822,64 @@ pub fn fetch_activities(
     // Parse which clients and types are requested
     let filter = parse_identifier_filter(identifiers);
 
-    // Claude Code sessions
+    // Build the combined session index
+    let mut all_sessions = Vec::new();
     if filter.include_claude {
-        let projects_dir = crate::claudecode::projects_dir();
-        if projects_dir.exists() {
-            for project_entry in fs::read_dir(&projects_dir)? {
-                let project_entry = project_entry?;
-                let project_path = project_entry.path();
-                if !project_path.is_dir() {
-                    continue;
-                }
+        all_sessions.extend(scan_claudecode_sessions(config));
+    }
+    if filter.include_opencode {
+        let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
+        all_sessions.extend(scan_opencode_sessions_to_meta(&oc_session_dir, config));
+    }
+    let index = SessionIndex {
+        sessions: all_sessions,
+    };
 
-                // Process session files
-                for file_entry in fs::read_dir(&project_path)? {
-                    let file_entry = file_entry?;
-                    let file_path = file_entry.path();
-                    if file_path.extension().is_some_and(|e| e == "jsonl") {
-                        // Skip subagent directories
-                        if file_path
-                            .parent()
-                            .is_some_and(|p| p.file_name().is_some_and(|n| n == "subagents"))
-                        {
-                            continue;
-                        }
-
-                        // Parse messages
-                        if filter.include_messages {
-                            if let Ok(events) = parse_claudecode_messages(&file_path, config) {
-                                for event in events {
-                                    if event.timestamp >= start_ts
-                                        && event.timestamp <= end_ts
-                                        && filter.matches_ident(&event.ident)
-                                    {
-                                        all_events.push(event);
-                                    }
-                                }
-                            }
-                        }
+    // Claude Code messages — iterate the pre-built index, skip children
+    if filter.include_claude && filter.include_messages {
+        for meta in index.non_child() {
+            if meta.client_type != ClientType::Claude {
+                continue;
+            }
+            let session_file = match &meta.session_file {
+                Some(p) => p,
+                None => continue,
+            };
+            if let Ok(events) = parse_claudecode_messages(session_file, config) {
+                for event in events {
+                    if event.timestamp >= start_ts
+                        && event.timestamp <= end_ts
+                        && filter.matches_ident(&event.ident)
+                    {
+                        all_events.push(event);
                     }
                 }
             }
         }
+    }
 
-        // Parse permission events from debug logs
-        if filter.include_permissions {
-            let debug_dir = crate::claudecode::debug_dir();
-            if debug_dir.exists() {
-                for entry in fs::read_dir(&debug_dir)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "txt") {
-                        let session_id = path.file_stem().map(|s| s.to_string_lossy().to_string());
-                        let session_file = session_id
-                            .as_ref()
-                            .and_then(|id| crate::claudecode::session::find_session_file(id));
+    // Claude Code permissions — still scanned from debug logs
+    if filter.include_claude && filter.include_permissions {
+        let debug_dir = crate::claudecode::debug_dir();
+        if debug_dir.exists() {
+            for entry in fs::read_dir(&debug_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "txt") {
+                    let session_id = path.file_stem().map(|s| s.to_string_lossy().to_string());
+                    let session_file = session_id
+                        .as_ref()
+                        .and_then(|id| crate::claudecode::session::find_session_file(id));
 
-                        if let Ok(events) =
-                            parse_claudecode_permissions(&path, session_file.as_deref(), config)
-                        {
-                            for event in events {
-                                if event.timestamp >= start_ts
-                                    && event.timestamp <= end_ts
-                                    && filter.matches_ident(&event.ident)
-                                {
-                                    all_events.push(event);
-                                }
+                    if let Ok(events) =
+                        parse_claudecode_permissions(&path, session_file.as_deref(), config)
+                    {
+                        for event in events {
+                            if event.timestamp >= start_ts
+                                && event.timestamp <= end_ts
+                                && filter.matches_ident(&event.ident)
+                            {
+                                all_events.push(event);
                             }
                         }
                     }
@@ -702,9 +888,10 @@ pub fn fetch_activities(
         }
     }
 
-    // OpenCode sessions
+    // OpenCode messages — use the pre-built index
     if filter.include_opencode && filter.include_messages {
-        if let Ok(events) = parse_opencode_messages(config) {
+        let storage_dir = crate::opencode_data_dir().join("storage");
+        if let Ok(events) = parse_opencode_messages_with_index(&storage_dir, config, &index) {
             for event in events {
                 if event.timestamp >= start_ts
                     && event.timestamp <= end_ts
@@ -721,10 +908,52 @@ pub fn fetch_activities(
         all_events.retain(|e| session_ids.iter().any(|sid| e.session_id == *sid));
     }
 
+    // Discard auto-loaded permission events: permission events that occur
+    // before the first user message in their session are the initial load
+    // of saved rules, not explicit user grants.
+    strip_preload_permissions(&mut all_events);
+
     // Sort by timestamp
     all_events.sort_by_key(|e| e.timestamp);
 
     Ok(all_events)
+}
+
+/// Remove permission events that precede the first user message in their
+/// session.
+///
+/// When a session starts, saved/project-level permissions are loaded
+/// automatically — these show up as a permission event before the user
+/// has typed anything.  Such events are noise for activity tracking so
+/// we drop them.  Any permission event that occurs *at or after* the
+/// first message in the same session is kept.
+fn strip_preload_permissions(events: &mut Vec<ActivityEvent>) {
+    // Build a map: session_id → earliest message timestamp.
+    let mut first_msg_ts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for e in events.iter() {
+        if e.activity_type == ActivityType::Message {
+            first_msg_ts
+                .entry(e.session_id.clone())
+                .and_modify(|ts| {
+                    if e.timestamp < *ts {
+                        *ts = e.timestamp;
+                    }
+                })
+                .or_insert(e.timestamp);
+        }
+    }
+
+    events.retain(|e| {
+        if e.activity_type != ActivityType::Permission {
+            return true;
+        }
+        match first_msg_ts.get(&e.session_id) {
+            // Permission before first message → auto-loaded, drop it.
+            Some(&msg_ts) => e.timestamp >= msg_ts,
+            // No messages for this session → no reference point, keep it.
+            None => true,
+        }
+    });
 }
 
 /// Filter for which activities to include

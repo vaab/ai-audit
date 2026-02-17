@@ -18,6 +18,18 @@ struct ActivityRecord<'a> {
     data: &'a crate::activity::ActivityData,
 }
 
+/// Payload with embedded ``session_id`` for NUL-separated output.
+///
+/// The 0k-activity contract requires 3 NUL-separated fields per record:
+/// ``timestamp\0ident\0payload_json\0``.  The ``session_id`` is folded
+/// into the JSON payload so the field count matches.
+#[derive(Debug, Serialize)]
+struct NulPayload<'a> {
+    session_id: &'a str,
+    #[serde(flatten)]
+    data: &'a crate::activity::ActivityData,
+}
+
 pub fn run(action: ActivityAction) -> Result<()> {
     let config = config::Config::load().context("Failed to load configuration")?;
 
@@ -74,14 +86,16 @@ pub fn run(action: ActivityAction) -> Result<()> {
                     }
                 }
                 OutputFormat::Nul => {
-                    // Format: timestamp\0ident\0session_id\0json_data\0
+                    // Format: timestamp\0ident\0json_data\0
+                    // Matches the 0k-activity 3-field contract;
+                    // session_id is embedded inside the JSON payload.
                     for event in events {
-                        let json = serde_json::to_string(&event.data)?;
-                        write!(
-                            handle,
-                            "{}\0{}\0{}\0{}\0",
-                            event.timestamp, event.ident, event.session_id, json
-                        )?;
+                        let payload = NulPayload {
+                            session_id: &event.session_id,
+                            data: &event.data,
+                        };
+                        let json = serde_json::to_string(&payload)?;
+                        write!(handle, "{}\0{}\0{}\0", event.timestamp, event.ident, json)?;
                     }
                 }
                 OutputFormat::Human => {
