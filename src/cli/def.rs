@@ -37,7 +37,7 @@ pub enum SessionType {
 #[command(group = ArgGroup::new("output-format").multiple(false))]
 pub struct OutputOpts {
     /// Output NUL-separated records for piping
-    #[arg(short = '0', long = "null", group = "output-format")]
+    #[arg(short = '0', long = "null", alias = "raw", group = "output-format")]
     pub nul: bool,
 
     /// Output as newline-delimited JSON
@@ -73,6 +73,10 @@ pub enum Commands {
         /// Filter by session type
         #[arg(short = 't', long = "type")]
         session_type: Option<SessionType>,
+
+        /// Filter by session ID (exact match)
+        #[arg(long)]
+        session_id: Option<String>,
 
         /// Only list sessions containing a message matching this string
         #[arg(short, long)]

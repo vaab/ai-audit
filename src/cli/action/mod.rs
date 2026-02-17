@@ -30,12 +30,14 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
         Commands::Permissions { session, output } => permissions::run(&session, output.format()),
         Commands::ListSessions {
             session_type,
+            session_id,
             search,
             timespan,
             project,
             output,
         } => list_sessions::run(
             session_type,
+            session_id.as_deref(),
             search.as_deref(),
             timespan.as_deref(),
             project.as_deref(),

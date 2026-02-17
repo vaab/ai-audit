@@ -37,6 +37,7 @@ impl TimespanFilter {
 
 pub fn run(
     session_type: Option<SessionType>,
+    session_id: Option<&str>,
     search: Option<&str>,
     timespan: Option<&str>,
     project: Option<&str>,
@@ -82,7 +83,12 @@ pub fn run(
         match claudecode::session::list_sessions() {
             Ok(cc_sessions) => {
                 for s in cc_sessions {
-                    // Filters: cheapest first (project, timespan, then search)
+                    // Filters: cheapest first (session_id, project, timespan, then search)
+                    if let Some(id) = session_id {
+                        if s.session_id != id {
+                            continue;
+                        }
+                    }
                     if let Some(ref expected) = project_path {
                         if s.project_dir != *expected {
                             continue;
@@ -121,7 +127,12 @@ pub fn run(
         match opencode::list_sessions() {
             Ok(oc_sessions) => {
                 for s in oc_sessions {
-                    // Filters: cheapest first (project, timespan, then search)
+                    // Filters: cheapest first (session_id, project, timespan, then search)
+                    if let Some(id) = session_id {
+                        if s.session_id != id {
+                            continue;
+                        }
+                    }
                     if let Some(ref expected) = project_path {
                         if s.project_dir != *expected {
                             continue;
@@ -254,4 +265,36 @@ pub fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use crate::cli::def::Args;
+
+    #[test]
+    fn cli_accepts_session_id_option() {
+        let args =
+            Args::try_parse_from(["ai-audit", "list-sessions", "--session-id", "ses_abc123"])
+                .expect("--session-id should be accepted");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { session_id, .. } => {
+                assert_eq!(session_id.as_deref(), Some("ses_abc123"));
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_session_id_default_is_none() {
+        let args =
+            Args::try_parse_from(["ai-audit", "list-sessions"]).expect("bare list-sessions works");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { session_id, .. } => {
+                assert!(session_id.is_none());
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
 }
