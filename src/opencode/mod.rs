@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod db;
 pub mod permissions;
 pub mod run;
 pub mod transcript;
@@ -22,6 +23,15 @@ pub fn log_dir() -> PathBuf {
 }
 
 pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
+    // Try DB first (richer data), fall back to file-based
+    if let Ok(info) = db::get_session_info_from_db(session_id) {
+        return Ok(info);
+    }
+    get_session_info_from_file(session_id)
+}
+
+/// File-based session info (original logic).
+fn get_session_info_from_file(session_id: &str) -> Result<SessionInfo> {
     let storage_dir = storage_dir();
     let session_file = storage_dir.join(format!("{}.json", session_id));
 
@@ -97,9 +107,10 @@ struct SessionTime {
 
 /// Check if a session's messages contain the given text.
 ///
-/// Walks message/<session_id>/ to find message IDs, then checks
-/// part/<msg_id>/ for text parts containing the needle.
+/// Checks both file-based storage and SQLite database. Returns true if
+/// either source finds a match.
 pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
+    // Check file-based first
     let storage_dir = storage_dir();
     let part_dir = storage_dir.parent().unwrap_or(&storage_dir).join("part");
     let message_dir = storage_dir
@@ -108,14 +119,20 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
         .join("message")
         .join(session_id);
 
-    session_contains_text_in_dirs(&message_dir, &part_dir, needle)
+    if session_contains_text_in_dirs(&message_dir, &part_dir, needle) {
+        return true;
+    }
+
+    // Fall back to DB
+    db::session_contains_text_from_db(session_id, needle)
 }
 
 /// Check if the last `last_n` messages of a session contain the given text.
 ///
-/// Like `session_contains_text` but only searches the most recent messages,
-/// which is much faster for large sessions.
+/// Checks both file-based storage and SQLite database. Returns true if
+/// either source finds a match.
 pub fn session_tail_contains_text(session_id: &str, needle: &str, last_n: usize) -> bool {
+    // Check file-based first
     let storage_dir = storage_dir();
     let part_dir = storage_dir.parent().unwrap_or(&storage_dir).join("part");
     let message_dir = storage_dir
@@ -124,7 +141,12 @@ pub fn session_tail_contains_text(session_id: &str, needle: &str, last_n: usize)
         .join("message")
         .join(session_id);
 
-    session_contains_text_in_dirs_tail(&message_dir, &part_dir, needle, Some(last_n))
+    if session_contains_text_in_dirs_tail(&message_dir, &part_dir, needle, Some(last_n)) {
+        return true;
+    }
+
+    // Fall back to DB
+    db::session_tail_contains_text_from_db(session_id, needle, last_n)
 }
 
 /// Check if an OpenCode part JSON contains the needle in searchable fields.
@@ -133,7 +155,7 @@ pub fn session_tail_contains_text(session_id: &str, needle: &str, last_n: usize)
 /// - `text` parts: the `text` field
 /// - `tool` parts: the tool name and `state.input` (serialized)
 /// - `tool` parts with output: `state.output` (serialized)
-fn part_contains_needle(part: &serde_json::Value, needle: &str) -> bool {
+pub(crate) fn part_contains_needle(part: &serde_json::Value, needle: &str) -> bool {
     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match part_type {
         "text" => part
@@ -268,6 +290,13 @@ fn session_contains_text_in_dirs_tail(
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
+    let file_sessions = list_sessions_from_files()?;
+    let db_sessions = db::list_sessions_from_db().unwrap_or_default();
+    Ok(merge_sessions(file_sessions, db_sessions))
+}
+
+/// File-based session listing (original logic).
+fn list_sessions_from_files() -> Result<Vec<SessionInfo>> {
     let session_base = crate::opencode_data_dir().join("storage/session");
     if !session_base.exists() {
         return Ok(Vec::new());
@@ -315,6 +344,30 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
 
     sessions.sort_by_key(|s| s.started_at);
     Ok(sessions)
+}
+
+/// Merge file-based and DB-based sessions, deduplicating by session_id.
+/// DB wins on conflict (it's the newer/canonical source).
+fn merge_sessions(
+    file_sessions: Vec<SessionInfo>,
+    db_sessions: Vec<SessionInfo>,
+) -> Vec<SessionInfo> {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, SessionInfo> = HashMap::new();
+
+    // Insert file-based first
+    for s in file_sessions {
+        by_id.insert(s.session_id.clone(), s);
+    }
+    // DB overwrites on conflict
+    for s in db_sessions {
+        by_id.insert(s.session_id.clone(), s);
+    }
+
+    let mut merged: Vec<SessionInfo> = by_id.into_values().collect();
+    merged.sort_by_key(|s| s.started_at);
+    merged
 }
 
 #[cfg(test)]
@@ -655,5 +708,89 @@ mod tests {
             &part_dir,
             "hello world output"
         ));
+    }
+
+    // --- Merge sessions tests ---
+
+    #[test]
+    fn test_merge_sessions_dedup_db_wins() {
+        let ts1 = Utc.timestamp_millis_opt(1705314600000).unwrap();
+        let ts2 = Utc.timestamp_millis_opt(1705314700000).unwrap();
+
+        let file_sessions = vec![SessionInfo {
+            session_id: "ses_001".to_string(),
+            started_at: ts1,
+            updated_at: ts1,
+            project_dir: "/old/path".to_string(),
+            title: "Old title".to_string(),
+            parent_id: None,
+        }];
+
+        let db_sessions = vec![SessionInfo {
+            session_id: "ses_001".to_string(),
+            started_at: ts1,
+            updated_at: ts2,
+            project_dir: "/new/path".to_string(),
+            title: "New title".to_string(),
+            parent_id: None,
+        }];
+
+        let merged = merge_sessions(file_sessions, db_sessions);
+        assert_eq!(merged.len(), 1);
+        // DB version wins
+        assert_eq!(merged[0].title, "New title");
+        assert_eq!(merged[0].project_dir, "/new/path");
+    }
+
+    #[test]
+    fn test_merge_sessions_combines_unique() {
+        let ts1 = Utc.timestamp_millis_opt(1705314600000).unwrap();
+        let ts2 = Utc.timestamp_millis_opt(1705314700000).unwrap();
+
+        let file_sessions = vec![SessionInfo {
+            session_id: "ses_file_only".to_string(),
+            started_at: ts1,
+            updated_at: ts1,
+            project_dir: "/proj".to_string(),
+            title: "File session".to_string(),
+            parent_id: None,
+        }];
+
+        let db_sessions = vec![SessionInfo {
+            session_id: "ses_db_only".to_string(),
+            started_at: ts2,
+            updated_at: ts2,
+            project_dir: "/proj".to_string(),
+            title: "DB session".to_string(),
+            parent_id: None,
+        }];
+
+        let merged = merge_sessions(file_sessions, db_sessions);
+        assert_eq!(merged.len(), 2);
+        // Sorted by started_at
+        assert_eq!(merged[0].session_id, "ses_file_only");
+        assert_eq!(merged[1].session_id, "ses_db_only");
+    }
+
+    #[test]
+    fn test_merge_sessions_empty_sources() {
+        let merged = merge_sessions(Vec::new(), Vec::new());
+        assert!(merged.is_empty());
+
+        let ts = Utc.timestamp_millis_opt(1705314600000).unwrap();
+        let sessions = vec![SessionInfo {
+            session_id: "ses_001".to_string(),
+            started_at: ts,
+            updated_at: ts,
+            project_dir: "/proj".to_string(),
+            title: "Only".to_string(),
+            parent_id: None,
+        }];
+
+        let merged = merge_sessions(sessions.clone(), Vec::new());
+        assert_eq!(merged.len(), 1);
+
+        let merged = merge_sessions(Vec::new(), sessions);
+        assert_eq!(merged.len(), 1);
     }
 }

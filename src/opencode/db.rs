@@ -1,0 +1,730 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::Connection;
+use std::path::PathBuf;
+
+use super::SessionInfo;
+
+/// Path to the OpenCode SQLite database.
+pub fn db_path() -> PathBuf {
+    crate::opencode_data_dir().join("opencode.db")
+}
+
+/// Check whether the SQLite database file exists.
+pub fn db_exists() -> bool {
+    db_path().exists()
+}
+
+/// Open the database in read-only mode with WAL journal.
+pub fn open_db() -> Result<Connection> {
+    let path = db_path();
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open database: {}", path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA query_only=true;")?;
+    Ok(conn)
+}
+
+/// Open an arbitrary database path (used by tests and for custom paths).
+pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open database: {}", path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA query_only=true;")?;
+    Ok(conn)
+}
+
+fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+/// List all sessions from the SQLite database.
+pub fn list_sessions_from_db() -> Result<Vec<SessionInfo>> {
+    let conn = open_db()?;
+    list_sessions_from_conn(&conn)
+}
+
+/// List all sessions using an existing connection (testable).
+pub fn list_sessions_from_conn(conn: &Connection) -> Result<Vec<SessionInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_id, directory, title, time_created, time_updated \
+         FROM session ORDER BY time_created",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let parent_id: Option<String> = row.get(1)?;
+        let directory: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        let title: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+        let time_created: i64 = row.get(4)?;
+        let time_updated: i64 = row.get(5)?;
+
+        Ok((id, parent_id, directory, title, time_created, time_updated))
+    })?;
+
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (id, parent_id, directory, title, time_created, time_updated) = row?;
+        let started_at = ms_to_datetime(time_created);
+        let updated_at = if time_updated > 0 {
+            ms_to_datetime(time_updated)
+        } else {
+            started_at
+        };
+        sessions.push(SessionInfo {
+            session_id: id,
+            started_at,
+            updated_at,
+            project_dir: directory,
+            title,
+            parent_id,
+        });
+    }
+
+    Ok(sessions)
+}
+
+/// Get info for a single session from the database.
+pub fn get_session_info_from_db(session_id: &str) -> Result<SessionInfo> {
+    let conn = open_db()?;
+    get_session_info_from_conn(&conn, session_id)
+}
+
+/// Get info for a single session using an existing connection (testable).
+pub fn get_session_info_from_conn(conn: &Connection, session_id: &str) -> Result<SessionInfo> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_id, directory, title, time_created, time_updated \
+         FROM session WHERE id = ?",
+    )?;
+
+    let (id, parent_id, directory, title, time_created, time_updated) =
+        stmt.query_row([session_id], |row| {
+            let id: String = row.get(0)?;
+            let parent_id: Option<String> = row.get(1)?;
+            let directory: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let title: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+            let time_created: i64 = row.get(4)?;
+            let time_updated: i64 = row.get(5)?;
+            Ok((id, parent_id, directory, title, time_created, time_updated))
+        })?;
+
+    let started_at = ms_to_datetime(time_created);
+    let updated_at = if time_updated > 0 {
+        ms_to_datetime(time_updated)
+    } else {
+        started_at
+    };
+
+    Ok(SessionInfo {
+        session_id: id,
+        started_at,
+        updated_at,
+        project_dir: directory,
+        title,
+        parent_id,
+    })
+}
+
+/// Check if any part in a session contains the needle text.
+///
+/// Queries all parts for the session, parses their `data` JSON, and applies
+/// the same `part_contains_needle()` logic used by the file-based search.
+pub fn session_contains_text_from_db(session_id: &str, needle: &str) -> bool {
+    let conn = match open_db() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    session_contains_text_from_conn(&conn, session_id, needle)
+}
+
+/// Testable version using an existing connection.
+pub fn session_contains_text_from_conn(conn: &Connection, session_id: &str, needle: &str) -> bool {
+    let parts = match get_parts_for_session(conn, session_id) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    for (_msg_id, part) in &parts {
+        // Fast pre-filter on raw JSON string
+        let raw = part.to_string();
+        if !raw.contains(needle) {
+            continue;
+        }
+        if super::part_contains_needle(part, needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if the last N messages of a session contain the needle text.
+pub fn session_tail_contains_text_from_db(session_id: &str, needle: &str, last_n: usize) -> bool {
+    let conn = match open_db() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    session_tail_contains_text_from_conn(&conn, session_id, needle, last_n)
+}
+
+/// Testable version using an existing connection.
+pub fn session_tail_contains_text_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    needle: &str,
+    last_n: usize,
+) -> bool {
+    // Get the last N message IDs
+    let mut stmt = match conn
+        .prepare("SELECT id FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT ?")
+    {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let msg_ids: Vec<String> = match stmt
+        .query_map(rusqlite::params![session_id, last_n as i64], |row| {
+            row.get(0)
+        }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => return false,
+    };
+
+    if msg_ids.is_empty() {
+        return false;
+    }
+
+    // Check parts for each of these messages
+    for msg_id in &msg_ids {
+        let parts = match get_parts_for_message(conn, msg_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for part in &parts {
+            let raw = part.to_string();
+            if !raw.contains(needle) {
+                continue;
+            }
+            if super::part_contains_needle(part, needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Get messages for a session: returns (msg_id, role, time_created_ms).
+///
+/// The `role` is extracted from the `data` JSON column.
+pub fn get_messages_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn
+        .prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC")?;
+
+    let rows = stmt.query_map([session_id], |row| {
+        let id: String = row.get(0)?;
+        let data_str: String = row.get(1)?;
+        Ok((id, data_str))
+    })?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let (id, data_str) = row?;
+        let data: serde_json::Value = match serde_json::from_str(&data_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let role = data
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let time_created = data
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        messages.push((id, role, time_created));
+    }
+
+    Ok(messages)
+}
+
+/// Get parsed `data` JSON values for all parts of a message.
+pub fn get_parts_for_message(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let mut stmt =
+        conn.prepare("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC")?;
+
+    let rows = stmt.query_map([message_id], |row| {
+        let data_str: String = row.get(0)?;
+        Ok(data_str)
+    })?;
+
+    let mut parts = Vec::new();
+    for row in rows {
+        let data_str = row?;
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str) {
+            parts.push(val);
+        }
+    }
+
+    Ok(parts)
+}
+
+/// Get all parts for a session: returns (message_id, data_json).
+///
+/// Joins through the message table to find all parts belonging to a session.
+pub fn get_parts_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<(String, serde_json::Value)>> {
+    let mut stmt = conn.prepare(
+        "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created ASC",
+    )?;
+
+    let rows = stmt.query_map([session_id], |row| {
+        let msg_id: String = row.get(0)?;
+        let data_str: String = row.get(1)?;
+        Ok((msg_id, data_str))
+    })?;
+
+    let mut parts = Vec::new();
+    for row in rows {
+        let (msg_id, data_str) = row?;
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str) {
+            parts.push((msg_id, val));
+        }
+    }
+
+    Ok(parts)
+}
+
+/// Create the schema in a connection (for testing).
+#[cfg(test)]
+pub fn create_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            parent_id TEXT,
+            directory TEXT,
+            title TEXT,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn
+    }
+
+    fn insert_session(
+        conn: &Connection,
+        id: &str,
+        parent_id: Option<&str>,
+        directory: &str,
+        title: &str,
+        time_created: i64,
+        time_updated: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, "proj_1", parent_id, directory, title, time_created, time_updated],
+        )
+        .unwrap();
+    }
+
+    fn insert_message(conn: &Connection, id: &str, session_id: &str, role: &str, time_ms: i64) {
+        let data = format!(r#"{{"role":"{}","time":{{"created":{}}}}}"#, role, time_ms);
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, time_ms, time_ms, data],
+        )
+        .unwrap();
+    }
+
+    fn insert_part(
+        conn: &Connection,
+        id: &str,
+        message_id: &str,
+        session_id: &str,
+        time_ms: i64,
+        data_json: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, message_id, session_id, time_ms, time_ms, data_json],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_list_sessions_from_conn_empty() {
+        let conn = setup_test_db();
+        let sessions = list_sessions_from_conn(&conn).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_list_sessions_from_conn() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/home/user/project",
+            "First session",
+            1705314600000,
+            1705314700000,
+        );
+        insert_session(
+            &conn,
+            "ses_002",
+            Some("ses_001"),
+            "/home/user/project",
+            "Sub-agent",
+            1705314800000,
+            1705314900000,
+        );
+
+        let sessions = list_sessions_from_conn(&conn).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        assert_eq!(sessions[0].session_id, "ses_001");
+        assert_eq!(sessions[0].project_dir, "/home/user/project");
+        assert_eq!(sessions[0].title, "First session");
+        assert!(sessions[0].parent_id.is_none());
+
+        assert_eq!(sessions[1].session_id, "ses_002");
+        assert_eq!(sessions[1].parent_id.as_deref(), Some("ses_001"));
+    }
+
+    #[test]
+    fn test_list_sessions_ordering() {
+        let conn = setup_test_db();
+        // Insert in reverse order
+        insert_session(
+            &conn,
+            "ses_b",
+            None,
+            "/b",
+            "B",
+            1705314800000,
+            1705314800000,
+        );
+        insert_session(
+            &conn,
+            "ses_a",
+            None,
+            "/a",
+            "A",
+            1705314600000,
+            1705314600000,
+        );
+
+        let sessions = list_sessions_from_conn(&conn).unwrap();
+        assert_eq!(sessions[0].session_id, "ses_a");
+        assert_eq!(sessions[1].session_id, "ses_b");
+    }
+
+    #[test]
+    fn test_get_session_info_from_conn() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/home/user/project",
+            "My session",
+            1705314600000,
+            1705314700000,
+        );
+
+        let info = get_session_info_from_conn(&conn, "ses_001").unwrap();
+        assert_eq!(info.session_id, "ses_001");
+        assert_eq!(info.title, "My session");
+        assert_eq!(info.project_dir, "/home/user/project");
+    }
+
+    #[test]
+    fn test_get_session_info_not_found() {
+        let conn = setup_test_db();
+        let result = get_session_info_from_conn(&conn, "ses_missing");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_messages_for_session() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "user", 1705314600000);
+        insert_message(&conn, "msg_002", "ses_001", "assistant", 1705314601000);
+        insert_message(&conn, "msg_003", "ses_002", "user", 1705314602000);
+
+        let messages = get_messages_for_session(&conn, "ses_001").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].0, "msg_001");
+        assert_eq!(messages[0].1, "user");
+        assert_eq!(messages[0].2, 1705314600000);
+        assert_eq!(messages[1].0, "msg_002");
+        assert_eq!(messages[1].1, "assistant");
+    }
+
+    #[test]
+    fn test_get_parts_for_message() {
+        let conn = setup_test_db();
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"Hello world"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_002",
+            "msg_001",
+            "ses_001",
+            1705314600100,
+            r#"{"type":"text","text":"More text"}"#,
+        );
+
+        let parts = get_parts_for_message(&conn, "msg_001").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].get("text").unwrap().as_str().unwrap(),
+            "Hello world"
+        );
+        assert_eq!(parts[1].get("text").unwrap().as_str().unwrap(), "More text");
+    }
+
+    #[test]
+    fn test_get_parts_for_session() {
+        let conn = setup_test_db();
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"Hello"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_002",
+            "msg_002",
+            "ses_001",
+            1705314601000,
+            r#"{"type":"tool","tool":"bash","state":{"input":{"command":"ls"}}}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_003",
+            "msg_003",
+            "ses_002",
+            1705314602000,
+            r#"{"type":"text","text":"Other session"}"#,
+        );
+
+        let parts = get_parts_for_session(&conn, "ses_001").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].0, "msg_001");
+        assert_eq!(parts[1].0, "msg_002");
+    }
+
+    #[test]
+    fn test_session_contains_text_from_conn_text_part() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "user", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"Hello world"}"#,
+        );
+
+        assert!(session_contains_text_from_conn(&conn, "ses_001", "Hello"));
+        assert!(session_contains_text_from_conn(&conn, "ses_001", "world"));
+        assert!(!session_contains_text_from_conn(&conn, "ses_001", "WORLD"));
+        assert!(!session_contains_text_from_conn(
+            &conn, "ses_001", "goodbye"
+        ));
+    }
+
+    #[test]
+    fn test_session_contains_text_from_conn_tool_part() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"bash","state":{"input":{"command":"cargo test"},"output":"test passed"}}"#,
+        );
+
+        assert!(session_contains_text_from_conn(&conn, "ses_001", "bash"));
+        assert!(session_contains_text_from_conn(
+            &conn,
+            "ses_001",
+            "cargo test"
+        ));
+        assert!(session_contains_text_from_conn(
+            &conn,
+            "ses_001",
+            "test passed"
+        ));
+        assert!(!session_contains_text_from_conn(
+            &conn,
+            "ses_001",
+            "npm install"
+        ));
+    }
+
+    #[test]
+    fn test_session_tail_contains_text_from_conn() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "user", 1705314600000);
+        insert_message(&conn, "msg_002", "ses_001", "assistant", 1705314601000);
+        insert_message(&conn, "msg_003", "ses_001", "user", 1705314602000);
+        insert_message(&conn, "msg_004", "ses_001", "assistant", 1705314603000);
+        insert_message(&conn, "msg_005", "ses_001", "user", 1705314604000);
+
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"old message"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_003",
+            "msg_003",
+            "ses_001",
+            1705314602000,
+            r#"{"type":"text","text":"unique target phrase"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_004",
+            "msg_004",
+            "ses_001",
+            1705314603000,
+            r#"{"type":"text","text":"recent message"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_005",
+            "msg_005",
+            "ses_001",
+            1705314604000,
+            r#"{"type":"text","text":"latest message"}"#,
+        );
+
+        // Last 2 should NOT find "unique target phrase" (it's in msg_003)
+        assert!(!session_tail_contains_text_from_conn(
+            &conn,
+            "ses_001",
+            "unique target phrase",
+            2
+        ));
+
+        // Last 3 SHOULD find it
+        assert!(session_tail_contains_text_from_conn(
+            &conn,
+            "ses_001",
+            "unique target phrase",
+            3
+        ));
+
+        // Last 2 should find "latest message"
+        assert!(session_tail_contains_text_from_conn(
+            &conn,
+            "ses_001",
+            "latest message",
+            2
+        ));
+    }
+
+    #[test]
+    fn test_session_contains_text_empty_session() {
+        let conn = setup_test_db();
+        assert!(!session_contains_text_from_conn(
+            &conn,
+            "ses_missing",
+            "anything"
+        ));
+    }
+
+    #[test]
+    fn test_timestamp_conversion() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_ts",
+            None,
+            "/proj",
+            "Timestamp test",
+            1705314600000, // 2024-01-15 10:30:00 UTC
+            1705314700000,
+        );
+
+        let info = get_session_info_from_conn(&conn, "ses_ts").unwrap();
+        assert_eq!(info.started_at.timestamp_millis(), 1705314600000);
+        assert_eq!(info.updated_at.timestamp_millis(), 1705314700000);
+    }
+
+    #[test]
+    fn test_zero_updated_at_falls_back_to_started() {
+        let conn = setup_test_db();
+        insert_session(&conn, "ses_zero", None, "/proj", "Zero", 1705314600000, 0);
+
+        let info = get_session_info_from_conn(&conn, "ses_zero").unwrap();
+        assert_eq!(info.started_at, info.updated_at);
+    }
+}

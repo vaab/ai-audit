@@ -308,6 +308,67 @@ fn scan_opencode_sessions_to_meta(session_dir: &Path, config: &Config) -> Vec<Se
     metas
 }
 
+/// Scan OpenCode sessions from the SQLite database and build `SessionMeta` entries.
+fn scan_opencode_sessions_to_meta_from_db(config: &Config) -> Vec<SessionMeta> {
+    if !crate::opencode::db::db_exists() {
+        return Vec::new();
+    }
+    let conn = match crate::opencode::db::open_db() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    scan_opencode_sessions_to_meta_from_conn(&conn, config)
+}
+
+/// Scan OpenCode sessions from a DB connection (testable).
+fn scan_opencode_sessions_to_meta_from_conn(
+    conn: &rusqlite::Connection,
+    config: &Config,
+) -> Vec<SessionMeta> {
+    let sessions = match crate::opencode::db::list_sessions_from_conn(conn) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    sessions
+        .into_iter()
+        .map(|s| {
+            let project_dir = if s.project_dir.is_empty() {
+                "unknown".to_string()
+            } else {
+                config.simplify_path(&s.project_dir)
+            };
+            SessionMeta {
+                id: s.session_id,
+                project_dir,
+                is_child: s.parent_id.is_some(),
+                client_type: ClientType::Opencode,
+                session_file: None,
+            }
+        })
+        .collect()
+}
+
+/// Merge two lists of `SessionMeta`, deduplicating by session ID.
+/// The second list (DB) wins on conflict.
+fn merge_session_metas(
+    file_metas: Vec<SessionMeta>,
+    db_metas: Vec<SessionMeta>,
+) -> Vec<SessionMeta> {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, SessionMeta> = HashMap::new();
+
+    for m in file_metas {
+        by_id.insert(m.id.clone(), m);
+    }
+    for m in db_metas {
+        by_id.insert(m.id.clone(), m);
+    }
+
+    by_id.into_values().collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct MessageContent {
     role: Option<String>,
@@ -721,6 +782,138 @@ fn get_opencode_message_content(part_dir: &Path, message_id: &str) -> Result<Str
     Ok(text_parts.join("\n"))
 }
 
+/// Get message content from OpenCode parts in the SQLite database.
+fn get_opencode_message_content_from_db(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+) -> Result<String> {
+    let parts = crate::opencode::db::get_parts_for_message(conn, message_id)?;
+
+    let mut text_parts = Vec::new();
+    for part in &parts {
+        if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                text_parts.push(text.to_string());
+            }
+        }
+    }
+
+    Ok(text_parts.join("\n"))
+}
+
+/// Parse user messages from OpenCode SQLite database using a pre-built session index.
+fn parse_opencode_messages_from_db(
+    conn: &rusqlite::Connection,
+    _config: &Config,
+    index: &SessionIndex,
+) -> Result<Vec<ActivityEvent>> {
+    let mut events = Vec::new();
+    let children = index.child_ids();
+
+    // Build a session_id → project_dir lookup from the index.
+    let dir_map: std::collections::HashMap<&str, &str> = index
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.project_dir.as_str()))
+        .collect();
+
+    // Get all sessions from the index that are OpenCode and non-child
+    for meta in index.non_child() {
+        if meta.client_type != ClientType::Opencode {
+            continue;
+        }
+
+        let session_id = &meta.id;
+
+        // Skip subagent sessions
+        if children.contains(session_id) {
+            continue;
+        }
+
+        let project_path = dir_map
+            .get(session_id.as_str())
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Get messages for this session from DB
+        let messages = match crate::opencode::db::get_messages_for_session(conn, session_id) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        for (msg_id, role, time_created) in &messages {
+            if role != "user" {
+                continue;
+            }
+
+            let msg_content = match get_opencode_message_content_from_db(conn, msg_id) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            if msg_content.trim().is_empty() {
+                continue;
+            }
+
+            // Timestamp is in milliseconds
+            let timestamp = time_created / 1000;
+
+            let ident = format!(
+                "{}-{}@{}",
+                ClientType::Opencode.as_str(),
+                ActivityType::Message.as_str(),
+                project_path
+            );
+
+            events.push(ActivityEvent {
+                timestamp,
+                ident,
+                session_id: session_id.clone(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: msg_content,
+                },
+            });
+        }
+    }
+
+    Ok(events)
+}
+
+/// Merge activity events from file and DB sources, deduplicating by
+/// (timestamp, session_id, ident). DB wins on conflict.
+fn merge_activity_events(
+    file_events: Vec<ActivityEvent>,
+    db_events: Vec<ActivityEvent>,
+) -> Vec<ActivityEvent> {
+    use std::collections::HashSet;
+
+    // Build a set of keys from DB events
+    let db_keys: HashSet<(i64, &str, &str)> = db_events
+        .iter()
+        .map(|e| (e.timestamp, e.session_id.as_str(), e.ident.as_str()))
+        .collect();
+
+    let mut merged = Vec::new();
+
+    // Add file events that don't conflict with DB
+    for event in file_events {
+        let key = (
+            event.timestamp,
+            event.session_id.as_str(),
+            event.ident.as_str(),
+        );
+        if !db_keys.contains(&key) {
+            merged.push(event);
+        }
+    }
+
+    // Add all DB events
+    merged.extend(db_events);
+
+    merged
+}
+
 /// List all available activity identifiers
 pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
     let mut identifiers = Vec::new();
@@ -728,7 +921,9 @@ pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
     // Build the combined session index
     let mut all_sessions = scan_claudecode_sessions(config);
     let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
-    all_sessions.extend(scan_opencode_sessions_to_meta(&oc_session_dir, config));
+    let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
+    let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
+    all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
     let index = SessionIndex {
         sessions: all_sessions,
     };
@@ -829,7 +1024,9 @@ pub fn fetch_activities(
     }
     if filter.include_opencode {
         let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
-        all_sessions.extend(scan_opencode_sessions_to_meta(&oc_session_dir, config));
+        let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
+        let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
+        all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
     }
     let index = SessionIndex {
         sessions: all_sessions,
@@ -888,17 +1085,28 @@ pub fn fetch_activities(
         }
     }
 
-    // OpenCode messages — use the pre-built index
+    // OpenCode messages — use the pre-built index, merge file + DB
     if filter.include_opencode && filter.include_messages {
         let storage_dir = crate::opencode_data_dir().join("storage");
-        if let Ok(events) = parse_opencode_messages_with_index(&storage_dir, config, &index) {
-            for event in events {
-                if event.timestamp >= start_ts
-                    && event.timestamp <= end_ts
-                    && filter.matches_ident(&event.ident)
-                {
-                    all_events.push(event);
-                }
+        let file_events =
+            parse_opencode_messages_with_index(&storage_dir, config, &index).unwrap_or_default();
+
+        let db_events = if crate::opencode::db::db_exists() {
+            crate::opencode::db::open_db()
+                .ok()
+                .and_then(|conn| parse_opencode_messages_from_db(&conn, config, &index).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let merged_events = merge_activity_events(file_events, db_events);
+        for event in merged_events {
+            if event.timestamp >= start_ts
+                && event.timestamp <= end_ts
+                && filter.matches_ident(&event.ident)
+            {
+                all_events.push(event);
             }
         }
     }
@@ -1913,5 +2121,340 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].session_id, "session-A");
         assert_eq!(filtered[1].session_id, "session-C");
+    }
+
+    // =========================================================================
+    // DB-based tests
+    // =========================================================================
+
+    fn setup_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::opencode::db::create_schema(&conn).unwrap();
+        conn
+    }
+
+    fn insert_session_db(
+        conn: &rusqlite::Connection,
+        id: &str,
+        parent_id: Option<&str>,
+        directory: &str,
+        time_created: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, "proj_1", parent_id, directory, "", time_created, time_created],
+        )
+        .unwrap();
+    }
+
+    fn insert_message_db(
+        conn: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        ts: i64,
+    ) {
+        let data = format!(r#"{{"role":"{}","time":{{"created":{}}}}}"#, role, ts);
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, ts, ts, data],
+        )
+        .unwrap();
+    }
+
+    fn insert_part_db(
+        conn: &rusqlite::Connection,
+        id: &str,
+        msg_id: &str,
+        session_id: &str,
+        ts: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, msg_id, session_id, ts, ts, data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_scan_opencode_sessions_to_meta_from_conn_basic() {
+        let config = default_config();
+        let conn = setup_test_db();
+
+        insert_session_db(&conn, "ses_001", None, "/home/user/project", 1705314600000);
+        insert_session_db(
+            &conn,
+            "ses_002",
+            Some("ses_001"),
+            "/home/user/project",
+            1705314700000,
+        );
+
+        let metas = scan_opencode_sessions_to_meta_from_conn(&conn, &config);
+        assert_eq!(metas.len(), 2);
+
+        let main = metas.iter().find(|m| m.id == "ses_001").unwrap();
+        assert!(!main.is_child);
+        assert!(main.project_dir.contains("/home/user/project"));
+
+        let child = metas.iter().find(|m| m.id == "ses_002").unwrap();
+        assert!(child.is_child);
+    }
+
+    #[test]
+    fn test_scan_opencode_sessions_to_meta_from_conn_empty() {
+        let config = default_config();
+        let conn = setup_test_db();
+
+        let metas = scan_opencode_sessions_to_meta_from_conn(&conn, &config);
+        assert!(metas.is_empty());
+    }
+
+    #[test]
+    fn test_merge_session_metas_dedup_db_wins() {
+        let file_metas = vec![SessionMeta {
+            id: "ses_001".to_string(),
+            project_dir: "/old/path".to_string(),
+            is_child: false,
+            client_type: ClientType::Opencode,
+            session_file: None,
+        }];
+
+        let db_metas = vec![SessionMeta {
+            id: "ses_001".to_string(),
+            project_dir: "/new/path".to_string(),
+            is_child: false,
+            client_type: ClientType::Opencode,
+            session_file: None,
+        }];
+
+        let merged = merge_session_metas(file_metas, db_metas);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].project_dir, "/new/path");
+    }
+
+    #[test]
+    fn test_merge_session_metas_combines_unique() {
+        let file_metas = vec![SessionMeta {
+            id: "ses_file".to_string(),
+            project_dir: "/proj".to_string(),
+            is_child: false,
+            client_type: ClientType::Opencode,
+            session_file: None,
+        }];
+
+        let db_metas = vec![SessionMeta {
+            id: "ses_db".to_string(),
+            project_dir: "/proj".to_string(),
+            is_child: false,
+            client_type: ClientType::Opencode,
+            session_file: None,
+        }];
+
+        let merged = merge_session_metas(file_metas, db_metas);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_get_opencode_message_content_from_db() {
+        let conn = setup_test_db();
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"Hello from DB"}"#,
+        );
+        insert_part_db(
+            &conn,
+            "prt_002",
+            "msg_001",
+            "ses_001",
+            1705314600100,
+            r#"{"type":"text","text":"More text"}"#,
+        );
+
+        let content = get_opencode_message_content_from_db(&conn, "msg_001").unwrap();
+        assert!(content.contains("Hello from DB"));
+        assert!(content.contains("More text"));
+    }
+
+    #[test]
+    fn test_get_opencode_message_content_from_db_skips_tool() {
+        let conn = setup_test_db();
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"bash","state":{"input":{"command":"ls"}}}"#,
+        );
+
+        let content = get_opencode_message_content_from_db(&conn, "msg_001").unwrap();
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn test_parse_opencode_messages_from_db_basic() {
+        let config = default_config();
+        let conn = setup_test_db();
+
+        insert_session_db(&conn, "ses_db1", None, "/home/user/project", 1705314600000);
+        insert_message_db(&conn, "msg_001", "ses_db1", "user", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db1",
+            1705314600000,
+            r#"{"type":"text","text":"Hello from DB"}"#,
+        );
+
+        let metas = scan_opencode_sessions_to_meta_from_conn(&conn, &config);
+        let index = SessionIndex { sessions: metas };
+
+        let events = parse_opencode_messages_from_db(&conn, &config, &index).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].activity_type, ActivityType::Message);
+        assert!(events[0].ident.starts_with("opencode-msg@"));
+        if let ActivityData::Message { content } = &events[0].data {
+            assert_eq!(content, "Hello from DB");
+        } else {
+            panic!("Expected Message data");
+        }
+    }
+
+    #[test]
+    fn test_parse_opencode_messages_from_db_skips_assistant() {
+        let config = default_config();
+        let conn = setup_test_db();
+
+        insert_session_db(&conn, "ses_db2", None, "/project", 1705314600000);
+        insert_message_db(&conn, "msg_001", "ses_db2", "assistant", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db2",
+            1705314600000,
+            r#"{"type":"text","text":"Assistant response"}"#,
+        );
+
+        let metas = scan_opencode_sessions_to_meta_from_conn(&conn, &config);
+        let index = SessionIndex { sessions: metas };
+
+        let events = parse_opencode_messages_from_db(&conn, &config, &index).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_opencode_messages_from_db_skips_children() {
+        let config = default_config();
+        let conn = setup_test_db();
+
+        insert_session_db(&conn, "ses_parent", None, "/project", 1705314600000);
+        insert_session_db(
+            &conn,
+            "ses_child",
+            Some("ses_parent"),
+            "/project",
+            1705314700000,
+        );
+        insert_message_db(&conn, "msg_001", "ses_child", "user", 1705314700000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_child",
+            1705314700000,
+            r#"{"type":"text","text":"Child message"}"#,
+        );
+
+        let metas = scan_opencode_sessions_to_meta_from_conn(&conn, &config);
+        let index = SessionIndex { sessions: metas };
+
+        let events = parse_opencode_messages_from_db(&conn, &config, &index).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_merge_activity_events_dedup_db_wins() {
+        let file_events = vec![
+            ActivityEvent {
+                timestamp: 100,
+                ident: "opencode-msg@/proj".to_string(),
+                session_id: "ses_001".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "file version".to_string(),
+                },
+            },
+            ActivityEvent {
+                timestamp: 200,
+                ident: "opencode-msg@/proj".to_string(),
+                session_id: "ses_001".to_string(),
+                activity_type: ActivityType::Message,
+                data: ActivityData::Message {
+                    content: "file only".to_string(),
+                },
+            },
+        ];
+
+        let db_events = vec![ActivityEvent {
+            timestamp: 100,
+            ident: "opencode-msg@/proj".to_string(),
+            session_id: "ses_001".to_string(),
+            activity_type: ActivityType::Message,
+            data: ActivityData::Message {
+                content: "db version".to_string(),
+            },
+        }];
+
+        let merged = merge_activity_events(file_events, db_events);
+        assert_eq!(merged.len(), 2);
+
+        // The event at ts=100 should be the DB version
+        let ts100 = merged.iter().find(|e| e.timestamp == 100).unwrap();
+        if let ActivityData::Message { content } = &ts100.data {
+            assert_eq!(content, "db version");
+        } else {
+            panic!("Expected Message data");
+        }
+
+        // The event at ts=200 should be the file version (unique)
+        let ts200 = merged.iter().find(|e| e.timestamp == 200).unwrap();
+        if let ActivityData::Message { content } = &ts200.data {
+            assert_eq!(content, "file only");
+        } else {
+            panic!("Expected Message data");
+        }
+    }
+
+    #[test]
+    fn test_merge_activity_events_empty_sources() {
+        let merged = merge_activity_events(Vec::new(), Vec::new());
+        assert!(merged.is_empty());
+
+        let events = vec![ActivityEvent {
+            timestamp: 100,
+            ident: "test".to_string(),
+            session_id: "ses_001".to_string(),
+            activity_type: ActivityType::Message,
+            data: ActivityData::Message {
+                content: "msg".to_string(),
+            },
+        }];
+
+        let merged = merge_activity_events(events.clone(), Vec::new());
+        assert_eq!(merged.len(), 1);
+
+        let merged = merge_activity_events(Vec::new(), events);
+        assert_eq!(merged.len(), 1);
     }
 }

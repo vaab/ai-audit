@@ -604,26 +604,51 @@ fn get_process_name(pid: u32) -> Option<String> {
 
 /// Gather OpenCode candidate sessions for the given directory.
 ///
-/// Reads `storage/session/<hash>/ses_*.json`, filters to:
+/// Reads `storage/session/<hash>/ses_*.json` and queries SQLite,
+/// filters to:
 /// - Non-child sessions (no `parentID`)
 /// - Matching directory
 /// - Sorted by `time.updated` descending
+///
+/// Deduplicates by session_id; DB wins on conflict.
 fn gather_opencode_candidates(cwd: &Path) -> Result<Vec<Candidate>> {
+    let file_candidates = gather_opencode_candidates_from_files(cwd);
+    let db_candidates = gather_opencode_candidates_from_db(cwd);
+    Ok(merge_candidates(file_candidates, db_candidates))
+}
+
+/// Gather candidates from file-based session storage.
+fn gather_opencode_candidates_from_files(cwd: &Path) -> Vec<Candidate> {
     let session_base = crate::opencode_data_dir().join("storage/session");
     if !session_base.exists() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let cwd_str = cwd.to_string_lossy();
     let mut candidates = Vec::new();
 
-    for project_entry in fs::read_dir(&session_base)? {
-        let project_entry = project_entry?;
+    let project_entries = match fs::read_dir(&session_base) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    for project_entry in project_entries {
+        let project_entry = match project_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         if !project_entry.path().is_dir() {
             continue;
         }
-        for file_entry in fs::read_dir(project_entry.path())? {
-            let file_entry = file_entry?;
+        let file_entries = match fs::read_dir(project_entry.path()) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for file_entry in file_entries {
+            let file_entry = match file_entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             let path = file_entry.path();
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
@@ -665,9 +690,82 @@ fn gather_opencode_candidates(cwd: &Path) -> Result<Vec<Candidate>> {
         }
     }
 
-    // Sort by most recently updated first
-    candidates.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
-    Ok(candidates)
+    candidates
+}
+
+/// Gather candidates from the SQLite database.
+fn gather_opencode_candidates_from_db(cwd: &Path) -> Vec<Candidate> {
+    if !crate::opencode::db::db_exists() {
+        return Vec::new();
+    }
+    let conn = match crate::opencode::db::open_db() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    gather_opencode_candidates_from_conn(&conn, cwd)
+}
+
+/// Gather candidates from a DB connection (testable).
+fn gather_opencode_candidates_from_conn(conn: &rusqlite::Connection, cwd: &Path) -> Vec<Candidate> {
+    let cwd_str = cwd.to_string_lossy();
+    let mut stmt = match conn.prepare(
+        "SELECT id, parent_id, directory, time_updated \
+         FROM session WHERE directory = ? AND parent_id IS NULL \
+         ORDER BY time_updated DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match stmt.query_map([cwd_str.as_ref()], |row| {
+        let id: String = row.get(0)?;
+        let _parent_id: Option<String> = row.get(1)?;
+        let _directory: String = row.get(2)?;
+        let time_updated: i64 = row.get(3)?;
+        Ok((id, time_updated))
+    }) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        if let Ok((id, time_updated)) = row {
+            if !id.is_empty() {
+                candidates.push(Candidate {
+                    session_id: id,
+                    provider: Provider::OpenCode,
+                    updated_ms: time_updated,
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Merge file-based and DB-based candidates, deduplicating by session_id.
+/// DB wins on conflict.
+fn merge_candidates(
+    file_candidates: Vec<Candidate>,
+    db_candidates: Vec<Candidate>,
+) -> Vec<Candidate> {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, Candidate> = HashMap::new();
+
+    // Insert file-based first
+    for c in file_candidates {
+        by_id.insert(c.session_id.clone(), c);
+    }
+    // DB overwrites on conflict
+    for c in db_candidates {
+        by_id.insert(c.session_id.clone(), c);
+    }
+
+    let mut merged: Vec<Candidate> = by_id.into_values().collect();
+    merged.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+    merged
 }
 
 /// Gather Claude Code candidate sessions for the given directory.
@@ -764,8 +862,31 @@ fn transcript_contains_fingerprint(
 
 /// Check OpenCode session transcript for a recent bash tool call
 /// containing the fingerprint.
+///
+/// Checks both file-based storage and SQLite database.
 fn opencode_transcript_has_fingerprint(session_id: &str, fingerprint: &str) -> bool {
+    // Check file-based first
     let storage_dir = crate::opencode_data_dir().join("storage");
+    if opencode_transcript_has_fingerprint_in_files(&storage_dir, session_id, fingerprint) {
+        return true;
+    }
+
+    // Fall back to DB
+    if crate::opencode::db::db_exists() {
+        if let Ok(conn) = crate::opencode::db::open_db() {
+            return opencode_transcript_has_fingerprint_in_db(&conn, session_id, fingerprint);
+        }
+    }
+
+    false
+}
+
+/// File-based fingerprint check (original logic).
+fn opencode_transcript_has_fingerprint_in_files(
+    storage_dir: &Path,
+    session_id: &str,
+    fingerprint: &str,
+) -> bool {
     let message_dir = storage_dir.join("message").join(session_id);
     let part_dir = storage_dir.join("part");
 
@@ -824,6 +945,60 @@ fn opencode_transcript_has_fingerprint(session_id: &str, fingerprint: &str) -> b
             };
 
             // Check for tool type with bash command containing fingerprint
+            if part.get("type").and_then(|v| v.as_str()) == Some("tool") {
+                let tool_name = part.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                if tool_name.eq_ignore_ascii_case("bash") {
+                    if let Some(input) = part
+                        .get("state")
+                        .and_then(|s| s.get("input"))
+                        .and_then(|i| i.get("command"))
+                        .and_then(|c| c.as_str())
+                    {
+                        if input.contains(fingerprint) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// DB-based fingerprint check: queries parts for the session looking for
+/// bash tool calls containing the fingerprint.
+fn opencode_transcript_has_fingerprint_in_db(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    fingerprint: &str,
+) -> bool {
+    // Get the last 5 messages for this session
+    let mut stmt = match conn
+        .prepare("SELECT id FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT 5")
+    {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let msg_ids: Vec<String> = match stmt.query_map([session_id], |row| row.get(0)) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => return false,
+    };
+
+    for msg_id in &msg_ids {
+        let parts = match crate::opencode::db::get_parts_for_message(conn, msg_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        for part in &parts {
+            // Fast pre-filter
+            let raw = part.to_string();
+            if !raw.contains(fingerprint) {
+                continue;
+            }
+
             if part.get("type").and_then(|v| v.as_str()) == Some("tool") {
                 let tool_name = part.get("tool").and_then(|v| v.as_str()).unwrap_or("");
                 if tool_name.eq_ignore_ascii_case("bash") {
@@ -990,9 +1165,26 @@ fn safe_truncate(s: &str, max_chars: usize) -> &str {
 ///
 /// Reads the last `max_messages` user messages, returning the first 60
 /// chars of each (minimum 12 chars to be useful for matching).
+///
+/// Checks both file-based storage and SQLite database, combining results.
 fn get_opencode_user_snippets(session_id: &str, max_messages: usize) -> Vec<String> {
     let storage_dir = crate::opencode_data_dir().join("storage");
-    get_opencode_user_snippets_in(&storage_dir, session_id, max_messages)
+    let mut snippets = get_opencode_user_snippets_in(&storage_dir, session_id, max_messages);
+
+    // Also gather from DB and combine (snippets are used for matching,
+    // no dedup needed — more snippets = better matching)
+    if crate::opencode::db::db_exists() {
+        if let Ok(conn) = crate::opencode::db::open_db() {
+            let db_snippets = get_opencode_user_snippets_from_db(&conn, session_id, max_messages);
+            for s in db_snippets {
+                if !snippets.contains(&s) {
+                    snippets.push(s);
+                }
+            }
+        }
+    }
+
+    snippets
 }
 
 /// Testable variant that accepts a storage directory override.
@@ -1071,6 +1263,54 @@ fn get_opencode_user_snippets_in(
                 Err(_) => continue,
             };
 
+            if part.get("type").and_then(|v| v.as_str()) != Some("text") {
+                continue;
+            }
+
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                let trimmed = text.trim();
+                if trimmed.len() >= 12 {
+                    let snippet = safe_truncate(trimmed, 60).to_string();
+                    snippets.push(snippet);
+                    break; // one snippet per message
+                }
+            }
+        }
+    }
+
+    snippets
+}
+
+/// Extract user-message snippets from the SQLite database.
+fn get_opencode_user_snippets_from_db(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    max_messages: usize,
+) -> Vec<String> {
+    // Get the last N user messages
+    let messages = match crate::opencode::db::get_messages_for_session(conn, session_id) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut snippets = Vec::new();
+
+    // Walk from newest to oldest, collecting user messages
+    for (msg_id, role, _time_created) in messages.iter().rev() {
+        if snippets.len() >= max_messages {
+            break;
+        }
+
+        if role != "user" {
+            continue;
+        }
+
+        let parts = match crate::opencode::db::get_parts_for_message(conn, msg_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        for part in &parts {
             if part.get("type").and_then(|v| v.as_str()) != Some("text") {
                 continue;
             }
@@ -2179,5 +2419,281 @@ mod tests {
             match_snippets_against_panes(&candidate_snippets, Provider::OpenCode, &pane_contents);
         assert!(result.is_some());
         assert_eq!(result.unwrap().session_id, "ses_bbb");
+    }
+
+    // === DB-based tests ===
+
+    fn setup_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::opencode::db::create_schema(&conn).unwrap();
+        conn
+    }
+
+    fn insert_session_db(
+        conn: &rusqlite::Connection,
+        id: &str,
+        parent_id: Option<&str>,
+        directory: &str,
+        time_updated: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, "proj_1", parent_id, directory, "", time_updated, time_updated],
+        )
+        .unwrap();
+    }
+
+    fn insert_message_db(
+        conn: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        ts: i64,
+    ) {
+        let data = format!(r#"{{"role":"{}","time":{{"created":{}}}}}"#, role, ts);
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, ts, ts, data],
+        )
+        .unwrap();
+    }
+
+    fn insert_part_db(
+        conn: &rusqlite::Connection,
+        id: &str,
+        msg_id: &str,
+        session_id: &str,
+        ts: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, msg_id, session_id, ts, ts, data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_gather_opencode_candidates_from_conn_basic() {
+        let conn = setup_test_db();
+        insert_session_db(&conn, "ses_001", None, "/test/dir", 2000);
+        insert_session_db(&conn, "ses_002", None, "/test/dir", 3000);
+        insert_session_db(&conn, "ses_003", None, "/other/dir", 4000);
+
+        let candidates = gather_opencode_candidates_from_conn(&conn, Path::new("/test/dir"));
+        assert_eq!(candidates.len(), 2);
+        // Most recently updated first
+        assert_eq!(candidates[0].session_id, "ses_002");
+        assert_eq!(candidates[1].session_id, "ses_001");
+    }
+
+    #[test]
+    fn test_gather_opencode_candidates_from_conn_filters_children() {
+        let conn = setup_test_db();
+        insert_session_db(&conn, "ses_main", None, "/test/dir", 2000);
+        insert_session_db(&conn, "ses_child", Some("ses_main"), "/test/dir", 3000);
+
+        let candidates = gather_opencode_candidates_from_conn(&conn, Path::new("/test/dir"));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "ses_main");
+    }
+
+    #[test]
+    fn test_gather_opencode_candidates_from_conn_empty() {
+        let conn = setup_test_db();
+        let candidates = gather_opencode_candidates_from_conn(&conn, Path::new("/test/dir"));
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_merge_candidates_dedup_db_wins() {
+        let file_candidates = vec![
+            Candidate {
+                session_id: "ses_001".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 1000,
+            },
+            Candidate {
+                session_id: "ses_002".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 2000,
+            },
+        ];
+
+        let db_candidates = vec![Candidate {
+            session_id: "ses_001".to_string(),
+            provider: Provider::OpenCode,
+            updated_ms: 5000, // DB has newer timestamp
+        }];
+
+        let merged = merge_candidates(file_candidates, db_candidates);
+        assert_eq!(merged.len(), 2);
+        // ses_001 should have DB's updated_ms
+        let ses_001 = merged.iter().find(|c| c.session_id == "ses_001").unwrap();
+        assert_eq!(ses_001.updated_ms, 5000);
+    }
+
+    #[test]
+    fn test_merge_candidates_combines_unique() {
+        let file_candidates = vec![Candidate {
+            session_id: "ses_file".to_string(),
+            provider: Provider::OpenCode,
+            updated_ms: 1000,
+        }];
+
+        let db_candidates = vec![Candidate {
+            session_id: "ses_db".to_string(),
+            provider: Provider::OpenCode,
+            updated_ms: 2000,
+        }];
+
+        let merged = merge_candidates(file_candidates, db_candidates);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_opencode_transcript_has_fingerprint_in_db_match() {
+        let conn = setup_test_db();
+        insert_message_db(&conn, "msg_001", "ses_fp1", "assistant", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_fp1",
+            1705314600000,
+            r#"{"type":"tool","tool":"bash","state":{"input":{"command":"ai-audit transcript"}}}"#,
+        );
+
+        assert!(opencode_transcript_has_fingerprint_in_db(
+            &conn, "ses_fp1", "ai-audit"
+        ));
+    }
+
+    #[test]
+    fn test_opencode_transcript_has_fingerprint_in_db_no_match() {
+        let conn = setup_test_db();
+        insert_message_db(&conn, "msg_001", "ses_fp2", "assistant", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_fp2",
+            1705314600000,
+            r#"{"type":"tool","tool":"bash","state":{"input":{"command":"cargo test"}}}"#,
+        );
+
+        assert!(!opencode_transcript_has_fingerprint_in_db(
+            &conn, "ses_fp2", "ai-audit"
+        ));
+    }
+
+    #[test]
+    fn test_opencode_transcript_has_fingerprint_in_db_only_bash() {
+        let conn = setup_test_db();
+        insert_message_db(&conn, "msg_001", "ses_fp3", "assistant", 1705314600000);
+        // Text part containing "ai-audit" — should NOT match
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_fp3",
+            1705314600000,
+            r#"{"type":"text","text":"Let me run ai-audit for you"}"#,
+        );
+
+        assert!(!opencode_transcript_has_fingerprint_in_db(
+            &conn, "ses_fp3", "ai-audit"
+        ));
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_from_db_basic() {
+        let conn = setup_test_db();
+        insert_message_db(&conn, "msg_001", "ses_snip_db1", "user", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_snip_db1",
+            1705314600000,
+            r#"{"type":"text","text":"Please help me refactor the authentication module"}"#,
+        );
+
+        let snippets = get_opencode_user_snippets_from_db(&conn, "ses_snip_db1", 5);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(
+            snippets[0],
+            "Please help me refactor the authentication module"
+        );
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_from_db_skips_short() {
+        let conn = setup_test_db();
+        insert_message_db(&conn, "msg_001", "ses_snip_db2", "user", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_snip_db2",
+            1705314600000,
+            r#"{"type":"text","text":"yes"}"#,
+        );
+
+        let snippets = get_opencode_user_snippets_from_db(&conn, "ses_snip_db2", 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_from_db_skips_assistant() {
+        let conn = setup_test_db();
+        insert_message_db(&conn, "msg_001", "ses_snip_db3", "assistant", 1705314600000);
+        insert_part_db(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_snip_db3",
+            1705314600000,
+            r#"{"type":"text","text":"Here is the refactored authentication module"}"#,
+        );
+
+        let snippets = get_opencode_user_snippets_from_db(&conn, "ses_snip_db3", 5);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn test_get_opencode_user_snippets_from_db_respects_max() {
+        let conn = setup_test_db();
+        for i in 1..=5 {
+            let msg_id = format!("msg_{:03}", i);
+            let prt_id = format!("prt_{:03}", i);
+            insert_message_db(
+                &conn,
+                &msg_id,
+                "ses_snip_db4",
+                "user",
+                1705314600000 + i * 1000,
+            );
+            insert_part_db(
+                &conn,
+                &prt_id,
+                &msg_id,
+                "ses_snip_db4",
+                1705314600000 + i * 1000,
+                &format!(
+                    r#"{{"type":"text","text":"User message number {} with enough text"}}"#,
+                    i
+                ),
+            );
+        }
+
+        let snippets = get_opencode_user_snippets_from_db(&conn, "ses_snip_db4", 2);
+        assert_eq!(snippets.len(), 2);
+        // Should be the most recent (msg_005, msg_004)
+        assert!(snippets[0].contains("number 5"));
+        assert!(snippets[1].contains("number 4"));
     }
 }
