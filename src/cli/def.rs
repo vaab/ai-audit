@@ -90,6 +90,10 @@ pub enum Commands {
         #[arg(short, long)]
         project: Option<String>,
 
+        /// Only list sessions where this file was written or edited
+        #[arg(short, long)]
+        file: Option<String>,
+
         /// Include sub-agent sessions (hidden by default)
         #[arg(short, long)]
         all: bool,

@@ -34,6 +34,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             search,
             timespan,
             project,
+            file,
             all,
             output,
         } => list_sessions::run(
@@ -42,6 +43,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             search.as_deref(),
             timespan.as_deref(),
             project.as_deref(),
+            file.as_deref(),
             all,
             output.format(),
             quiet,

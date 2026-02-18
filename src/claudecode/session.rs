@@ -277,6 +277,108 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     file_contains_text(&session_file, needle)
 }
 
+/// Claude Code tool names that write or edit files.
+const WRITE_TOOL_NAMES: &[&str] = &["Write", "Edit", "MultiEdit", "CreateFile"];
+
+/// Check if a session contains any Write or Edit tool_use targeting the given file path.
+///
+/// The `target_path` should be an absolute, canonicalized path. It is matched against
+/// the `file_path` input field of Write/Edit tool_use blocks. Both exact match and
+/// suffix match (for relative paths stored in tool inputs) are tried.
+pub fn session_edited_file(session_uuid: &str, target_path: &str) -> bool {
+    let session_file = match find_session_file(session_uuid) {
+        Some(f) => f,
+        None => return false,
+    };
+    file_edited_file(&session_file, target_path)
+}
+
+/// Check if a session JSONL file contains a write/edit tool_use targeting the given path.
+///
+/// Uses a two-pass strategy: first a raw string check for the filename component
+/// to skip files that cannot possibly match, then proper JSON parsing.
+fn file_edited_file(path: &Path, target_path: &str) -> bool {
+    use std::io::BufRead;
+
+    // Fast pre-filter: check if the filename component appears anywhere in the raw file.
+    let filename = std::path::Path::new(target_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(target_path);
+
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !raw.contains(filename) {
+        return false;
+    }
+
+    // Slow path: parse JSONL and check tool_use blocks.
+    let reader = std::io::BufReader::new(raw.as_bytes());
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Quick pre-filter: skip lines without the filename
+        if !line.contains(filename) {
+            continue;
+        }
+
+        // Only assistant messages have tool_use blocks
+        if !line.contains("\"type\":\"assistant\"") {
+            continue;
+        }
+
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+
+        let content = match entry.get("message").and_then(|m| m.get("content")) {
+            Some(serde_json::Value::Array(arr)) => arr,
+            _ => continue,
+        };
+
+        for block in content {
+            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if block_type != "tool_use" {
+                continue;
+            }
+            let tool_name = match block.get("name").and_then(|n| n.as_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !WRITE_TOOL_NAMES.contains(&tool_name) {
+                continue;
+            }
+            let tool_path = match block
+                .get("input")
+                .and_then(|i| i.get("file_path"))
+                .and_then(|p| p.as_str())
+            {
+                Some(p) => p,
+                None => continue,
+            };
+            if crate::file_path_matches(tool_path, target_path) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Check if the last `last_n` messages of a session contain the given text.
 ///
 /// Like `session_contains_text` but only searches the most recent messages.
@@ -890,5 +992,116 @@ mod tests {
         assert!(!file_tail_contains_text(file.path(), "old message", 1));
         // But IS in the last 2
         assert!(file_tail_contains_text(file.path(), "old message", 2));
+    }
+
+    // === file_edited_file tests ===
+
+    #[test]
+    fn test_file_edited_file_write_absolute_match() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Write","input":{{"file_path":"/home/user/project/src/main.rs","content":"fn main() {{}}"}}}}]}}}}"#
+        ).unwrap();
+
+        assert!(file_edited_file(
+            file.path(),
+            "/home/user/project/src/main.rs"
+        ));
+        assert!(!file_edited_file(
+            file.path(),
+            "/home/user/project/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_file_edited_file_edit_tool() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"/home/user/src/lib.rs","old_string":"old","new_string":"new"}}}}]}}}}"#
+        ).unwrap();
+
+        assert!(file_edited_file(file.path(), "/home/user/src/lib.rs"));
+    }
+
+    #[test]
+    fn test_file_edited_file_multiedit_tool() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"MultiEdit","input":{{"file_path":"/home/user/src/mod.rs","edits":[]}}}}]}}}}"#
+        ).unwrap();
+
+        assert!(file_edited_file(file.path(), "/home/user/src/mod.rs"));
+    }
+
+    #[test]
+    fn test_file_edited_file_createfile_tool() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"CreateFile","input":{{"file_path":"/home/user/new.rs","content":"// new"}}}}]}}}}"#
+        ).unwrap();
+
+        assert!(file_edited_file(file.path(), "/home/user/new.rs"));
+    }
+
+    #[test]
+    fn test_file_edited_file_relative_path_in_tool() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Write","input":{{"file_path":"src/main.rs","content":"fn main() {{}}"}}}}]}}}}"#
+        ).unwrap();
+
+        // Relative tool path should suffix-match against absolute target
+        assert!(file_edited_file(
+            file.path(),
+            "/home/user/project/src/main.rs"
+        ));
+        assert!(!file_edited_file(
+            file.path(),
+            "/home/user/project/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_file_edited_file_ignores_non_write_tools() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Read","input":{{"file_path":"/home/user/src/main.rs"}}}}]}}}}"#
+        ).unwrap();
+
+        assert!(!file_edited_file(file.path(), "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_file_edited_file_ignores_user_messages() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"user","content":"edit /home/user/src/main.rs"}}}}"#
+        ).unwrap();
+
+        assert!(!file_edited_file(file.path(), "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_file_edited_file_empty_file() {
+        let file = NamedTempFile::new().unwrap();
+        assert!(!file_edited_file(file.path(), "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_file_edited_file_multiple_tools_one_matches() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Read","input":{{"file_path":"/home/user/src/main.rs"}}}},{{"type":"tool_use","name":"Write","input":{{"file_path":"/home/user/src/main.rs","content":"updated"}}}}]}}}}"#
+        ).unwrap();
+
+        assert!(file_edited_file(file.path(), "/home/user/src/main.rs"));
     }
 }

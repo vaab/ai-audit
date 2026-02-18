@@ -41,6 +41,7 @@ pub fn run(
     search: Option<&str>,
     timespan: Option<&str>,
     project: Option<&str>,
+    file: Option<&str>,
     all: bool,
     format: OutputFormat,
     quiet: bool,
@@ -74,6 +75,21 @@ pub fn run(
         None => None,
     };
 
+    // Resolve --file to an absolute path for structured matching
+    let file_path: Option<String> = match file {
+        Some(f) => {
+            let path = PathBuf::from(f);
+            let abs = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            let resolved = abs.canonicalize().unwrap_or(abs);
+            Some(resolved.to_string_lossy().to_string())
+        }
+        None => None,
+    };
+
     let mut sessions: Vec<SessionRecord> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -101,6 +117,11 @@ pub fn run(
                         + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
                     if let Some(ref filter) = ts_filter {
                         if !filter.overlaps(started, updated) {
+                            continue;
+                        }
+                    }
+                    if let Some(ref target) = file_path {
+                        if !claudecode::session::session_edited_file(&s.session_id, target) {
                             continue;
                         }
                     }
@@ -148,6 +169,11 @@ pub fn run(
                         + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
                     if let Some(ref filter) = ts_filter {
                         if !filter.overlaps(started, updated) {
+                            continue;
+                        }
+                    }
+                    if let Some(ref target) = file_path {
+                        if !opencode::session_edited_file(&s.session_id, target) {
                             continue;
                         }
                     }

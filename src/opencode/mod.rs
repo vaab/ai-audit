@@ -127,6 +127,134 @@ pub fn session_contains_text(session_id: &str, needle: &str) -> bool {
     db::session_contains_text_from_db(session_id, needle)
 }
 
+/// OpenCode tool names that write or edit files.
+const WRITE_TOOL_NAMES: &[&str] = &["write", "edit", "multi_edit", "create"];
+
+/// Check if a session contains any write/edit tool_use targeting the given file path.
+///
+/// Checks both file-based storage and SQLite database. Returns true if
+/// either source finds a match.
+pub fn session_edited_file(session_id: &str, target_path: &str) -> bool {
+    // Check file-based first
+    let storage_dir = storage_dir();
+    let part_dir = storage_dir.parent().unwrap_or(&storage_dir).join("part");
+    let message_dir = storage_dir
+        .parent()
+        .unwrap_or(&storage_dir)
+        .join("message")
+        .join(session_id);
+
+    if session_edited_file_in_dirs(&message_dir, &part_dir, target_path) {
+        return true;
+    }
+
+    // Fall back to DB
+    db::session_edited_file_from_db(session_id, target_path)
+}
+
+/// Check if a part JSON represents a write/edit tool targeting the given file path.
+fn part_edits_file(part: &serde_json::Value, target_path: &str) -> bool {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if part_type != "tool" {
+        return false;
+    }
+    let tool_name = match part.get("tool").and_then(|t| t.as_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    if !WRITE_TOOL_NAMES.contains(&tool_name) {
+        return false;
+    }
+    let input = match part.get("state").and_then(|s| s.get("input")) {
+        Some(i) => i,
+        None => return false,
+    };
+    // OpenCode uses camelCase primarily, but also check snake_case
+    let tool_path = input
+        .get("filePath")
+        .or_else(|| input.get("file_path"))
+        .and_then(|p| p.as_str());
+    match tool_path {
+        Some(p) => crate::file_path_matches(p, target_path),
+        None => false,
+    }
+}
+
+/// Internal: check message/part dirs for file edit match.
+fn session_edited_file_in_dirs(
+    message_dir: &std::path::Path,
+    part_dir: &std::path::Path,
+    target_path: &str,
+) -> bool {
+    if !message_dir.exists() {
+        return false;
+    }
+
+    // Fast pre-filter: extract filename component for raw text check
+    let filename = std::path::Path::new(target_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(target_path);
+
+    let msg_files: Vec<_> = match fs::read_dir(message_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect(),
+        Err(_) => return false,
+    };
+
+    for msg_entry in &msg_files {
+        let msg_path = msg_entry.path();
+        let msg_id = match msg_path.file_stem() {
+            Some(s) => s.to_string_lossy().to_string(),
+            None => continue,
+        };
+
+        let msg_part_dir = part_dir.join(&msg_id);
+        if !msg_part_dir.exists() {
+            continue;
+        }
+
+        let part_entries = match fs::read_dir(&msg_part_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for part_entry in part_entries {
+            let part_entry = match part_entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let part_path = part_entry.path();
+            if part_path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+
+            let raw = match fs::read_to_string(&part_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Fast pre-filter: skip files where the filename can't appear
+            if !raw.contains(filename) {
+                continue;
+            }
+
+            let part: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if part_edits_file(&part, target_path) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Check if the last `last_n` messages of a session contain the given text.
 ///
 /// Checks both file-based storage and SQLite database. Returns true if
@@ -792,5 +920,210 @@ mod tests {
 
         let merged = merge_sessions(Vec::new(), sessions);
         assert_eq!(merged.len(), 1);
+    }
+
+    // === session_edited_file tests ===
+
+    #[test]
+    fn test_session_edited_file_write_tool_absolute() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/home/user/src/main.rs","content":"fn main() {}"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/main.rs"
+        ));
+        assert!(!session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_edit_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"/home/user/src/lib.rs","oldString":"old","newString":"new"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_multi_edit_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"multi_edit","state":{"status":"completed","input":{"filePath":"/home/user/src/mod.rs","edits":[]}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/mod.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_create_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"create","state":{"status":"completed","input":{"filePath":"/home/user/new.rs","content":"// new"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/new.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_snake_case_field() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"write","state":{"status":"completed","input":{"file_path":"/home/user/src/main.rs","content":"fn main() {}"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_relative_path_in_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"src/main.rs","content":"fn main() {}"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/project/src/main.rs"
+        ));
+        assert!(!session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/project/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_ignores_non_write_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        create_raw_part(
+            temp.path(),
+            "ses_abc",
+            "msg_1",
+            "prt_1",
+            r#"{"id":"prt_1","type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/home/user/src/main.rs"}}}"#,
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(!session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_ignores_text_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        create_session_with_messages(
+            temp.path(),
+            "ses_abc",
+            &[("msg_1", &[("prt_1", "/home/user/src/main.rs")])],
+        );
+
+        let message_dir = temp.path().join("message/ses_abc");
+        let part_dir = temp.path().join("part");
+
+        assert!(!session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_empty_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let message_dir = temp.path().join("message/ses_empty");
+        let part_dir = temp.path().join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        assert!(!session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_nonexistent_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let message_dir = temp.path().join("message/ses_missing");
+        let part_dir = temp.path().join("part");
+
+        assert!(!session_edited_file_in_dirs(
+            &message_dir,
+            &part_dir,
+            "/home/user/src/main.rs"
+        ));
     }
 }

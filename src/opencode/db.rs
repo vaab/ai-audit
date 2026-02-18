@@ -212,6 +212,48 @@ pub fn session_tail_contains_text_from_conn(
     false
 }
 
+/// Check if any part in a session contains a write/edit tool targeting the given file path.
+///
+/// Queries all parts for the session, parses their `data` JSON, and applies
+/// the `part_edits_file()` logic.
+pub fn session_edited_file_from_db(session_id: &str, target_path: &str) -> bool {
+    let conn = match open_db() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    session_edited_file_from_conn(&conn, session_id, target_path)
+}
+
+/// Testable version using an existing connection.
+pub fn session_edited_file_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    target_path: &str,
+) -> bool {
+    let parts = match get_parts_for_session(conn, session_id) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    // Fast pre-filter: extract filename component
+    let filename = std::path::Path::new(target_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(target_path);
+
+    for (_msg_id, part) in &parts {
+        // Fast pre-filter on raw JSON string
+        let raw = part.to_string();
+        if !raw.contains(filename) {
+            continue;
+        }
+        if super::part_edits_file(part, target_path) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Get messages for a session: returns (msg_id, role, time_created_ms).
 ///
 /// The `role` is extracted from the `data` JSON column.
@@ -726,5 +768,147 @@ mod tests {
 
         let info = get_session_info_from_conn(&conn, "ses_zero").unwrap();
         assert_eq!(info.started_at, info.updated_at);
+    }
+
+    // === session_edited_file_from_conn tests ===
+
+    #[test]
+    fn test_session_edited_file_from_conn_write_tool() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/home/user/src/main.rs","content":"fn main() {}"}}}"#,
+        );
+
+        assert!(session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/src/main.rs"
+        ));
+        assert!(!session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_from_conn_edit_tool() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"/home/user/src/lib.rs","oldString":"old","newString":"new"}}}"#,
+        );
+
+        assert!(session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_from_conn_relative_path() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"src/main.rs","content":"fn main() {}"}}}"#,
+        );
+
+        assert!(session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/project/src/main.rs"
+        ));
+        assert!(!session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/project/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_from_conn_snake_case_field() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"file_path":"/home/user/src/main.rs","content":"fn main() {}"}}}"#,
+        );
+
+        assert!(session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_from_conn_ignores_non_write() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/home/user/src/main.rs"}}}"#,
+        );
+
+        assert!(!session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_from_conn_ignores_text_parts() {
+        let conn = setup_test_db();
+        insert_message(&conn, "msg_001", "ses_001", "user", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"/home/user/src/main.rs"}"#,
+        );
+
+        assert!(!session_edited_file_from_conn(
+            &conn,
+            "ses_001",
+            "/home/user/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_session_edited_file_from_conn_empty_session() {
+        let conn = setup_test_db();
+        assert!(!session_edited_file_from_conn(
+            &conn,
+            "ses_missing",
+            "/home/user/src/main.rs"
+        ));
     }
 }
