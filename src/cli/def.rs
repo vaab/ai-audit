@@ -116,6 +116,10 @@ pub enum Commands {
         #[arg(short = 'n', long)]
         last: Option<usize>,
 
+        /// Show only tool_use entries that wrote or edited this file
+        #[arg(short, long)]
+        file: Option<String>,
+
         #[command(flatten)]
         output: OutputOpts,
     },

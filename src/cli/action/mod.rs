@@ -51,10 +51,17 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
         Commands::Transcript {
             session,
             last,
+            file,
             output,
         } => {
             let session_id = resolve_session(session)?;
-            transcript::run(&session_id, last, output.format(), _verbose)
+            transcript::run(
+                &session_id,
+                last,
+                file.as_deref(),
+                output.format(),
+                _verbose,
+            )
         }
         Commands::CurrentSession {
             r#match,

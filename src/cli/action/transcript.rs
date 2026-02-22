@@ -1,11 +1,28 @@
 use anyhow::Result;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use crate::activity::format_timestamp_display;
 use crate::transcript::{EntryType, Role, TranscriptEntry};
 use crate::OutputFormat;
 
-pub fn run(session: &str, last: Option<usize>, format: OutputFormat, verbose: u8) -> Result<()> {
+/// Tool names (case-insensitive) that write or edit files.
+const WRITE_TOOL_NAMES: &[&str] = &[
+    "write",
+    "edit",
+    "multiedit",
+    "createfile",
+    "multi_edit",
+    "create",
+];
+
+pub fn run(
+    session: &str,
+    last: Option<usize>,
+    file: Option<&str>,
+    format: OutputFormat,
+    verbose: u8,
+) -> Result<()> {
     // Auto-detect provider
     let mut entries = if session.starts_with("ses_") {
         crate::opencode::transcript::parse_transcript(session)?
@@ -16,6 +33,19 @@ pub fn run(session: &str, last: Option<usize>, format: OutputFormat, verbose: u8
     // Filter thinking entries unless verbose
     if verbose == 0 {
         entries.retain(|e| !matches!(e.entry_type, EntryType::Thinking));
+    }
+
+    // Filter to only tool_use entries targeting the given file
+    if let Some(f) = file {
+        let path = PathBuf::from(f);
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        };
+        let resolved = abs.canonicalize().unwrap_or(abs);
+        let target = resolved.to_string_lossy().to_string();
+        entries.retain(|e| entry_targets_file(e, &target));
     }
 
     // Apply --last N
@@ -102,6 +132,35 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Check if a transcript entry is a tool_use that writes/edits the given file.
+///
+/// Handles both Claude Code (`file_path` key) and OpenCode (`filePath` / `file_path` keys)
+/// tool input formats. Tool names are matched case-insensitively to handle both providers.
+fn entry_targets_file(entry: &TranscriptEntry, target_path: &str) -> bool {
+    if !matches!(entry.entry_type, EntryType::ToolUse) {
+        return false;
+    }
+    let tool_name = match &entry.tool_name {
+        Some(n) => n,
+        None => return false,
+    };
+    if !WRITE_TOOL_NAMES.contains(&tool_name.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    let input = match &entry.tool_input {
+        Some(v) => v,
+        None => return false,
+    };
+    let tool_path = input
+        .get("file_path")
+        .or_else(|| input.get("filePath"))
+        .and_then(|p| p.as_str());
+    match tool_path {
+        Some(p) => crate::file_path_matches(p, target_path),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +184,116 @@ mod tests {
             truncate_line("line1\nline2\nline3", 200),
             "line1\\nline2\\nline3"
         );
+    }
+
+    #[test]
+    fn test_entry_targets_file_write_match() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::Assistant,
+            entry_type: EntryType::ToolUse,
+            content: String::new(),
+            tool_name: Some("Write".to_string()),
+            tool_input: Some(
+                serde_json::json!({"file_path": "/home/user/src/main.rs", "content": "fn main() {}"}),
+            ),
+        };
+        assert!(entry_targets_file(&entry, "/home/user/src/main.rs"));
+        assert!(!entry_targets_file(&entry, "/home/user/src/lib.rs"));
+    }
+
+    #[test]
+    fn test_entry_targets_file_opencode_camel_case() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::Assistant,
+            entry_type: EntryType::ToolUse,
+            content: String::new(),
+            tool_name: Some("edit".to_string()),
+            tool_input: Some(serde_json::json!({"filePath": "/home/user/src/main.rs"})),
+        };
+        assert!(entry_targets_file(&entry, "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_entry_targets_file_relative_path_in_tool() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::Assistant,
+            entry_type: EntryType::ToolUse,
+            content: String::new(),
+            tool_name: Some("Edit".to_string()),
+            tool_input: Some(serde_json::json!({"file_path": "src/main.rs"})),
+        };
+        assert!(entry_targets_file(&entry, "/home/user/project/src/main.rs"));
+        assert!(!entry_targets_file(&entry, "/home/user/project/src/lib.rs"));
+    }
+
+    #[test]
+    fn test_entry_targets_file_ignores_non_write_tools() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::Assistant,
+            entry_type: EntryType::ToolUse,
+            content: String::new(),
+            tool_name: Some("Read".to_string()),
+            tool_input: Some(serde_json::json!({"file_path": "/home/user/src/main.rs"})),
+        };
+        assert!(!entry_targets_file(&entry, "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_entry_targets_file_ignores_text_entries() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::Assistant,
+            entry_type: EntryType::Text,
+            content: "editing src/main.rs".to_string(),
+            tool_name: None,
+            tool_input: None,
+        };
+        assert!(!entry_targets_file(&entry, "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_entry_targets_file_ignores_tool_result() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::User,
+            entry_type: EntryType::ToolResult,
+            content: "file written".to_string(),
+            tool_name: None,
+            tool_input: None,
+        };
+        assert!(!entry_targets_file(&entry, "/home/user/src/main.rs"));
+    }
+
+    #[test]
+    fn test_entry_targets_file_all_write_tools() {
+        for tool in &[
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "CreateFile",
+            "write",
+            "edit",
+            "multi_edit",
+            "create",
+        ] {
+            let entry = TranscriptEntry {
+                timestamp: chrono::Utc::now(),
+                role: Role::Assistant,
+                entry_type: EntryType::ToolUse,
+                content: String::new(),
+                tool_name: Some(tool.to_string()),
+                tool_input: Some(serde_json::json!({"file_path": "/home/user/src/main.rs"})),
+            };
+            assert!(
+                entry_targets_file(&entry, "/home/user/src/main.rs"),
+                "tool '{}' should be recognized as a write tool",
+                tool
+            );
+        }
     }
 
     #[test]
