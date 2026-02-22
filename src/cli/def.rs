@@ -127,14 +127,9 @@ pub enum Commands {
     CurrentSession {
         /// Text to match against the last messages of session transcripts.
         /// When provided, sessions are identified by searching for this string
-        /// in recent messages instead of using process-tree fingerprinting.
-        #[arg(short, long, conflicts_with = "pid")]
+        /// in recent messages instead of using process-tree detection.
+        #[arg(short, long)]
         r#match: Option<String>,
-
-        /// PID of an AI assistant process (opencode, claude).
-        /// Extracts session info from /proc/<pid>/ (env vars, cwd, process tree).
-        #[arg(long, conflicts_with = "r#match")]
-        pid: Option<u32>,
 
         /// Filter by session type (claudecode or opencode)
         #[arg(short = 't', long = "type")]

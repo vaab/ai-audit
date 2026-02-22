@@ -65,7 +65,6 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
         }
         Commands::CurrentSession {
             r#match,
-            pid,
             session_type,
             last_messages,
             project,
@@ -85,11 +84,8 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
                         project_dir: project,
                     },
                 )?
-            } else if let Some(target_pid) = pid {
-                // PID-based detection: examine /proc/<pid>/
-                crate::session_detect::find_session_by_pid(target_pid, provider_filter)?
             } else {
-                // Standard auto-detection (env vars, process tree, fingerprint)
+                // Standard auto-detection (env vars, process tree, tmux pane matching)
                 crate::session_detect::detect_current_session()?
             };
             let format = output.format();
