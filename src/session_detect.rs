@@ -35,9 +35,16 @@ pub struct DetectedSession {
 #[derive(Debug, Clone)]
 struct Candidate {
     session_id: String,
-    #[allow(dead_code)]
     provider: Provider,
     updated_ms: i64,
+}
+
+/// Options for last-session detection.
+pub struct LastSessionOptions {
+    /// Optional provider filter.
+    pub provider_filter: Option<Provider>,
+    /// Optional project directory override.
+    pub project_dir: Option<String>,
 }
 
 /// Options for match-based session detection.
@@ -290,6 +297,38 @@ pub fn detect_current_session() -> Result<DetectedSession> {
         msg.push_str(&format!("\n  {}", c.session_id));
     }
     bail!("{}", msg);
+}
+
+/// Detect the last AI session used in the current tmux pane or directory.
+///
+/// Detection strategy:
+/// 1. If in tmux:
+///    a. Check if current pane's process is an AI tool → extract session from cmdline
+///    b. Capture pane content → extract session/project from opencode launch commands
+///    c. Gather candidates for the detected project directory
+///    d. If multiple, try snippet matching against pane content
+///    e. Return best match or most recent by timestamp
+/// 2. If not in tmux:
+///    a. Use CWD (or provided --project dir) as project directory
+///    b. Return the most recent session for that directory
+pub fn detect_last_session(opts: &LastSessionOptions) -> Result<DetectedSession> {
+    let project_override = opts.project_dir.as_ref().map(|p| resolve_to_absolute(p));
+
+    #[cfg(unix)]
+    if is_tmux_available() {
+        if let Some(result) =
+            detect_last_session_via_tmux(opts.provider_filter, project_override.as_deref())
+        {
+            return Ok(result);
+        }
+    }
+
+    // Fallback: CWD + most recent session
+    let dir = match project_override {
+        Some(d) => std::path::PathBuf::from(d),
+        None => env::current_dir().context("Failed to get current directory")?,
+    };
+    find_most_recent_session(&dir, opts.provider_filter)
 }
 
 /// Detect which AI provider spawned this process.
@@ -1005,6 +1044,362 @@ fn match_by_tmux_pane_content(
         .collect();
 
     match_snippets_against_panes(&candidate_snippets, provider, &pane_contents)
+}
+
+// === Last-session detection helpers ===
+
+/// Resolve a path string to an absolute path.
+fn resolve_to_absolute(path: &str) -> String {
+    let p = std::path::PathBuf::from(path);
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        env::current_dir().unwrap_or_default().join(p)
+    };
+    abs.canonicalize()
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Detect the last session by reading the current tmux pane's content.
+#[cfg(unix)]
+fn detect_last_session_via_tmux(
+    provider_filter: Option<Provider>,
+    project_override: Option<&str>,
+) -> Option<DetectedSession> {
+    let pane_id = env::var("TMUX_PANE").ok()?;
+
+    // Get pane info from tmux
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-t",
+            &pane_id,
+            "-p",
+            "#{pane_pid} #{pane_current_command} #{pane_current_path}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let info_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parts: Vec<&str> = info_line.splitn(3, ' ').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let pane_pid: u32 = parts[0].parse().ok()?;
+    let pane_command = parts[1];
+    let pane_path = parts[2];
+
+    // Step 1: If AI process running, try to extract session from process tree
+    let is_ai_command = pane_command == "opencode" || pane_command == "claude";
+    if is_ai_command {
+        let provider = if pane_command == "opencode" {
+            Provider::OpenCode
+        } else {
+            Provider::ClaudeCode
+        };
+        if let Some(detected) = try_session_from_pane_process(pane_pid, pane_command, provider) {
+            if provider_filter.is_none() || provider_filter == Some(detected.provider) {
+                return Some(detected);
+            }
+        }
+    }
+
+    // Step 2: Capture pane content for analysis
+    let visible = capture_pane_visible_content(&pane_id).unwrap_or_default();
+    let alternate = capture_pane_content(&pane_id).unwrap_or_default();
+
+    // Step 3: Extract session ID and project dir from content
+    let (content_session_id, content_project_dir) = extract_ai_launch_info(&visible, &alternate);
+
+    // If we found a session ID directly, return it
+    if let Some(sid) = content_session_id {
+        let provider = if sid.starts_with("ses_") {
+            Provider::OpenCode
+        } else {
+            Provider::ClaudeCode
+        };
+        if provider_filter.is_none() || provider_filter == Some(provider) {
+            return Some(DetectedSession {
+                session_id: sid,
+                provider,
+            });
+        }
+    }
+
+    // Step 4: Determine project directory
+    let project_dir = project_override
+        .map(|s| s.to_string())
+        .or(content_project_dir)
+        .unwrap_or_else(|| pane_path.to_string());
+
+    let dir = Path::new(&project_dir);
+
+    // Step 5: Gather candidates
+    let mut candidates = gather_candidates_for_dir(dir, provider_filter);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Sort by updated_ms descending (most recent first)
+    candidates.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+
+    if candidates.len() == 1 {
+        return Some(DetectedSession {
+            session_id: candidates[0].session_id.clone(),
+            provider: candidates[0].provider,
+        });
+    }
+
+    // Step 6: Try snippet matching against pane content
+    let candidate_snippets: Vec<(String, Vec<String>)> = candidates
+        .iter()
+        .map(|c| {
+            let snippets = match c.provider {
+                Provider::OpenCode => get_opencode_user_snippets(&c.session_id, 5),
+                Provider::ClaudeCode => get_claudecode_user_snippets(&c.session_id, 5),
+            };
+            (c.session_id.clone(), snippets)
+        })
+        .collect();
+
+    let pane_contents: Vec<String> = [visible, alternate]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if let Some(detected) = match_snippets_mixed(&candidate_snippets, &candidates, &pane_contents) {
+        return Some(detected);
+    }
+
+    // Step 7: Return most recent candidate
+    Some(DetectedSession {
+        session_id: candidates[0].session_id.clone(),
+        provider: candidates[0].provider,
+    })
+}
+
+/// Capture the visible pane content including scrollback (up to 500 lines back).
+#[cfg(unix)]
+fn capture_pane_visible_content(pane_id: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-S", "-500", "-t", pane_id])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Extract session ID and project directory from terminal content.
+///
+/// Searches for opencode launch commands, parsing `--session`/`-s` and
+/// `--dir` flags. Later lines take precedence (more recent commands).
+fn extract_ai_launch_info(visible: &str, alternate: &str) -> (Option<String>, Option<String>) {
+    let mut session_id: Option<String> = None;
+    let mut project_dir: Option<String> = None;
+
+    // Process alternate first (pre-TUI shell), then visible (more recent)
+    for content in [alternate, visible] {
+        for line in content.lines() {
+            if !line.contains("opencode") {
+                continue;
+            }
+
+            // Find the opencode command portion
+            let cmd_start = match line.find("opencode") {
+                Some(pos) => pos,
+                None => continue,
+            };
+            let cmd_portion = &line[cmd_start..];
+            let tokens: Vec<&str> = cmd_portion.split_whitespace().collect();
+
+            // Check for --flag=value format
+            for token in &tokens {
+                if let Some(rest) = token.strip_prefix("--session=") {
+                    if !rest.is_empty() {
+                        session_id = Some(rest.to_string());
+                    }
+                }
+                if let Some(rest) = token.strip_prefix("--dir=") {
+                    if !rest.is_empty() {
+                        project_dir = Some(rest.to_string());
+                    }
+                }
+            }
+
+            // Check for --flag value format
+            for window in tokens.windows(2) {
+                if (window[0] == "-s" || window[0] == "--session")
+                    && !window[1].is_empty()
+                    && !window[1].starts_with('-')
+                {
+                    session_id = Some(window[1].to_string());
+                }
+                if window[0] == "--dir" && !window[1].is_empty() && !window[1].starts_with('-') {
+                    project_dir = Some(window[1].to_string());
+                }
+            }
+        }
+    }
+
+    (session_id, project_dir)
+}
+
+/// Gather candidates from both providers for a given directory.
+fn gather_candidates_for_dir(dir: &Path, provider_filter: Option<Provider>) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+
+    let include_opencode = provider_filter.is_none() || provider_filter == Some(Provider::OpenCode);
+    let include_claudecode =
+        provider_filter.is_none() || provider_filter == Some(Provider::ClaudeCode);
+
+    if include_opencode {
+        if let Ok(oc) = gather_opencode_candidates(dir) {
+            candidates.extend(oc);
+        }
+    }
+    if include_claudecode {
+        if let Ok(cc) = gather_claudecode_candidates(dir) {
+            candidates.extend(cc);
+        }
+    }
+
+    candidates
+}
+
+/// Find the most recent session for a given directory.
+fn find_most_recent_session(
+    dir: &Path,
+    provider_filter: Option<Provider>,
+) -> Result<DetectedSession> {
+    let mut candidates = gather_candidates_for_dir(dir, provider_filter);
+    if candidates.is_empty() {
+        bail!("No sessions found for directory: {}", dir.display());
+    }
+    candidates.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+    Ok(DetectedSession {
+        session_id: candidates[0].session_id.clone(),
+        provider: candidates[0].provider,
+    })
+}
+
+/// Match snippets against pane contents for candidates with mixed providers.
+///
+/// Like `match_snippets_against_panes` but handles candidates from different
+/// providers. Returns the candidate with the most snippet hits if it clearly
+/// wins (more hits than any other, minimum 1 hit).
+fn match_snippets_mixed(
+    candidate_snippets: &[(String, Vec<String>)],
+    candidates: &[Candidate],
+    pane_contents: &[String],
+) -> Option<DetectedSession> {
+    if candidate_snippets.is_empty() || pane_contents.is_empty() {
+        return None;
+    }
+
+    let mut scores: Vec<(usize, usize)> = Vec::new(); // (max_hits, candidate_index)
+
+    for (idx, (_session_id, snippets)) in candidate_snippets.iter().enumerate() {
+        if snippets.is_empty() {
+            scores.push((0, idx));
+            continue;
+        }
+        let mut max_hits = 0usize;
+        for pane_content in pane_contents {
+            let hits = snippets
+                .iter()
+                .filter(|s| pane_content.contains(s.as_str()))
+                .count();
+            max_hits = max_hits.max(hits);
+        }
+        scores.push((max_hits, idx));
+    }
+
+    scores.sort_by(|a, b| b.0.cmp(&a.0));
+    let best = scores[0];
+    if best.0 == 0 {
+        return None;
+    }
+    if scores.len() > 1 && scores[1].0 == best.0 {
+        return None; // tie → ambiguous
+    }
+
+    let winner = &candidates[best.1];
+    Some(DetectedSession {
+        session_id: winner.session_id.clone(),
+        provider: winner.provider,
+    })
+}
+
+/// Try to find an AI process in the pane's process tree and extract session info.
+#[cfg(unix)]
+fn try_session_from_pane_process(
+    pane_pid: u32,
+    command_name: &str,
+    provider: Provider,
+) -> Option<DetectedSession> {
+    let ai_pid = find_descendant_process(pane_pid, command_name, 3)?;
+    let raw = fs::read_to_string(format!("/proc/{}/cmdline", ai_pid)).ok()?;
+    let session_id = parse_session_from_cmdline_args(&raw)?;
+    Some(DetectedSession {
+        session_id,
+        provider,
+    })
+}
+
+/// Find a descendant process with the given name, up to `max_depth` levels deep.
+#[cfg(unix)]
+fn find_descendant_process(parent_pid: u32, target_name: &str, max_depth: u32) -> Option<u32> {
+    if max_depth == 0 {
+        return None;
+    }
+
+    // Try /proc/<pid>/task/<pid>/children first (efficient, Linux 3.5+)
+    let children_file = format!("/proc/{}/task/{}/children", parent_pid, parent_pid);
+    let child_pids: Vec<u32> = if let Ok(content) = fs::read_to_string(&children_file) {
+        content
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    } else {
+        // Fallback: scan /proc for direct children
+        let mut pids = Vec::new();
+        if let Ok(proc_dir) = fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if let Ok(pid) = name_str.parse::<u32>() {
+                    if get_parent_pid(pid) == Some(parent_pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+        pids
+    };
+
+    // Check direct children first
+    for &pid in &child_pids {
+        if let Some(name) = get_process_name(pid) {
+            if name == target_name {
+                return Some(pid);
+            }
+        }
+    }
+
+    // Recurse into children
+    for &pid in &child_pids {
+        if let Some(found) = find_descendant_process(pid, target_name, max_depth - 1) {
+            return Some(found);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1833,5 +2228,249 @@ mod tests {
         // Should be the most recent (msg_005, msg_004)
         assert!(snippets[0].contains("number 5"));
         assert!(snippets[1].contains("number 4"));
+    }
+
+    // === extract_ai_launch_info tests ===
+
+    #[test]
+    fn test_extract_ai_launch_info_with_dir() {
+        let visible = "";
+        let alternate = "$ /home/user/.local/bin/opencode attach http://127.0.0.1:4096 --dir /home/user/project\n";
+        let (session_id, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert!(session_id.is_none());
+        assert_eq!(project_dir, Some("/home/user/project".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_with_session_and_dir() {
+        let visible = "";
+        let alternate =
+            "$ opencode attach http://127.0.0.1:4096 -s ses_abc123 --dir /home/user/project\n";
+        let (session_id, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert_eq!(session_id, Some("ses_abc123".to_string()));
+        assert_eq!(project_dir, Some("/home/user/project".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_session_long_flag() {
+        let visible = "$ opencode --session ses_xyz789 --dir /tmp/project\n";
+        let alternate = "";
+        let (session_id, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert_eq!(session_id, Some("ses_xyz789".to_string()));
+        assert_eq!(project_dir, Some("/tmp/project".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_equals_format() {
+        let visible = "";
+        let alternate = "$ opencode --session=ses_eq1 --dir=/tmp/eq\n";
+        let (session_id, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert_eq!(session_id, Some("ses_eq1".to_string()));
+        assert_eq!(project_dir, Some("/tmp/eq".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_no_match() {
+        let visible = "Some random text\nNo AI commands here\n";
+        let alternate = "Just a shell prompt\n";
+        let (session_id, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert!(session_id.is_none());
+        assert!(project_dir.is_none());
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_visible_overrides_alternate() {
+        let alternate = "$ opencode --dir /old/path\n";
+        let visible = "$ opencode --dir /new/path\n";
+        let (_, project_dir) = extract_ai_launch_info(visible, alternate);
+        // Visible is processed after alternate, so it takes precedence
+        assert_eq!(project_dir, Some("/new/path".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_launching_prefix() {
+        let visible = "";
+        let alternate = "Launching: /home/user/.local/bin/opencode attach http://127.0.0.1:4096 --dir /home/user/my-project\n";
+        let (_, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert_eq!(project_dir, Some("/home/user/my-project".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ai_launch_info_real_world_format() {
+        // Based on actual tmux capture from a running opencode pane
+        let visible = "";
+        let alternate = concat!(
+            "autoloading: nvm\n",
+            "Launching: /home/vaab/.local/bin/opencode attach http://127.0.0.1:4096 --dir /home/vaab/dev/rs/talk-rs\n",
+        );
+        let (session_id, project_dir) = extract_ai_launch_info(visible, alternate);
+        assert!(session_id.is_none());
+        assert_eq!(project_dir, Some("/home/vaab/dev/rs/talk-rs".to_string()));
+    }
+
+    // === match_snippets_mixed tests ===
+
+    #[test]
+    fn test_match_snippets_mixed_single_winner() {
+        let candidates = vec![
+            Candidate {
+                session_id: "ses_aaa".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 1000,
+            },
+            Candidate {
+                session_id: "ses_bbb".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 2000,
+            },
+        ];
+        let candidate_snippets = vec![
+            (
+                "ses_aaa".to_string(),
+                vec!["refactor the auth module".to_string()],
+            ),
+            (
+                "ses_bbb".to_string(),
+                vec!["deploy to production now".to_string()],
+            ),
+        ];
+        let pane_contents = vec!["... refactor the auth module ...".to_string()];
+
+        let result = match_snippets_mixed(&candidate_snippets, &candidates, &pane_contents);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().session_id, "ses_aaa");
+    }
+
+    #[test]
+    fn test_match_snippets_mixed_no_match() {
+        let candidates = vec![Candidate {
+            session_id: "ses_aaa".to_string(),
+            provider: Provider::OpenCode,
+            updated_ms: 1000,
+        }];
+        let candidate_snippets = vec![("ses_aaa".to_string(), vec!["unique text".to_string()])];
+        let pane_contents = vec!["completely unrelated content".to_string()];
+
+        let result = match_snippets_mixed(&candidate_snippets, &candidates, &pane_contents);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_match_snippets_mixed_tie_returns_none() {
+        let candidates = vec![
+            Candidate {
+                session_id: "ses_aaa".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 1000,
+            },
+            Candidate {
+                session_id: "ses_bbb".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 2000,
+            },
+        ];
+        let candidate_snippets = vec![
+            ("ses_aaa".to_string(), vec!["shared text".to_string()]),
+            ("ses_bbb".to_string(), vec!["shared text".to_string()]),
+        ];
+        let pane_contents = vec!["... shared text ...".to_string()];
+
+        let result = match_snippets_mixed(&candidate_snippets, &candidates, &pane_contents);
+        assert!(result.is_none()); // tie → ambiguous
+    }
+
+    #[test]
+    fn test_match_snippets_mixed_empty_inputs() {
+        let result = match_snippets_mixed(&[], &[], &["content".to_string()]);
+        assert!(result.is_none());
+
+        let candidates = vec![Candidate {
+            session_id: "ses_aaa".to_string(),
+            provider: Provider::OpenCode,
+            updated_ms: 1000,
+        }];
+        let candidate_snippets = vec![("ses_aaa".to_string(), vec!["some snippet".to_string()])];
+        let result = match_snippets_mixed(&candidate_snippets, &candidates, &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_match_snippets_mixed_providers() {
+        let candidates = vec![
+            Candidate {
+                session_id: "ses_oc".to_string(),
+                provider: Provider::OpenCode,
+                updated_ms: 1000,
+            },
+            Candidate {
+                session_id: "uuid-cc-1234".to_string(),
+                provider: Provider::ClaudeCode,
+                updated_ms: 2000,
+            },
+        ];
+        let candidate_snippets = vec![
+            (
+                "ses_oc".to_string(),
+                vec!["opencode specific text here".to_string()],
+            ),
+            (
+                "uuid-cc-1234".to_string(),
+                vec!["claude specific text here".to_string()],
+            ),
+        ];
+        let pane_contents = vec!["... claude specific text here ...".to_string()];
+
+        let result = match_snippets_mixed(&candidate_snippets, &candidates, &pane_contents);
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.session_id, "uuid-cc-1234");
+        assert_eq!(detected.provider, Provider::ClaudeCode);
+    }
+
+    // === CLI parsing test for LastSession ===
+
+    #[test]
+    fn cli_accepts_last_session_command() {
+        use clap::Parser;
+
+        let args = crate::cli::Args::try_parse_from(["ai-audit", "last-session"])
+            .expect("bare last-session should work");
+        match args.command {
+            crate::cli::Commands::LastSession {
+                session_type,
+                project,
+                ..
+            } => {
+                assert!(session_type.is_none());
+                assert!(project.is_none());
+            }
+            _ => panic!("expected LastSession command"),
+        }
+    }
+
+    #[test]
+    fn cli_last_session_with_type_and_project() {
+        use clap::Parser;
+
+        let args = crate::cli::Args::try_parse_from([
+            "ai-audit",
+            "last-session",
+            "-t",
+            "opencode",
+            "-p",
+            "/home/user/project",
+        ])
+        .expect("last-session with flags should work");
+        match args.command {
+            crate::cli::Commands::LastSession {
+                session_type,
+                project,
+                ..
+            } => {
+                assert!(session_type.is_some());
+                assert_eq!(project, Some("/home/user/project".to_string()));
+            }
+            _ => panic!("expected LastSession command"),
+        }
     }
 }

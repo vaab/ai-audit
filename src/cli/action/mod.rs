@@ -1,6 +1,7 @@
 //! Command action handlers.
 
 mod activity;
+mod last_session;
 mod list_sessions;
 mod permissions;
 mod rate;
@@ -112,6 +113,11 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             }
             Ok(())
         }
+        Commands::LastSession {
+            session_type,
+            project,
+            output,
+        } => last_session::run(session_type, project, output.format()),
         Commands::Activity { action } => activity::run(action),
         Commands::Rate {
             instruction,

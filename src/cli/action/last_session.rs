@@ -1,0 +1,46 @@
+//! Last session detection handler.
+
+use anyhow::Result;
+
+use crate::session_detect;
+use crate::OutputFormat;
+
+pub fn run(
+    session_type: Option<super::super::def::SessionType>,
+    project: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
+    let provider_filter = session_type.map(|t| match t {
+        super::super::def::SessionType::OpenCode => session_detect::Provider::OpenCode,
+        super::super::def::SessionType::ClaudeCode => session_detect::Provider::ClaudeCode,
+    });
+
+    let detected = session_detect::detect_last_session(&session_detect::LastSessionOptions {
+        provider_filter,
+        project_dir: project,
+    })?;
+
+    match format {
+        OutputFormat::Json => {
+            let provider = match detected.provider {
+                session_detect::Provider::OpenCode => "opencode",
+                session_detect::Provider::ClaudeCode => "claudecode",
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "session_id": detected.session_id,
+                    "provider": provider,
+                })
+            );
+        }
+        OutputFormat::Nul => {
+            print!("{}\0", detected.session_id);
+        }
+        OutputFormat::Human => {
+            println!("{}", detected.session_id);
+        }
+    }
+
+    Ok(())
+}
