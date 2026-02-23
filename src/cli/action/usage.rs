@@ -20,6 +20,24 @@ struct SessionUsage {
     total_tokens: u64,
     #[serde(rename = "messages")]
     message_count: usize,
+    is_sub_agent: bool,
+}
+
+/// Format a token count for human display using SI prefixes (K/M/G).
+///
+/// Values under 1000 are shown as-is with trailing padding so that
+/// bare numbers align with suffixed ones: `"8   "` aligns with
+/// `"8.0K"` when right-justified in a column.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}G", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{}   ", n)
+    }
 }
 
 /// Parsed timespan bounds as UTC epoch seconds.
@@ -75,6 +93,7 @@ fn run_single(session_id: &str, format: OutputFormat) -> Result<()> {
                 total_tokens: total_tokens.total(),
                 tokens: total_tokens,
                 message_count: messages.len(),
+                is_sub_agent: false,
             };
             println!("{}", serde_json::to_string(&record)?);
         }
@@ -107,14 +126,35 @@ fn run_single(session_id: &str, format: OutputFormat) -> Result<()> {
             );
             println!();
             println!("Token Usage:");
-            println!("  Input:          {:>12}", total_tokens.input);
-            println!("  Output:         {:>12}", total_tokens.output);
-            println!("  Cache read:     {:>12}", total_tokens.cache_read);
-            println!("  Cache write:    {:>12}", total_tokens.cache_write);
-            println!("  Cache creation: {:>12}", total_tokens.cache_creation);
-            println!("  Reasoning:      {:>12}", total_tokens.reasoning);
+            println!(
+                "  Input:          {:>12}",
+                format_tokens(total_tokens.input)
+            );
+            println!(
+                "  Output:         {:>12}",
+                format_tokens(total_tokens.output)
+            );
+            println!(
+                "  Cache read:     {:>12}",
+                format_tokens(total_tokens.cache_read)
+            );
+            println!(
+                "  Cache write:    {:>12}",
+                format_tokens(total_tokens.cache_write)
+            );
+            println!(
+                "  Cache creation: {:>12}",
+                format_tokens(total_tokens.cache_creation)
+            );
+            println!(
+                "  Reasoning:      {:>12}",
+                format_tokens(total_tokens.reasoning)
+            );
             println!("  {}", "\u{2500}".repeat(17));
-            println!("  Total:          {:>12}", total_tokens.total());
+            println!(
+                "  Total:          {:>12}",
+                format_tokens(total_tokens.total())
+            );
         }
     }
 
@@ -190,6 +230,7 @@ fn run_aggregated(
                             if tokens.is_empty() {
                                 continue;
                             }
+                            let is_sub_agent = s.parent_id.is_some();
                             usage_records.push(SessionUsage {
                                 timestamp: started,
                                 session_id: s.session_id,
@@ -197,6 +238,7 @@ fn run_aggregated(
                                 total_tokens: tokens.total(),
                                 tokens,
                                 message_count: messages.len(),
+                                is_sub_agent,
                             });
                         }
                         Err(e) => {
@@ -244,6 +286,9 @@ fn run_aggregated(
         }
         OutputFormat::Human => {
             for r in &usage_records {
+                if r.is_sub_agent {
+                    continue;
+                }
                 let dt: chrono::DateTime<chrono::Local> =
                     chrono::DateTime::from_timestamp(r.timestamp as i64, 0)
                         .unwrap_or_default()
@@ -253,23 +298,37 @@ fn run_aggregated(
                     dt.format("%Y-%m-%dT%H:%M:%S"),
                     r.session_id,
                     r.provider,
-                    r.tokens.input,
-                    r.tokens.output,
-                    r.total_tokens,
+                    format_tokens(r.tokens.input),
+                    format_tokens(r.tokens.output),
+                    format_tokens(r.total_tokens),
                 );
             }
 
-            // Summary line
+            // Summary line with sub-agent breakdown
             let total_input: u64 = usage_records.iter().map(|r| r.tokens.input).sum();
             let total_output: u64 = usage_records.iter().map(|r| r.tokens.output).sum();
             let grand_total: u64 = usage_records.iter().map(|r| r.total_tokens).sum();
-            println!(
-                "Total: {} sessions, {} input, {} output, {} total tokens",
-                usage_records.len(),
-                total_input,
-                total_output,
-                grand_total,
-            );
+            let user_count = usage_records.iter().filter(|r| !r.is_sub_agent).count();
+            let sub_agent_count = usage_records.iter().filter(|r| r.is_sub_agent).count();
+            if sub_agent_count > 0 {
+                println!(
+                    "Total: {} sessions ({} user + {} sub-agent), {} input, {} output, {} total tokens",
+                    usage_records.len(),
+                    user_count,
+                    sub_agent_count,
+                    format_tokens(total_input),
+                    format_tokens(total_output),
+                    format_tokens(grand_total),
+                );
+            } else {
+                println!(
+                    "Total: {} sessions, {} input, {} output, {} total tokens",
+                    usage_records.len(),
+                    format_tokens(total_input),
+                    format_tokens(total_output),
+                    format_tokens(grand_total),
+                );
+            }
         }
     }
 
@@ -400,5 +459,33 @@ mod tests {
             result.is_err(),
             "--json and -0 should be mutually exclusive"
         );
+    }
+
+    #[test]
+    fn format_tokens_below_thousand() {
+        assert_eq!(super::format_tokens(0), "0   ");
+        assert_eq!(super::format_tokens(1), "1   ");
+        assert_eq!(super::format_tokens(999), "999   ");
+    }
+
+    #[test]
+    fn format_tokens_thousands() {
+        assert_eq!(super::format_tokens(1_000), "1.0K");
+        assert_eq!(super::format_tokens(1_500), "1.5K");
+        assert_eq!(super::format_tokens(52_301), "52.3K");
+        assert_eq!(super::format_tokens(999_999), "1000.0K");
+    }
+
+    #[test]
+    fn format_tokens_millions() {
+        assert_eq!(super::format_tokens(1_000_000), "1.0M");
+        assert_eq!(super::format_tokens(5_622_054), "5.6M");
+        assert_eq!(super::format_tokens(215_015_370), "215.0M");
+    }
+
+    #[test]
+    fn format_tokens_billions() {
+        assert_eq!(super::format_tokens(1_000_000_000), "1.0G");
+        assert_eq!(super::format_tokens(1_400_000_000), "1.4G");
     }
 }
