@@ -19,6 +19,12 @@ use std::path::Path;
 
 pub use crate::provider::Provider;
 
+/// Minimum length for an extracted message to be useful as a search needle.
+const MIN_NEEDLE_LENGTH: usize = 20;
+
+/// Number of scrollback lines to capture for last-session detection.
+const LAST_SESSION_SCROLLBACK_LINES: &str = "3000";
+
 /// Result of session auto-detection.
 #[derive(Debug, Clone)]
 pub struct DetectedSession {
@@ -38,8 +44,6 @@ struct Candidate {
 pub struct LastSessionOptions {
     /// Optional provider filter.
     pub provider_filter: Option<Provider>,
-    /// Optional project directory override.
-    pub project_dir: Option<String>,
 }
 
 /// Options for match-based session detection.
@@ -304,25 +308,18 @@ pub fn detect_current_session() -> Result<DetectedSession> {
 ///    d. If multiple, try snippet matching against pane content
 ///    e. Return best match or most recent by timestamp
 /// 2. If not in tmux:
-///    a. Use CWD (or provided --project dir) as project directory
+///    a. Use CWD as project directory
 ///    b. Return the most recent session for that directory
 pub fn detect_last_session(opts: &LastSessionOptions) -> Result<DetectedSession> {
-    let project_override = opts.project_dir.as_ref().map(|p| resolve_to_absolute(p));
-
     #[cfg(unix)]
     if is_tmux_available() {
-        if let Some(result) =
-            detect_last_session_via_tmux(opts.provider_filter, project_override.as_deref())
-        {
+        if let Some(result) = detect_last_session_via_tmux(opts.provider_filter) {
             return Ok(result);
         }
     }
 
     // Fallback: CWD + most recent session
-    let dir = match project_override {
-        Some(d) => std::path::PathBuf::from(d),
-        None => env::current_dir().context("Failed to get current directory")?,
-    };
+    let dir = env::current_dir().context("Failed to get current directory")?;
     find_most_recent_session(&dir, opts.provider_filter)
 }
 
@@ -1044,36 +1041,165 @@ fn match_by_tmux_pane_content(
 
 // === Last-session detection helpers ===
 
-/// Resolve a path string to an absolute path.
-fn resolve_to_absolute(path: &str) -> String {
-    let p = std::path::PathBuf::from(path);
-    let abs = if p.is_absolute() {
-        p
+/// Extract the last assistant message from an OpenCode TUI pane scrollback.
+///
+/// Parses the TUI output bottom-up to find the footer, completion marker,
+/// and assistant message text. Returns the longest extracted line as a
+/// search needle (must be >= `MIN_NEEDLE_LENGTH` chars).
+fn extract_last_message_from_pane(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // Step 1: Find the most recent TUI footer (scan from bottom).
+    // Footer pattern: optional whitespace, then ╹, then 10+ ▀ characters.
+    let footer_idx = lines.iter().rposition(|line| {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('╹') {
+            return false;
+        }
+        let after_marker = &trimmed['\u{2579}'.len_utf8()..];
+        after_marker.chars().take_while(|&c| c == '▀').count() >= 10
+    })?;
+
+    // Step 2: Find the last ▣ completion marker above the footer.
+    let marker_idx = lines[..footer_idx]
+        .iter()
+        .rposition(|line| line.trim().starts_with('▣'))?;
+
+    // Step 3: Extract assistant message text above the marker.
+    // Walk upward from the ▣ line, skipping empty lines immediately above it,
+    // then collecting text lines until we hit a bordered line (┃), another ▣,
+    // or the start of content.
+    let mut text_lines: Vec<&str> = Vec::new();
+    let mut skipping_blanks = true;
+
+    for i in (0..marker_idx).rev() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if skipping_blanks {
+            if trimmed.is_empty() {
+                continue;
+            }
+            skipping_blanks = false;
+        }
+
+        // Stop conditions
+        if trimmed.starts_with('┃') || trimmed.starts_with('▣') {
+            break;
+        }
+        if trimmed.is_empty() {
+            // Blank line within message text — could be paragraph break.
+            // Keep collecting (there may be more text above).
+            text_lines.push(trimmed);
+            continue;
+        }
+
+        text_lines.push(trimmed);
+    }
+
+    // Lines were collected bottom-up; reverse to get top-down order.
+    text_lines.reverse();
+
+    // Trim trailing empty lines.
+    while text_lines.last().is_some_and(|l| l.is_empty()) {
+        text_lines.pop();
+    }
+
+    if text_lines.is_empty() {
+        return None;
+    }
+
+    // Step 4: Return the longest line as the search needle.
+    let longest = text_lines.iter().max_by_key(|l| l.len())?;
+    if longest.len() >= MIN_NEEDLE_LENGTH {
+        Some(longest.to_string())
     } else {
-        env::current_dir().unwrap_or_default().join(p)
-    };
-    abs.canonicalize()
-        .unwrap_or(abs)
-        .to_string_lossy()
-        .to_string()
+        None
+    }
+}
+
+/// Search all sessions for one whose recent messages contain the given needle.
+///
+/// Lists sessions from both providers (respecting `provider_filter`),
+/// sorts by `updated_at` descending, and returns the first match.
+/// Skips OpenCode sub-agent sessions (those with a `parent_id`).
+fn find_session_by_pane_message(
+    needle: &str,
+    last_n: usize,
+    provider_filter: Option<Provider>,
+) -> Option<DetectedSession> {
+    // Collect sessions from both providers with their updated_at timestamps.
+    let mut all_sessions: Vec<(String, Provider, chrono::DateTime<chrono::Utc>)> = Vec::new();
+
+    let include_opencode = provider_filter.is_none() || provider_filter == Some(Provider::OpenCode);
+    let include_claudecode =
+        provider_filter.is_none() || provider_filter == Some(Provider::ClaudeCode);
+
+    if include_opencode {
+        if let Ok(sessions) = crate::opencode::list_sessions() {
+            for s in sessions {
+                if s.parent_id.is_some() {
+                    continue;
+                }
+                all_sessions.push((s.session_id, Provider::OpenCode, s.updated_at));
+            }
+        }
+    }
+
+    if include_claudecode {
+        if let Ok(sessions) = crate::claudecode::session::list_sessions() {
+            for s in sessions {
+                all_sessions.push((s.session_id, Provider::ClaudeCode, s.updated_at));
+            }
+        }
+    }
+
+    // Sort by updated_at descending (most recent first).
+    all_sessions.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Search each session for the needle.
+    for (session_id, provider, _updated_at) in &all_sessions {
+        let found = match provider {
+            Provider::OpenCode => {
+                crate::opencode::session_tail_contains_text(session_id, needle, last_n)
+            }
+            Provider::ClaudeCode => {
+                crate::claudecode::session::session_tail_contains_text(session_id, needle, last_n)
+            }
+        };
+        if found {
+            return Some(DetectedSession {
+                session_id: session_id.clone(),
+                provider: *provider,
+            });
+        }
+    }
+
+    None
 }
 
 /// Detect the last session by reading the current tmux pane's content.
+///
+/// Algorithm:
+/// 1. If AI process currently running in pane, extract session from cmdline
+/// 2. Capture pane scrollback (3000 lines)
+/// 3. Extract last assistant message from OpenCode TUI output
+/// 4. Search all sessions for one containing that message text
 #[cfg(unix)]
-fn detect_last_session_via_tmux(
-    provider_filter: Option<Provider>,
-    project_override: Option<&str>,
-) -> Option<DetectedSession> {
+fn detect_last_session_via_tmux(provider_filter: Option<Provider>) -> Option<DetectedSession> {
     let pane_id = env::var("TMUX_PANE").ok()?;
 
-    // Get pane info from tmux
+    // Get pane info for running-process check
     let output = std::process::Command::new("tmux")
         .args([
             "display-message",
             "-t",
             &pane_id,
             "-p",
-            "#{pane_pid} #{pane_current_command} #{pane_current_path}",
+            "#{pane_pid} #{pane_current_command}",
         ])
         .output()
         .ok()?;
@@ -1081,13 +1207,12 @@ fn detect_last_session_via_tmux(
         return None;
     }
     let info_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let parts: Vec<&str> = info_line.splitn(3, ' ').collect();
-    if parts.len() < 3 {
+    let parts: Vec<&str> = info_line.splitn(2, ' ').collect();
+    if parts.len() < 2 {
         return None;
     }
     let pane_pid: u32 = parts[0].parse().ok()?;
     let pane_command = parts[1];
-    let pane_path = parts[2];
 
     // Step 1: If AI process running, try to extract session from process tree
     let is_ai_command = pane_command == "opencode" || pane_command == "claude";
@@ -1104,59 +1229,14 @@ fn detect_last_session_via_tmux(
         }
     }
 
-    // Step 2: Capture pane content for snippet matching
-    let visible = capture_pane_visible_content(&pane_id).unwrap_or_default();
-    let alternate = capture_pane_content(&pane_id).unwrap_or_default();
+    // Step 2: Capture pane scrollback
+    let scrollback = capture_pane_scrollback(&pane_id)?;
 
-    // Step 3: Determine project directory (override or pane's cwd)
-    let project_dir = project_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| pane_path.to_string());
+    // Step 3: Extract last assistant message from TUI output
+    let needle = extract_last_message_from_pane(&scrollback)?;
 
-    let dir = Path::new(&project_dir);
-
-    // Step 4: Gather candidates
-    let mut candidates = gather_candidates_for_dir(dir, provider_filter);
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Sort by updated_ms descending (most recent first)
-    candidates.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
-
-    if candidates.len() == 1 {
-        return Some(DetectedSession {
-            session_id: candidates[0].session_id.clone(),
-            provider: candidates[0].provider,
-        });
-    }
-
-    // Step 5: Match session log content against pane content (primary strategy)
-    let candidate_snippets: Vec<(String, Vec<String>)> = candidates
-        .iter()
-        .map(|c| {
-            let snippets = match c.provider {
-                Provider::OpenCode => get_opencode_user_snippets(&c.session_id, 5),
-                Provider::ClaudeCode => get_claudecode_user_snippets(&c.session_id, 5),
-            };
-            (c.session_id.clone(), snippets)
-        })
-        .collect();
-
-    let pane_contents: Vec<String> = [visible, alternate]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if let Some(detected) = match_snippets_mixed(&candidate_snippets, &candidates, &pane_contents) {
-        return Some(detected);
-    }
-
-    // Step 6: Fallback — return most recent candidate
-    Some(DetectedSession {
-        session_id: candidates[0].session_id.clone(),
-        provider: candidates[0].provider,
-    })
+    // Step 4: Search all sessions for the needle
+    find_session_by_pane_message(&needle, 5, provider_filter)
 }
 
 /// Capture the visible pane content including scrollback (up to 500 lines back).
@@ -1164,6 +1244,26 @@ fn detect_last_session_via_tmux(
 fn capture_pane_visible_content(pane_id: &str) -> Option<String> {
     let output = std::process::Command::new("tmux")
         .args(["capture-pane", "-p", "-S", "-500", "-t", pane_id])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Capture pane scrollback for last-session detection (more lines than visible capture).
+#[cfg(unix)]
+fn capture_pane_scrollback(pane_id: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-p",
+            "-S",
+            &format!("-{}", LAST_SESSION_SCROLLBACK_LINES),
+            "-t",
+            pane_id,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -2294,41 +2394,102 @@ mod tests {
         let args = crate::cli::Args::try_parse_from(["ai-audit", "last-session"])
             .expect("bare last-session should work");
         match args.command {
-            crate::cli::Commands::LastSession {
-                session_type,
-                project,
-                ..
-            } => {
+            crate::cli::Commands::LastSession { session_type, .. } => {
                 assert!(session_type.is_none());
-                assert!(project.is_none());
             }
             _ => panic!("expected LastSession command"),
         }
     }
 
     #[test]
-    fn cli_last_session_with_type_and_project() {
+    fn cli_last_session_with_type() {
         use clap::Parser;
 
-        let args = crate::cli::Args::try_parse_from([
-            "ai-audit",
-            "last-session",
-            "-t",
-            "opencode",
-            "-p",
-            "/home/user/project",
-        ])
-        .expect("last-session with flags should work");
+        let args = crate::cli::Args::try_parse_from(["ai-audit", "last-session", "-t", "opencode"])
+            .expect("last-session with -t should work");
         match args.command {
-            crate::cli::Commands::LastSession {
-                session_type,
-                project,
-                ..
-            } => {
+            crate::cli::Commands::LastSession { session_type, .. } => {
                 assert!(session_type.is_some());
-                assert_eq!(project, Some("/home/user/project".to_string()));
             }
             _ => panic!("expected LastSession command"),
         }
+    }
+
+    // === TUI pane message extraction tests ===
+
+    #[test]
+    fn test_extract_last_message_basic() {
+        // Realistic OpenCode TUI output (bottom section)
+        let content = "\
+  ┃                                                              \n\
+                                                                  \n\
+     Still ambiguous even with --type opencode. Found 2 sessions:\n\
+                                                                  \n\
+     - ses_37d118025ffeqDSRBmU4F6Kzy3\n\
+     - ses_37d2085cdffe01ypbQtMozLg2t\n\
+                                                                  \n\
+     Want me to retry with a specific session ID from the list above?\n\
+                                                                  \n\
+     ▣  Sisyphus · claude-opus-4-6 · 9.9s                        \n\
+                                                                  \n\
+  ┃                                                              \n\
+  ┃                                                              \n\
+  ┃  Sisyphus  Claude Opus 4.6 Anthropic · max                   \n\
+                                                                  \n\
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+                    ctrl+t variants  tab agents  ctrl+p commands  ";
+
+        let result = extract_last_message_from_pane(content);
+        assert!(result.is_some(), "Should extract a message from TUI output");
+        let needle = result.unwrap();
+        // The longest line should be the one about retrying
+        assert!(
+            needle.contains("Want me to retry with a specific session"),
+            "Expected the longest assistant text line, got: {}",
+            needle
+        );
+        assert!(
+            needle.len() >= MIN_NEEDLE_LENGTH,
+            "Needle should be >= {} chars, got {}",
+            MIN_NEEDLE_LENGTH,
+            needle.len()
+        );
+    }
+
+    #[test]
+    fn test_extract_last_message_no_tui() {
+        // Plain shell output — no TUI elements
+        let content = "\
+$ cargo build\n\
+   Compiling ai-audit v0.1.0\n\
+    Finished dev [unoptimized + debuginfo] target(s) in 2.34s\n\
+$ ";
+
+        let result = extract_last_message_from_pane(content);
+        assert!(result.is_none(), "Should return None for non-TUI output");
+    }
+
+    #[test]
+    fn test_extract_last_message_short_text() {
+        // TUI output where the assistant message is too short
+        let content = "\
+  ┃                                                              \n\
+                                                                  \n\
+     Done.\n\
+                                                                  \n\
+     ▣  Sisyphus · claude-opus-4-6 · 1.2s                        \n\
+                                                                  \n\
+  ┃                                                              \n\
+  ┃  Sisyphus  Claude Opus 4.6 Anthropic · max                   \n\
+                                                                  \n\
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+                    ctrl+t variants  tab agents  ctrl+p commands  ";
+
+        let result = extract_last_message_from_pane(content);
+        assert!(
+            result.is_none(),
+            "Should return None when message is too short (< {} chars)",
+            MIN_NEEDLE_LENGTH
+        );
     }
 }

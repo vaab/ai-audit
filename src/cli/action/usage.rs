@@ -336,7 +336,10 @@ mod tests {
             .expect("--type opencode works");
         match args.command {
             crate::cli::def::Commands::Usage { session_type, .. } => {
-                assert!(matches!(session_type, Some(crate::cli::def::SessionType::OpenCode)));
+                assert!(matches!(
+                    session_type,
+                    Some(crate::cli::def::SessionType::OpenCode)
+                ));
             }
             _ => panic!("expected Usage command"),
         }
@@ -368,8 +371,7 @@ mod tests {
 
     #[test]
     fn cli_usage_json_flag() {
-        let args =
-            Args::try_parse_from(["ai-audit", "usage", "--json"]).expect("--json works");
+        let args = Args::try_parse_from(["ai-audit", "usage", "--json"]).expect("--json works");
         match args.command {
             crate::cli::def::Commands::Usage { output, .. } => {
                 assert!(output.json);
@@ -394,6 +396,9 @@ mod tests {
     #[test]
     fn cli_usage_json_and_nul_mutually_exclusive() {
         let result = Args::try_parse_from(["ai-audit", "usage", "--json", "-0"]);
-        assert!(result.is_err(), "--json and -0 should be mutually exclusive");
+        assert!(
+            result.is_err(),
+            "--json and -0 should be mutually exclusive"
+        );
     }
 }

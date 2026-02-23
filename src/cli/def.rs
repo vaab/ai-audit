@@ -146,15 +146,11 @@ pub enum Commands {
         #[command(flatten)]
         output: OutputOpts,
     },
-    /// Detect the last AI session used in the current tmux pane or directory
+    /// Detect the last AI session used in the current tmux pane
     LastSession {
         /// Filter by session type (claudecode or opencode)
         #[arg(short = 't', long = "type")]
         session_type: Option<SessionType>,
-
-        /// Override project path for session lookup
-        #[arg(short, long)]
-        project: Option<String>,
 
         #[command(flatten)]
         output: OutputOpts,

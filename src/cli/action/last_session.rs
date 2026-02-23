@@ -7,7 +7,6 @@ use crate::OutputFormat;
 
 pub fn run(
     session_type: Option<super::super::def::SessionType>,
-    project: Option<String>,
     format: OutputFormat,
 ) -> Result<()> {
     let provider_filter = session_type.map(|t| match t {
@@ -17,7 +16,6 @@ pub fn run(
 
     let detected = session_detect::detect_last_session(&session_detect::LastSessionOptions {
         provider_filter,
-        project_dir: project,
     })?;
 
     match format {
