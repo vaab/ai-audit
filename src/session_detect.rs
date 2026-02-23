@@ -839,11 +839,15 @@ fn get_opencode_user_snippets_from_db(
     let mut snippets = Vec::new();
 
     // Walk from newest to oldest, collecting user messages
-    for (msg_id, role, _time_created) in messages.iter().rev() {
+    for (msg_id, data) in messages.iter().rev() {
         if snippets.len() >= max_messages {
             break;
         }
 
+        let role = data
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         if role != "user" {
             continue;
         }

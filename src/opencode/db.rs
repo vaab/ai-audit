@@ -254,13 +254,15 @@ pub fn session_edited_file_from_conn(
     false
 }
 
-/// Get messages for a session: returns (msg_id, role, time_created_ms).
+/// Get messages for a session as parsed JSON values.
 ///
-/// The `role` is extracted from the `data` JSON column.
+/// Returns `(msg_id, data)` pairs ordered by creation time.  The `id`
+/// field from the SQL row is injected into the `data` JSON when absent
+/// so that downstream consumers always find it at `data["id"]`.
 pub fn get_messages_for_session(
     conn: &Connection,
     session_id: &str,
-) -> Result<Vec<(String, String, i64)>> {
+) -> Result<Vec<(String, serde_json::Value)>> {
     let mut stmt = conn
         .prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC")?;
 
@@ -273,21 +275,16 @@ pub fn get_messages_for_session(
     let mut messages = Vec::new();
     for row in rows {
         let (id, data_str) = row?;
-        let data: serde_json::Value = match serde_json::from_str(&data_str) {
+        let mut data: serde_json::Value = match serde_json::from_str(&data_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let role = data
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let time_created = data
-            .get("time")
-            .and_then(|t| t.get("created"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        messages.push((id, role, time_created));
+        // DB rows store `id` as a separate column; inject it so all
+        // downstream code can rely on `data["id"]` being present.
+        if data.get("id").is_none() {
+            data["id"] = serde_json::Value::String(id.clone());
+        }
+        messages.push((id, data));
     }
 
     Ok(messages)
@@ -536,10 +533,16 @@ mod tests {
         let messages = get_messages_for_session(&conn, "ses_001").unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].0, "msg_001");
-        assert_eq!(messages[0].1, "user");
-        assert_eq!(messages[0].2, 1705314600000);
+        assert_eq!(messages[0].1.get("role").unwrap().as_str().unwrap(), "user");
+        assert_eq!(
+            messages[0].1.get("id").unwrap().as_str().unwrap(),
+            "msg_001"
+        );
         assert_eq!(messages[1].0, "msg_002");
-        assert_eq!(messages[1].1, "assistant");
+        assert_eq!(
+            messages[1].1.get("role").unwrap().as_str().unwrap(),
+            "assistant"
+        );
     }
 
     #[test]

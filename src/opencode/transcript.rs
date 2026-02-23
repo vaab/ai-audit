@@ -50,16 +50,25 @@ pub fn parse_transcript_from_conn(
 
     let mut entries = Vec::new();
 
-    for (msg_id, role_str, time_created_ms) in &messages {
-        let role = match role_str.as_str() {
+    for (msg_id, data) in &messages {
+        let role = match data
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+        {
             "user" => Role::User,
             "assistant" => Role::Assistant,
             "system" => Role::System,
             _ => continue,
         };
 
+        let time_created_ms = data
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let msg_timestamp = Utc
-            .timestamp_millis_opt(*time_created_ms)
+            .timestamp_millis_opt(time_created_ms)
             .single()
             .unwrap_or_else(Utc::now);
 

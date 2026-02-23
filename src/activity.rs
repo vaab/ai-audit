@@ -826,7 +826,11 @@ fn parse_opencode_messages_from_db(
             Err(_) => continue,
         };
 
-        for (msg_id, role, time_created) in &messages {
+        for (msg_id, data) in &messages {
+            let role = data
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             if role != "user" {
                 continue;
             }
@@ -841,6 +845,11 @@ fn parse_opencode_messages_from_db(
             }
 
             // Timestamp is in milliseconds
+            let time_created = data
+                .get("time")
+                .and_then(|t| t.get("created"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let timestamp = time_created / 1000;
 
             let ident = format!(

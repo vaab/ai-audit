@@ -551,26 +551,11 @@ fn list_messages_from_db(session_id: &str) -> Result<Vec<Message>> {
         return Ok(Vec::new());
     }
     let conn = db::open_db()?;
-    let mut stmt = conn
-        .prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC")?;
-    let rows = stmt.query_map([session_id], |row| {
-        let id: String = row.get(0)?;
-        let data_str: String = row.get(1)?;
-        Ok((id, data_str))
-    })?;
+    let rows = db::get_messages_for_session(&conn, session_id)?;
 
     let mut messages = Vec::new();
-    for row in rows {
-        let (id, data_str) = row?;
-        let mut data: serde_json::Value = match serde_json::from_str(&data_str) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // DB rows store `id` in a separate column, not inside the data JSON.
-        if data.get("id").is_none() {
-            data["id"] = serde_json::Value::String(id);
-        }
-        if let Some(msg) = parse_message_from_value(&data, session_id) {
+    for (_id, data) in &rows {
+        if let Some(msg) = parse_message_from_value(data, session_id) {
             messages.push(msg);
         }
     }
