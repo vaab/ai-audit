@@ -17,12 +17,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-/// Detected provider type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provider {
-    OpenCode,
-    ClaudeCode,
-}
+pub use crate::provider::Provider;
 
 /// Result of session auto-detection.
 #[derive(Debug, Clone)]

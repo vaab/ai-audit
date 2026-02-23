@@ -24,11 +24,8 @@ pub fn run(
     verbose: u8,
 ) -> Result<()> {
     // Auto-detect provider
-    let mut entries = if session.starts_with("ses_") {
-        crate::opencode::transcript::parse_transcript(session)?
-    } else {
-        crate::claudecode::transcript::parse_transcript(session)?
-    };
+    let provider = crate::provider::provider_for_session(session);
+    let mut entries = provider.parse_transcript(session)?;
 
     // Filter thinking entries unless verbose
     if verbose == 0 {

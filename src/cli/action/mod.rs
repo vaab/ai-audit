@@ -72,8 +72,8 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             output,
         } => {
             let provider_filter = session_type.map(|t| match t {
-                super::def::SessionType::OpenCode => crate::session_detect::Provider::OpenCode,
-                super::def::SessionType::ClaudeCode => crate::session_detect::Provider::ClaudeCode,
+                super::def::SessionType::OpenCode => crate::provider::Provider::OpenCode,
+                super::def::SessionType::ClaudeCode => crate::provider::Provider::ClaudeCode,
             });
             let detected = if let Some(needle) = r#match {
                 // Match-based detection: search recent messages for the given text
@@ -92,15 +92,11 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             let format = output.format();
             match format {
                 crate::OutputFormat::Json => {
-                    let provider = match detected.provider {
-                        crate::session_detect::Provider::OpenCode => "opencode",
-                        crate::session_detect::Provider::ClaudeCode => "claudecode",
-                    };
                     println!(
                         "{}",
                         serde_json::json!({
                             "session_id": detected.session_id,
-                            "provider": provider,
+                            "provider": detected.provider.as_str(),
                         })
                     );
                 }

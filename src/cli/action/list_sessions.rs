@@ -5,7 +5,8 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use super::super::def::SessionType;
-use crate::{claudecode, opencode, OutputFormat};
+use crate::provider::{self, Provider};
+use crate::OutputFormat;
 
 /// Session record for JSON/NUL output
 #[derive(Debug, Serialize)]
@@ -93,63 +94,18 @@ pub fn run(
     let mut sessions: Vec<SessionRecord> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    let include_claudecode = session_type.is_none_or(|t| matches!(t, SessionType::ClaudeCode));
-    let include_opencode = session_type.is_none_or(|t| matches!(t, SessionType::OpenCode));
+    // Determine which providers to query
+    let providers: Vec<Box<dyn provider::SessionProvider>> = match session_type {
+        Some(SessionType::ClaudeCode) => vec![provider::provider_for(Provider::ClaudeCode)],
+        Some(SessionType::OpenCode) => vec![provider::provider_for(Provider::OpenCode)],
+        None => provider::all_providers(),
+    };
 
-    if include_claudecode {
-        match claudecode::session::list_sessions() {
-            Ok(cc_sessions) => {
-                for s in cc_sessions {
-                    // Filters: cheapest first (session_id, project, timespan, then search)
-                    if let Some(id) = session_id {
-                        if s.session_id != id {
-                            continue;
-                        }
-                    }
-                    if let Some(ref expected) = project_path {
-                        if s.project_dir != *expected {
-                            continue;
-                        }
-                    }
-                    let started = s.started_at.timestamp() as f64
-                        + s.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    let updated = s.updated_at.timestamp() as f64
-                        + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    if let Some(ref filter) = ts_filter {
-                        if !filter.overlaps(started, updated) {
-                            continue;
-                        }
-                    }
-                    if let Some(ref target) = file_path {
-                        if !claudecode::session::session_edited_file(&s.session_id, target) {
-                            continue;
-                        }
-                    }
-                    if let Some(needle) = search {
-                        if !claudecode::session::session_contains_text(&s.session_id, needle) {
-                            continue;
-                        }
-                    }
-                    sessions.push(SessionRecord {
-                        timestamp: started,
-                        session_id: s.session_id,
-                        session_type: "claudecode",
-                        project_dir: s.project_dir,
-                        title: s.title,
-                    });
-                }
-            }
-            Err(e) => {
-                errors.push(format!("claudecode: {}", e));
-            }
-        }
-    }
-
-    if include_opencode {
-        match opencode::list_sessions() {
-            Ok(oc_sessions) => {
-                for s in oc_sessions {
-                    // Filters: cheapest first (parent, session_id, project, timespan, then search)
+    for p in &providers {
+        match p.list_sessions() {
+            Ok(provider_sessions) => {
+                for s in provider_sessions {
+                    // Filters: cheapest first (parent, session_id, project, timespan, file, then search)
                     if !all && s.parent_id.is_some() {
                         continue;
                     }
@@ -173,26 +129,26 @@ pub fn run(
                         }
                     }
                     if let Some(ref target) = file_path {
-                        if !opencode::session_edited_file(&s.session_id, target) {
+                        if !p.session_edited_file(&s.session_id, target) {
                             continue;
                         }
                     }
                     if let Some(needle) = search {
-                        if !opencode::session_contains_text(&s.session_id, needle) {
+                        if !p.session_contains_text(&s.session_id, needle) {
                             continue;
                         }
                     }
                     sessions.push(SessionRecord {
                         timestamp: started,
                         session_id: s.session_id,
-                        session_type: "opencode",
+                        session_type: s.provider.as_str(),
                         project_dir: s.project_dir,
                         title: s.title,
                     });
                 }
             }
             Err(e) => {
-                errors.push(format!("opencode: {}", e));
+                errors.push(format!("{}: {}", p.provider(), e));
             }
         }
     }

@@ -10,6 +10,50 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::provider::{Provider, Session, SessionProvider};
+use crate::transcript::TranscriptEntry;
+
+/// OpenCode provider adapter.
+pub struct OpenCodeProvider;
+
+impl SessionProvider for OpenCodeProvider {
+    fn provider(&self) -> Provider {
+        Provider::OpenCode
+    }
+
+    fn list_sessions(&self) -> Result<Vec<Session>> {
+        let sessions = list_sessions()?;
+        Ok(sessions
+            .into_iter()
+            .map(|s| Session {
+                session_id: s.session_id,
+                provider: Provider::OpenCode,
+                started_at: s.started_at,
+                updated_at: s.updated_at,
+                project_dir: s.project_dir,
+                title: s.title,
+                parent_id: s.parent_id,
+            })
+            .collect())
+    }
+
+    fn session_contains_text(&self, session_id: &str, needle: &str) -> bool {
+        session_contains_text(session_id, needle)
+    }
+
+    fn session_edited_file(&self, session_id: &str, file_path: &str) -> bool {
+        session_edited_file(session_id, file_path)
+    }
+
+    fn session_tail_contains_text(&self, session_id: &str, needle: &str, last_n: usize) -> bool {
+        session_tail_contains_text(session_id, needle, last_n)
+    }
+
+    fn parse_transcript(&self, session_id: &str) -> Result<Vec<TranscriptEntry>> {
+        transcript::parse_transcript(session_id)
+    }
+}
+
 pub fn storage_dir() -> PathBuf {
     crate::opencode_data_dir().join("storage/directory-agents")
 }

@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::provider::Provider;
 
 /// Activity event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,22 +59,6 @@ pub struct TimestampedActivity {
     pub event: ActivityEvent,
 }
 
-/// Client type (provider)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientType {
-    Claude,
-    Opencode,
-}
-
-impl ClientType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ClientType::Claude => "claudecode",
-            ClientType::Opencode => "opencode",
-        }
-    }
-}
-
 /// Per-session metadata — the single source of truth for child-session
 /// detection and project-directory resolution.
 #[derive(Debug)]
@@ -85,7 +70,7 @@ struct SessionMeta {
     /// `true` when this session belongs to a subagent.
     is_child: bool,
     /// Provider that owns this session.
-    client_type: ClientType,
+    provider: Provider,
     /// Path to the JSONL file (Claude Code only; `None` for OpenCode).
     session_file: Option<PathBuf>,
 }
@@ -232,7 +217,7 @@ fn scan_claudecode_sessions(config: &Config) -> Vec<SessionMeta> {
                 id: session_id,
                 project_dir,
                 is_child,
-                client_type: ClientType::Claude,
+                provider: Provider::ClaudeCode,
                 session_file: Some(file_path),
             });
         }
@@ -299,7 +284,7 @@ fn scan_opencode_sessions_to_meta(session_dir: &Path, config: &Config) -> Vec<Se
                 id: session.id,
                 project_dir,
                 is_child: session.parent_id.is_some(),
-                client_type: ClientType::Opencode,
+                provider: Provider::OpenCode,
                 session_file: None,
             });
         }
@@ -342,7 +327,7 @@ fn scan_opencode_sessions_to_meta_from_conn(
                 id: s.session_id,
                 project_dir,
                 is_child: s.parent_id.is_some(),
-                client_type: ClientType::Opencode,
+                provider: Provider::OpenCode,
                 session_file: None,
             }
         })
@@ -453,7 +438,7 @@ pub fn parse_claudecode_messages(
 
         let ident = format!(
             "{}-{}@{}",
-            ClientType::Claude.as_str(),
+            Provider::ClaudeCode.as_str(),
             ActivityType::Message.as_str(),
             project_path
         );
@@ -520,7 +505,7 @@ pub fn parse_claudecode_permissions(
 
         let ident = format!(
             "{}-{}@{}",
-            ClientType::Claude.as_str(),
+            Provider::ClaudeCode.as_str(),
             ActivityType::Permission.as_str(),
             project_path
         );
@@ -724,7 +709,7 @@ fn parse_opencode_messages_with_index(
 
             let ident = format!(
                 "{}-{}@{}",
-                ClientType::Opencode.as_str(),
+                Provider::OpenCode.as_str(),
                 ActivityType::Message.as_str(),
                 project_path
             );
@@ -819,7 +804,7 @@ fn parse_opencode_messages_from_db(
 
     // Get all sessions from the index that are OpenCode and non-child
     for meta in index.non_child() {
-        if meta.client_type != ClientType::Opencode {
+        if meta.provider != Provider::OpenCode {
             continue;
         }
 
@@ -860,7 +845,7 @@ fn parse_opencode_messages_from_db(
 
             let ident = format!(
                 "{}-{}@{}",
-                ClientType::Opencode.as_str(),
+                Provider::OpenCode.as_str(),
                 ActivityType::Message.as_str(),
                 project_path
             );
@@ -931,18 +916,18 @@ pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
     // Collect unique project_dir values per (client_type, project_dir),
     // skipping child sessions.
     for meta in index.non_child() {
-        match meta.client_type {
-            ClientType::Claude => {
+        match meta.provider {
+            Provider::ClaudeCode => {
                 // Claude Code produces both msg and perm identifiers
                 let msg_ident = format!(
                     "{}-{}@{}",
-                    ClientType::Claude.as_str(),
+                    Provider::ClaudeCode.as_str(),
                     ActivityType::Message.as_str(),
                     meta.project_dir
                 );
                 let perm_ident = format!(
                     "{}-{}@{}",
-                    ClientType::Claude.as_str(),
+                    Provider::ClaudeCode.as_str(),
                     ActivityType::Permission.as_str(),
                     meta.project_dir
                 );
@@ -954,10 +939,10 @@ pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
                     identifiers.push(perm_ident);
                 }
             }
-            ClientType::Opencode => {
+            Provider::OpenCode => {
                 let msg_ident = format!(
                     "{}-{}@{}",
-                    ClientType::Opencode.as_str(),
+                    Provider::OpenCode.as_str(),
                     ActivityType::Message.as_str(),
                     meta.project_dir
                 );
@@ -1035,7 +1020,7 @@ pub fn fetch_activities(
     // Claude Code messages — iterate the pre-built index, skip children
     if filter.include_claude && filter.include_messages {
         for meta in index.non_child() {
-            if meta.client_type != ClientType::Claude {
+            if meta.provider != Provider::ClaudeCode {
                 continue;
             }
             let session_file = match &meta.session_file {
@@ -1354,8 +1339,8 @@ mod tests {
 
     #[test]
     fn test_client_type_as_str() {
-        assert_eq!(ClientType::Claude.as_str(), "claudecode");
-        assert_eq!(ClientType::Opencode.as_str(), "opencode");
+        assert_eq!(Provider::ClaudeCode.as_str(), "claudecode");
+        assert_eq!(Provider::OpenCode.as_str(), "opencode");
     }
 
     #[test]
@@ -1525,7 +1510,7 @@ mod tests {
     fn test_identifier_format() {
         let ident = format!(
             "{}-{}@{}",
-            ClientType::Claude.as_str(),
+            Provider::ClaudeCode.as_str(),
             ActivityType::Message.as_str(),
             "DEV>rs/project"
         );
@@ -1533,7 +1518,7 @@ mod tests {
 
         let ident = format!(
             "{}-{}@{}",
-            ClientType::Opencode.as_str(),
+            Provider::OpenCode.as_str(),
             ActivityType::Permission.as_str(),
             "WORK>app"
         );
@@ -2220,7 +2205,7 @@ mod tests {
             id: "ses_001".to_string(),
             project_dir: "/old/path".to_string(),
             is_child: false,
-            client_type: ClientType::Opencode,
+            provider: Provider::OpenCode,
             session_file: None,
         }];
 
@@ -2228,7 +2213,7 @@ mod tests {
             id: "ses_001".to_string(),
             project_dir: "/new/path".to_string(),
             is_child: false,
-            client_type: ClientType::Opencode,
+            provider: Provider::OpenCode,
             session_file: None,
         }];
 
@@ -2243,7 +2228,7 @@ mod tests {
             id: "ses_file".to_string(),
             project_dir: "/proj".to_string(),
             is_child: false,
-            client_type: ClientType::Opencode,
+            provider: Provider::OpenCode,
             session_file: None,
         }];
 
@@ -2251,7 +2236,7 @@ mod tests {
             id: "ses_db".to_string(),
             project_dir: "/proj".to_string(),
             is_child: false,
-            client_type: ClientType::Opencode,
+            provider: Provider::OpenCode,
             session_file: None,
         }];
 

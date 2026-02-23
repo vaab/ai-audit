@@ -11,8 +11,8 @@ pub fn run(
     format: OutputFormat,
 ) -> Result<()> {
     let provider_filter = session_type.map(|t| match t {
-        super::super::def::SessionType::OpenCode => session_detect::Provider::OpenCode,
-        super::super::def::SessionType::ClaudeCode => session_detect::Provider::ClaudeCode,
+        super::super::def::SessionType::OpenCode => crate::provider::Provider::OpenCode,
+        super::super::def::SessionType::ClaudeCode => crate::provider::Provider::ClaudeCode,
     });
 
     let detected = session_detect::detect_last_session(&session_detect::LastSessionOptions {
@@ -22,15 +22,11 @@ pub fn run(
 
     match format {
         OutputFormat::Json => {
-            let provider = match detected.provider {
-                session_detect::Provider::OpenCode => "opencode",
-                session_detect::Provider::ClaudeCode => "claudecode",
-            };
             println!(
                 "{}",
                 serde_json::json!({
                     "session_id": detected.session_id,
-                    "provider": provider,
+                    "provider": detected.provider.as_str(),
                 })
             );
         }
