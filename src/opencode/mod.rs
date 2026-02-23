@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::provider::{Provider, Session, SessionProvider};
+use crate::provider::{Message, Provider, Session, SessionProvider, TokenUsage};
 use crate::transcript::TranscriptEntry;
 
 /// OpenCode provider adapter.
@@ -51,6 +51,10 @@ impl SessionProvider for OpenCodeProvider {
 
     fn parse_transcript(&self, session_id: &str) -> Result<Vec<TranscriptEntry>> {
         transcript::parse_transcript(session_id)
+    }
+
+    fn list_messages(&self, session_id: &str) -> Result<Vec<Message>> {
+        self::list_messages(session_id)
     }
 }
 
@@ -459,6 +463,143 @@ fn session_contains_text_in_dirs_tail(
     }
 
     false
+}
+
+/// Parse token usage from an OpenCode message JSON `tokens` object.
+///
+/// Expected structure: `{"input": N, "output": N, "reasoning": N, "cache": {"read": N, "write": N}}`
+fn parse_opencode_tokens(tokens: &serde_json::Value) -> TokenUsage {
+    let cache = tokens.get("cache").unwrap_or(&serde_json::Value::Null);
+    TokenUsage {
+        input: tokens.get("input").and_then(|v| v.as_u64()).unwrap_or(0),
+        output: tokens.get("output").and_then(|v| v.as_u64()).unwrap_or(0),
+        reasoning: tokens
+            .get("reasoning")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_read: cache.get("read").and_then(|v| v.as_u64()).unwrap_or(0),
+        cache_write: cache.get("write").and_then(|v| v.as_u64()).unwrap_or(0),
+        cache_creation: 0,
+    }
+}
+
+/// Parse a single OpenCode message JSON value into a Message.
+fn parse_message_from_value(data: &serde_json::Value, session_id: &str) -> Option<Message> {
+    let id = data.get("id").and_then(|v| v.as_str())?;
+    let role = data
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let time_created = data
+        .get("time")
+        .and_then(|t| t.get("created"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let timestamp = Utc
+        .timestamp_millis_opt(time_created)
+        .single()
+        .unwrap_or_else(Utc::now);
+
+    // Model info: on assistant messages it's flat `modelID`, on user messages it's nested `model.modelID`
+    let model = data
+        .get("modelID")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data.get("model")
+                .and_then(|m| m.get("modelID"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string());
+
+    let tokens = data.get("tokens").map(|t| parse_opencode_tokens(t));
+
+    Some(Message {
+        message_id: id.to_string(),
+        session_id: session_id.to_string(),
+        provider: Provider::OpenCode,
+        role: role.to_string(),
+        model,
+        timestamp,
+        tokens,
+    })
+}
+
+/// List messages with token usage data for an OpenCode session.
+///
+/// Tries file-based storage first, falls back to SQLite database.
+pub fn list_messages(session_id: &str) -> Result<Vec<Message>> {
+    // Try file-based first
+    let message_dir = crate::opencode_data_dir()
+        .join("storage/message")
+        .join(session_id);
+
+    if message_dir.exists() {
+        let mut messages = list_messages_from_files(&message_dir, session_id)?;
+        if !messages.is_empty() {
+            messages.sort_by_key(|m| m.timestamp);
+            return Ok(messages);
+        }
+    }
+
+    // Fall back to DB
+    list_messages_from_db(session_id)
+}
+
+/// Parse messages from SQLite database.
+fn list_messages_from_db(session_id: &str) -> Result<Vec<Message>> {
+    if !db::db_exists() {
+        return Ok(Vec::new());
+    }
+    let conn = db::open_db()?;
+    let mut stmt =
+        conn.prepare("SELECT data FROM message WHERE session_id = ? ORDER BY time_created ASC")?;
+    let rows = stmt.query_map([session_id], |row| {
+        let data_str: String = row.get(0)?;
+        Ok(data_str)
+    })?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let data_str = row?;
+        let data: serde_json::Value = match serde_json::from_str(&data_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(msg) = parse_message_from_value(&data, session_id) {
+            messages.push(msg);
+        }
+    }
+    Ok(messages)
+}
+
+/// Parse messages from file-based storage.
+fn list_messages_from_files(
+    message_dir: &std::path::Path,
+    session_id: &str,
+) -> Result<Vec<Message>> {
+    let mut messages = Vec::new();
+
+    let entries = fs::read_dir(message_dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let data: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(msg) = parse_message_from_value(&data, session_id) {
+            messages.push(msg);
+        }
+    }
+
+    Ok(messages)
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {

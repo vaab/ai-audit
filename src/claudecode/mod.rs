@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::provider::{Provider, Session, SessionProvider};
+use crate::provider::{Message, Provider, Session, SessionProvider};
 use crate::transcript::TranscriptEntry;
 
 pub fn debug_dir() -> PathBuf {
@@ -59,5 +59,9 @@ impl SessionProvider for ClaudeCodeProvider {
 
     fn parse_transcript(&self, session_id: &str) -> Result<Vec<TranscriptEntry>> {
         transcript::parse_transcript(session_id)
+    }
+
+    fn list_messages(&self, session_id: &str) -> Result<Vec<Message>> {
+        session::list_messages(session_id)
     }
 }

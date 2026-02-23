@@ -2,9 +2,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::provider::{Message, Provider, TokenUsage};
 
 #[derive(Debug, Clone)]
 pub struct ToolUse {
@@ -686,6 +688,207 @@ pub fn load_tool_uses(session_uuid: &str) -> Result<Vec<ToolUse>> {
     let content = fs::read_to_string(&session_file).context("Failed to read session file")?;
 
     parse_tool_uses(&content)
+}
+
+/// Parse token usage from a Claude Code JSONL `message.usage` object.
+fn parse_usage_from_value(usage: &Value) -> TokenUsage {
+    TokenUsage {
+        input: usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output: usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_read: usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation: usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_write: 0,
+        reasoning: 0,
+    }
+}
+
+/// List messages with token usage data from a Claude Code session JSONL.
+///
+/// Parses `type: "assistant"` entries for direct messages and
+/// `type: "progress"` entries for sub-agent token usage. Deduplicates
+/// by `requestId` — multiple JSONL lines can share the same requestId
+/// (streaming chunks); only the last occurrence (with final usage) is kept.
+pub fn list_messages(session_uuid: &str) -> Result<Vec<Message>> {
+    let session_file = find_session_file(session_uuid).context("Session file not found")?;
+    let content = fs::read_to_string(&session_file).context("Failed to read session file")?;
+    parse_messages(&content, session_uuid)
+}
+
+/// Parse messages with token data from raw JSONL content.
+pub fn parse_messages(content: &str, session_id: &str) -> Result<Vec<Message>> {
+    use std::io::BufRead;
+
+    let reader = std::io::BufReader::new(content.as_bytes());
+
+    // Collect entries keyed by (requestId or synthetic id) → (timestamp, message data).
+    // For entries sharing a requestId, the last one wins (has final usage).
+    let mut messages_by_id: Vec<(String, Message)> = Vec::new();
+    let mut seen_request_ids: HashSet<String> = HashSet::new();
+    // Collect in reverse order to let last occurrence win, then reverse at end.
+    let lines: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    // Process lines in reverse so we see the last occurrence of each requestId first.
+    for line in lines.iter().rev() {
+        let entry: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let timestamp_str = match entry.get("timestamp").and_then(|v| v.as_str()) {
+            Some(ts) => ts,
+            None => continue,
+        };
+        let timestamp = match DateTime::parse_from_rfc3339(timestamp_str) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => continue,
+        };
+
+        match entry_type {
+            "assistant" => {
+                let message = match entry.get("message") {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let usage = match message.get("usage") {
+                    Some(u) => u,
+                    None => continue,
+                };
+
+                // Deduplicate by requestId
+                let request_id = entry
+                    .get("requestId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !request_id.is_empty() {
+                    if seen_request_ids.contains(&request_id) {
+                        continue;
+                    }
+                    seen_request_ids.insert(request_id.clone());
+                }
+
+                let model = message
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let msg_id = if !request_id.is_empty() {
+                    request_id.clone()
+                } else {
+                    format!("assistant-{}", timestamp.timestamp_millis())
+                };
+
+                let tokens = parse_usage_from_value(usage);
+
+                messages_by_id.push((
+                    msg_id.clone(),
+                    Message {
+                        message_id: msg_id,
+                        session_id: session_id.to_string(),
+                        provider: Provider::ClaudeCode,
+                        role: "assistant".to_string(),
+                        model,
+                        timestamp,
+                        tokens: Some(tokens),
+                    },
+                ));
+            }
+            "progress" => {
+                // Sub-agent token usage at data.message.message.usage
+                let usage = entry
+                    .get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.get("message"))
+                    .and_then(|m| m.get("usage"));
+                let usage = match usage {
+                    Some(u) => u,
+                    None => continue,
+                };
+
+                // Deduplicate by nested requestId
+                let request_id = entry
+                    .get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.get("requestId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !request_id.is_empty() {
+                    if seen_request_ids.contains(&request_id) {
+                        continue;
+                    }
+                    seen_request_ids.insert(request_id.clone());
+                }
+
+                let model = entry
+                    .get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.get("message"))
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let msg_id = if !request_id.is_empty() {
+                    format!("sub-{}", request_id)
+                } else {
+                    format!("progress-{}", timestamp.timestamp_millis())
+                };
+
+                let tokens = parse_usage_from_value(usage);
+
+                messages_by_id.push((
+                    msg_id.clone(),
+                    Message {
+                        message_id: msg_id,
+                        session_id: session_id.to_string(),
+                        provider: Provider::ClaudeCode,
+                        role: "assistant".to_string(),
+                        model,
+                        timestamp,
+                        tokens: Some(tokens),
+                    },
+                ));
+            }
+            "user" => {
+                // User messages have no token data, but include them for completeness
+                messages_by_id.push((
+                    format!("user-{}", timestamp.timestamp_millis()),
+                    Message {
+                        message_id: format!("user-{}", timestamp.timestamp_millis()),
+                        session_id: session_id.to_string(),
+                        provider: Provider::ClaudeCode,
+                        role: "user".to_string(),
+                        model: None,
+                        timestamp,
+                        tokens: None,
+                    },
+                ));
+            }
+            _ => continue,
+        }
+    }
+
+    // Reverse to restore chronological order
+    messages_by_id.reverse();
+
+    Ok(messages_by_id.into_iter().map(|(_, msg)| msg).collect())
 }
 
 #[cfg(test)]
