@@ -159,6 +159,26 @@ pub enum Commands {
         #[command(flatten)]
         output: OutputOpts,
     },
+    /// Show token usage for a session or across all sessions
+    Usage {
+        /// Session ID. If omitted, shows aggregated usage across all sessions.
+        session: Option<String>,
+
+        /// Filter by session type (claudecode or opencode)
+        #[arg(short = 't', long = "type")]
+        session_type: Option<SessionType>,
+
+        /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
+        #[arg(long)]
+        timespan: Option<String>,
+
+        /// Filter by project path
+        #[arg(short, long)]
+        project: Option<String>,
+
+        #[command(flatten)]
+        output: OutputOpts,
+    },
     /// Rate agent instructions against test cases
     Rate {
         /// Path to agent instruction file (system prompt)

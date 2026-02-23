@@ -1311,4 +1311,94 @@ mod tests {
             "/home/user/src/main.rs"
         ));
     }
+
+    // === parse_opencode_tokens / parse_message_from_value tests ===
+
+    #[test]
+    fn test_parse_opencode_tokens_full() {
+        use serde_json::json;
+        let val = json!({"input": 100, "output": 50, "reasoning": 10, "cache": {"read": 200, "write": 300}});
+        let tokens = parse_opencode_tokens(&val);
+        assert_eq!(tokens.input, 100);
+        assert_eq!(tokens.output, 50);
+        assert_eq!(tokens.reasoning, 10);
+        assert_eq!(tokens.cache_read, 200);
+        assert_eq!(tokens.cache_write, 300);
+        assert_eq!(tokens.cache_creation, 0);
+    }
+
+    #[test]
+    fn test_parse_opencode_tokens_missing_cache() {
+        use serde_json::json;
+        let val = json!({"input": 100, "output": 50, "reasoning": 10});
+        let tokens = parse_opencode_tokens(&val);
+        assert_eq!(tokens.input, 100);
+        assert_eq!(tokens.output, 50);
+        assert_eq!(tokens.reasoning, 10);
+        assert_eq!(tokens.cache_read, 0);
+        assert_eq!(tokens.cache_write, 0);
+    }
+
+    #[test]
+    fn test_parse_opencode_tokens_missing_fields() {
+        use serde_json::json;
+        let val = json!({});
+        let tokens = parse_opencode_tokens(&val);
+        assert_eq!(tokens.input, 0);
+        assert_eq!(tokens.output, 0);
+        assert_eq!(tokens.reasoning, 0);
+        assert_eq!(tokens.cache_read, 0);
+        assert_eq!(tokens.cache_write, 0);
+        assert_eq!(tokens.cache_creation, 0);
+    }
+
+    #[test]
+    fn test_parse_message_from_value_assistant() {
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_assist_001",
+            "role": "assistant",
+            "time": {"created": 1705314600000_i64},
+            "modelID": "claude-3-opus",
+            "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache": {"read": 10, "write": 20}}
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        assert_eq!(msg.message_id, "msg_assist_001");
+        assert_eq!(msg.session_id, "ses_test");
+        assert_eq!(msg.provider, Provider::OpenCode);
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.model.as_deref(), Some("claude-3-opus"));
+        let tokens = msg.tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 100);
+        assert_eq!(tokens.output, 50);
+        assert_eq!(tokens.cache_read, 10);
+        assert_eq!(tokens.cache_write, 20);
+    }
+
+    #[test]
+    fn test_parse_message_from_value_user() {
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_user_001",
+            "role": "user",
+            "time": {"created": 1705314600000_i64},
+            "model": {"modelID": "claude-3-opus"}
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        assert_eq!(msg.message_id, "msg_user_001");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.model.as_deref(), Some("claude-3-opus"));
+        assert!(msg.tokens.is_none());
+    }
+
+    #[test]
+    fn test_parse_message_from_value_missing_id() {
+        use serde_json::json;
+        let data = json!({
+            "role": "assistant",
+            "time": {"created": 1705314600000_i64},
+            "modelID": "claude-3-opus"
+        });
+        assert!(parse_message_from_value(&data, "ses_test").is_none());
+    }
 }

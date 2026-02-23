@@ -6,6 +6,7 @@ mod list_sessions;
 mod permissions;
 mod rate;
 mod transcript;
+mod usage;
 
 use anyhow::Result;
 
@@ -133,6 +134,20 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             timeout,
             no_cache,
             judge_prompt.as_deref(),
+            quiet,
+        ),
+        Commands::Usage {
+            session,
+            session_type,
+            timespan,
+            project,
+            output,
+        } => usage::run(
+            session,
+            session_type,
+            timespan.as_deref(),
+            project.as_deref(),
+            output.format(),
             quiet,
         ),
     }

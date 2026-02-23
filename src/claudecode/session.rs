@@ -1307,4 +1307,109 @@ mod tests {
 
         assert!(file_edited_file(file.path(), "/home/user/src/main.rs"));
     }
+
+    // === parse_messages tests ===
+
+    #[test]
+    fn test_parse_messages_assistant_with_usage() {
+        let jsonl = r#"{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","requestId":"req-001","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":300}}}"#;
+        let messages = parse_messages(jsonl, "test-session").unwrap();
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.provider, Provider::ClaudeCode);
+        assert_eq!(msg.session_id, "test-session");
+        assert_eq!(msg.model.as_deref(), Some("claude-3-opus"));
+        assert_eq!(msg.message_id, "req-001");
+        let tokens = msg.tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 100);
+        assert_eq!(tokens.output, 50);
+        assert_eq!(tokens.cache_read, 200);
+        assert_eq!(tokens.cache_creation, 300);
+        assert_eq!(tokens.cache_write, 0);
+        assert_eq!(tokens.reasoning, 0);
+    }
+
+    #[test]
+    fn test_parse_messages_user_entry() {
+        let jsonl = r#"{"type":"user","timestamp":"2024-01-15T10:30:00.000Z","message":{"role":"user","content":"Hello"}}"#;
+        let messages = parse_messages(jsonl, "test-session").unwrap();
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.provider, Provider::ClaudeCode);
+        assert!(msg.tokens.is_none());
+        assert!(msg.model.is_none());
+    }
+
+    #[test]
+    fn test_parse_messages_deduplication_by_request_id() {
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","requestId":"req-dup","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:30:01.000Z","requestId":"req-dup","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":20,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:30:02.000Z","requestId":"req-dup","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":30,"output_tokens":15}}}"#,
+        ]
+        .join("\n");
+        let messages = parse_messages(&jsonl, "test-session").unwrap();
+        // Deduplication: only the last occurrence (final usage) is kept
+        assert_eq!(messages.len(), 1);
+        let tokens = messages[0].tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 30);
+        assert_eq!(tokens.output, 15);
+    }
+
+    #[test]
+    fn test_parse_messages_progress_subagent() {
+        let jsonl = r#"{"type":"progress","timestamp":"2024-01-15T10:30:00.000Z","data":{"message":{"requestId":"sub-req-001","message":{"role":"assistant","model":"claude-3-haiku","usage":{"input_tokens":500,"output_tokens":250,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}}}}"#;
+        let messages = parse_messages(jsonl, "test-session").unwrap();
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert!(msg.message_id.starts_with("sub-"));
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.model.as_deref(), Some("claude-3-haiku"));
+        let tokens = msg.tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 500);
+        assert_eq!(tokens.output, 250);
+        assert_eq!(tokens.cache_read, 100);
+        assert_eq!(tokens.cache_creation, 50);
+    }
+
+    #[test]
+    fn test_parse_messages_chronological_order() {
+        // JSONL lines in chronological file order — parse_messages preserves this order
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:30:00.000Z","requestId":"req-first","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"{"type":"user","timestamp":"2024-01-15T10:31:00.000Z","message":{"role":"user","content":"ok"}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:32:00.000Z","requestId":"req-third","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":3,"output_tokens":3}}}"#,
+        ]
+        .join("\n");
+        let messages = parse_messages(&jsonl, "test-session").unwrap();
+        assert_eq!(messages.len(), 3);
+        // Order preserved from JSONL file order (chronological)
+        assert_eq!(messages[0].message_id, "req-first");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].message_id, "req-third");
+        assert!(messages[0].timestamp < messages[1].timestamp);
+        assert!(messages[1].timestamp < messages[2].timestamp);
+    }
+
+    #[test]
+    fn test_parse_messages_ignores_other_types() {
+        let jsonl = [
+            r#"{"type":"summary","timestamp":"2024-01-15T10:30:00.000Z","summary":"test"}"#,
+            r#"{"type":"system","timestamp":"2024-01-15T10:30:01.000Z","data":"init"}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-15T10:30:02.000Z","requestId":"req-real","message":{"role":"assistant","model":"claude-3-opus","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ]
+        .join("\n");
+        let messages = parse_messages(&jsonl, "test-session").unwrap();
+        // Only the assistant entry should be present
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "req-real");
+    }
+
+    #[test]
+    fn test_parse_messages_empty_content() {
+        let messages = parse_messages("", "test-session").unwrap();
+        assert!(messages.is_empty());
+    }
 }
