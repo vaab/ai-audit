@@ -1,6 +1,7 @@
 //! CLI module - argument parsing and command dispatch.
 
 mod action;
+pub(crate) mod color;
 mod def;
 
 pub use def::{Args, Commands};
@@ -33,13 +34,9 @@ pub fn run() -> Result<()> {
     #[cfg(unix)]
     reset_sigpipe();
 
-    // Respect NO_COLOR environment variable
-    if std::env::var("NO_COLOR").is_ok() {
-        // Future: disable colors when color support is added
-        // colored::control::set_override(false);
-    }
-
     let args = Args::parse();
+    // Detect TTY before pager fork (pager turns stdout into a pipe).
+    color::init();
     setup_pager(args.command.output_format());
     action::dispatch(args.command, args.quiet, args.verbose)
 }

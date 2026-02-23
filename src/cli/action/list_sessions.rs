@@ -1,6 +1,7 @@
 //! List sessions command handler.
 
 use anyhow::Result;
+use colored::Colorize;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -217,9 +218,9 @@ pub fn run(
             for s in &sessions {
                 let dt = to_local(s.timestamp);
                 let ts = dt.format(ts_fmt).to_string();
-                let mut parts = vec![ts, s.session_id.clone()];
+                let mut parts = vec![ts.cyan().to_string(), s.session_id.yellow().to_string()];
                 if show_type {
-                    parts.push(s.session_type.to_string());
+                    parts.push(s.session_type.purple().to_string());
                 }
                 if show_dir {
                     // Replace $HOME prefix with ~
@@ -230,9 +231,9 @@ pub fn run(
                     } else {
                         s.project_dir.clone()
                     };
-                    parts.push(dir);
+                    parts.push(dir.blue().to_string());
                 }
-                parts.push(s.title.clone());
+                parts.push(s.title.white().bold().to_string());
                 println!("{}", parts.join(" "));
             }
         }
