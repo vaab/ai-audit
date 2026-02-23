@@ -16,6 +16,7 @@ regex = "1"
 anyhow = "1"
 dirs = "5"
 kal-time = "0.1"
+pager = "0.16"
 wait-timeout = "0.2"
 log = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }

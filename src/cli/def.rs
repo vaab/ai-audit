@@ -210,6 +210,28 @@ pub enum Commands {
     },
 }
 
+impl Commands {
+    /// Extract the output format from any command variant.
+    ///
+    /// Commands without output options (Activity, Rate) default to Human.
+    pub fn output_format(&self) -> OutputFormat {
+        match self {
+            Commands::Permissions { output, .. }
+            | Commands::ListSessions { output, .. }
+            | Commands::Transcript { output, .. }
+            | Commands::CurrentSession { output, .. }
+            | Commands::LastSession { output, .. }
+            | Commands::Usage { output, .. } => output.format(),
+            Commands::Activity { action } => match action {
+                ActivityAction::List { output, .. } | ActivityAction::Get { output, .. } => {
+                    output.format()
+                }
+            },
+            Commands::Rate { .. } => OutputFormat::Human,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ActivityAction {
     /// List available activity identifiers
