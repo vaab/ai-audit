@@ -334,9 +334,10 @@ pub(crate) fn session_matches_filters(
     session_id: &str,
     filters: &[crate::session_detect::SessionFilter],
     last_n: usize,
+    project_dir: &str,
 ) -> bool {
     // Try DB first (most reliable)
-    db::session_matches_filters_from_db(session_id, filters, last_n)
+    db::session_matches_filters_from_db(session_id, filters, last_n, project_dir)
 }
 
 /// Check if an OpenCode part JSON contains the needle in searchable fields.

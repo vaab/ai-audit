@@ -101,6 +101,22 @@ fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
+/// Split a string by ANSI escape codes, returning the text segments between them.
+fn ansi_segments(s: &str) -> Vec<&str> {
+    let re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
+    re.split(s).filter(|seg| !seg.is_empty()).collect()
+}
+
+/// Find the longest text segment between ANSI escape codes in a string.
+fn longest_ansi_segment(s: &str) -> Option<String> {
+    ansi_segments(s)
+        .into_iter()
+        .map(|seg| seg.trim())
+        .filter(|seg| !seg.is_empty())
+        .max_by_key(|seg| seg.len())
+        .map(|s| s.to_string())
+}
+
 /// Classify a raw TUI line based on ANSI color codes and content.
 fn classify_tui_line(raw_line: &str) -> TuiLineKind {
     let stripped = strip_ansi(raw_line);
@@ -141,8 +157,9 @@ fn classify_tui_line(raw_line: &str) -> TuiLineKind {
     }
 
     // AssistantText: light gray foreground WITHOUT background color
+    // Store the raw line so we can extract ANSI segments later.
     if raw_line.contains("38;2;242;244;248") && !raw_line.contains("48;2;") {
-        return TuiLineKind::AssistantText(trimmed.to_string());
+        return TuiLineKind::AssistantText(raw_line.to_string());
     }
 
     TuiLineKind::Other
@@ -170,10 +187,7 @@ fn parse_tool_line(stripped_text: &str) -> Option<ParsedToolCall> {
     let after_icon = after_icon.trim_start();
 
     // Extract tool name (first word, lowercased)
-    let tool_name = after_icon
-        .split_whitespace()
-        .next()?
-        .to_lowercase();
+    let tool_name = after_icon.split_whitespace().next()?.to_lowercase();
 
     let rest = after_icon[tool_name.len()..].trim_start();
 
@@ -219,6 +233,27 @@ fn parse_tool_line(stripped_text: &str) -> Option<ParsedToolCall> {
         }
     }
 
+    // Normalize tool names: the TUI renders some tools differently
+    // from how they appear in the database.
+    let (tool_name, fields) = if tool_name == "skill_mcp" {
+        // TUI: ⚙ skill_mcp [mcp_name=playwright, tool_name=browser_navigate]
+        // DB:  tool="skill", input={name: "playwright"}
+        let mapped_fields: Vec<(String, String)> = fields
+            .into_iter()
+            .filter_map(|(k, v)| {
+                if k == "mcp_name" {
+                    Some(("name".to_string(), v))
+                } else {
+                    // Drop tool_name and other sub-agent fields not in DB
+                    None
+                }
+            })
+            .collect();
+        ("skill".to_string(), mapped_fields)
+    } else {
+        (tool_name, fields)
+    };
+
     Some(ParsedToolCall { tool_name, fields })
 }
 
@@ -237,7 +272,10 @@ fn parse_pane_messages(content: &str) -> Vec<PaneMessage> {
     let classified: Vec<TuiLineKind> = lines.iter().map(|l| classify_tui_line(l)).collect();
 
     // Find last Footer
-    let footer_idx = match classified.iter().rposition(|k| matches!(k, TuiLineKind::Footer)) {
+    let footer_idx = match classified
+        .iter()
+        .rposition(|k| matches!(k, TuiLineKind::Footer))
+    {
         Some(idx) => idx,
         None => return Vec::new(),
     };
@@ -309,10 +347,7 @@ fn parse_pane_messages(content: &str) -> Vec<PaneMessage> {
         msg.depth = i;
     }
 
-    log::debug!(
-        "parse_pane_messages: found {} messages",
-        messages.len()
-    );
+    log::debug!("parse_pane_messages: found {} messages", messages.len());
     for (i, msg) in messages.iter().enumerate() {
         log::trace!(
             "  message[{}]: depth={}, text_lines={}, tool_calls={}",
@@ -362,14 +397,19 @@ fn build_filters(messages: &[PaneMessage]) -> Vec<SessionFilter> {
         let msg = &messages[idx];
         let mut criteria = Vec::new();
 
-        // Longest text line as TextContains
+        // Longest ANSI segment across all text lines as TextContains.
+        // Text lines contain raw ANSI — split by escape codes to get
+        // the actual text segments.  The biggest segment is the most
+        // distinctive needle and will match as a substring of the DB
+        // text even when the TUI rendered away markdown formatting.
         if let Some(longest) = msg
             .text_lines
             .iter()
-            .filter(|l| l.len() >= MIN_NEEDLE_LENGTH)
-            .max_by_key(|l| l.len())
+            .filter_map(|raw| longest_ansi_segment(raw))
+            .filter(|seg| seg.len() >= MIN_NEEDLE_LENGTH)
+            .max_by_key(|seg| seg.len())
         {
-            criteria.push(FilterCriterion::TextContains(longest.clone()));
+            criteria.push(FilterCriterion::TextContains(longest));
         }
 
         // Tool call fields as ToolFieldEquals
@@ -399,6 +439,26 @@ fn build_filters(messages: &[PaneMessage]) -> Vec<SessionFilter> {
             f.depth,
             f.criteria.len()
         );
+        for (j, c) in f.criteria.iter().enumerate() {
+            match c {
+                FilterCriterion::TextContains(needle) => {
+                    log::trace!("    criterion[{}]: TextContains({:?})", j, needle);
+                }
+                FilterCriterion::ToolFieldEquals {
+                    tool_name,
+                    field,
+                    value,
+                } => {
+                    log::trace!(
+                        "    criterion[{}]: ToolFieldEquals(tool={}, {}={:?})",
+                        j,
+                        tool_name,
+                        field,
+                        value
+                    );
+                }
+            }
+        }
     }
 
     filters
@@ -418,7 +478,9 @@ fn find_session_by_filters(
     }
 
     // Collect sessions from both providers
-    let mut all_sessions: Vec<(String, Provider, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    // Tuple: (session_id, provider, updated_at, project_dir)
+    let mut all_sessions: Vec<(String, Provider, chrono::DateTime<chrono::Utc>, String)> =
+        Vec::new();
 
     let include_opencode = provider_filter.is_none() || provider_filter == Some(Provider::OpenCode);
     let include_claudecode =
@@ -431,7 +493,12 @@ fn find_session_by_filters(
                 if s.parent_id.is_some() {
                     continue;
                 }
-                all_sessions.push((s.session_id, Provider::OpenCode, s.updated_at));
+                all_sessions.push((
+                    s.session_id,
+                    Provider::OpenCode,
+                    s.updated_at,
+                    s.project_dir,
+                ));
             }
         }
     }
@@ -439,7 +506,12 @@ fn find_session_by_filters(
     if include_claudecode {
         if let Ok(sessions) = crate::claudecode::session::list_sessions() {
             for s in sessions {
-                all_sessions.push((s.session_id, Provider::ClaudeCode, s.updated_at));
+                all_sessions.push((
+                    s.session_id,
+                    Provider::ClaudeCode,
+                    s.updated_at,
+                    String::new(),
+                ));
             }
         }
     }
@@ -456,43 +528,67 @@ fn find_session_by_filters(
     // Incremental margins: try tighter windows first
     let margins = [5usize, 10, 20];
 
-    for margin in &margins {
-        for (session_id, provider, _updated_at) in &all_sessions {
-            let all_match = filters.iter().all(|filter| {
-                let window = margin + filter.depth;
-                match provider {
-                    Provider::OpenCode => {
-                        crate::opencode::session_matches_filters(session_id, &[filter.clone()], window)
-                    }
-                    Provider::ClaudeCode => {
-                        // Fallback: use depth-0 TextContains only
-                        if filter.depth == 0 {
-                            for criterion in &filter.criteria {
-                                if let FilterCriterion::TextContains(needle) = criterion {
-                                    if crate::claudecode::session::session_tail_contains_text(
-                                        session_id, needle, window,
-                                    ) {
-                                        return true;
+    // Graceful degradation: try all filters, then drop the deepest ones.
+    // Scrollback may contain content from previous sessions (user switched
+    // via Ctrl+P), so older/deeper messages may belong to a different session.
+    // Require at least 2 filters to avoid false positives.
+    let mut filter_counts: Vec<usize> = Vec::new();
+    filter_counts.push(filters.len());
+    if filters.len() > 2 {
+        filter_counts.push(filters.len() - 1);
+    }
+
+    // Sort filters by depth ascending (shallowest = most recent first).
+    // When degrading, we drop the deepest (oldest) filters.
+    let mut sorted_filters: Vec<&SessionFilter> = filters.iter().collect();
+    sorted_filters.sort_by_key(|f| f.depth);
+
+    for &num_filters in &filter_counts {
+        let active_filters = &sorted_filters[..num_filters];
+
+        for margin in &margins {
+            for (session_id, provider, _updated_at, project_dir) in &all_sessions {
+                let all_match = active_filters.iter().all(|filter| {
+                    let window = margin + filter.depth;
+                    match provider {
+                        Provider::OpenCode => crate::opencode::session_matches_filters(
+                            session_id,
+                            &[(*filter).clone()],
+                            window,
+                            project_dir,
+                        ),
+                        Provider::ClaudeCode => {
+                            // Fallback: use depth-0 TextContains only
+                            if filter.depth == 0 {
+                                for criterion in &filter.criteria {
+                                    if let FilterCriterion::TextContains(needle) = criterion {
+                                        if crate::claudecode::session::session_tail_contains_text(
+                                            session_id, needle, window,
+                                        ) {
+                                            return true;
+                                        }
                                     }
                                 }
                             }
+                            false
                         }
-                        false
                     }
-                }
-            });
-
-            if all_match {
-                log::debug!(
-                    "find_session_by_filters: matched {} ({:?}) at margin {}",
-                    session_id,
-                    provider,
-                    margin
-                );
-                return Some(DetectedSession {
-                    session_id: session_id.clone(),
-                    provider: *provider,
                 });
+
+                if all_match {
+                    log::debug!(
+                        "find_session_by_filters: matched {} ({:?}) at margin {} with {}/{} filters",
+                        session_id,
+                        provider,
+                        margin,
+                        num_filters,
+                        filters.len()
+                    );
+                    return Some(DetectedSession {
+                        session_id: session_id.clone(),
+                        provider: *provider,
+                    });
+                }
             }
         }
     }
@@ -675,6 +771,7 @@ fn capture_pane_scrollback(pane_id: &str) -> Option<String> {
         .args([
             "capture-pane",
             "-p",
+            "-e",
             "-S",
             &format!("-{}", LAST_SESSION_SCROLLBACK_LINES),
             "-t",
@@ -770,10 +867,7 @@ mod tests {
     fn test_strip_ansi() {
         assert_eq!(strip_ansi("hello"), "hello");
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
-        assert_eq!(
-            strip_ansi("\x1b[38;2;242;244;248mtext\x1b[0m"),
-            "text"
-        );
+        assert_eq!(strip_ansi("\x1b[38;2;242;244;248mtext\x1b[0m"), "text");
         assert_eq!(strip_ansi(""), "");
         assert_eq!(
             strip_ansi("\x1b[1m\x1b[38;2;125;132;143m→ Read\x1b[0m"),
@@ -788,7 +882,9 @@ mod tests {
         let raw = "\x1b[38;2;242;244;248mThis is assistant text output\x1b[0m";
         match classify_tui_line(raw) {
             TuiLineKind::AssistantText(text) => {
-                assert_eq!(text, "This is assistant text output");
+                // Stores raw ANSI for segment extraction
+                assert!(text.contains("\x1b["));
+                assert!(text.contains("This is assistant text output"));
             }
             other => panic!("expected AssistantText, got {:?}", other),
         }
@@ -852,8 +948,12 @@ mod tests {
         assert!(result.is_some());
         let tc = result.unwrap();
         assert_eq!(tc.tool_name, "read");
-        assert!(tc.fields.contains(&("filePath".to_string(), "src/foo.rs".to_string())));
-        assert!(tc.fields.contains(&("offset".to_string(), "100".to_string())));
+        assert!(tc
+            .fields
+            .contains(&("filePath".to_string(), "src/foo.rs".to_string())));
+        assert!(tc
+            .fields
+            .contains(&("offset".to_string(), "100".to_string())));
         assert!(tc.fields.contains(&("limit".to_string(), "50".to_string())));
     }
 
@@ -863,8 +963,12 @@ mod tests {
         assert!(result.is_some());
         let tc = result.unwrap();
         assert_eq!(tc.tool_name, "grep");
-        assert!(tc.fields.contains(&("pattern".to_string(), "pattern".to_string())));
-        assert!(tc.fields.contains(&("path".to_string(), "src/".to_string())));
+        assert!(tc
+            .fields
+            .contains(&("pattern".to_string(), "pattern".to_string())));
+        assert!(tc
+            .fields
+            .contains(&("path".to_string(), "src/".to_string())));
     }
 
     #[test]
@@ -873,7 +977,9 @@ mod tests {
         assert!(result.is_some());
         let tc = result.unwrap();
         assert_eq!(tc.tool_name, "edit");
-        assert!(tc.fields.contains(&("filePath".to_string(), "src/foo.rs".to_string())));
+        assert!(tc
+            .fields
+            .contains(&("filePath".to_string(), "src/foo.rs".to_string())));
     }
 
     #[test]
@@ -882,7 +988,9 @@ mod tests {
         assert!(result.is_some());
         let tc = result.unwrap();
         assert_eq!(tc.tool_name, "background_output");
-        assert!(tc.fields.contains(&("task_id".to_string(), "bg_xxx".to_string())));
+        assert!(tc
+            .fields
+            .contains(&("task_id".to_string(), "bg_xxx".to_string())));
     }
 
     // === parse_pane_messages tests ===
@@ -903,18 +1011,16 @@ mod tests {
         let messages = parse_pane_messages(&content);
         assert_eq!(messages.len(), 1, "should find 1 message");
         assert_eq!(messages[0].depth, 0);
+        assert!(!messages[0].text_lines.is_empty(), "should have text lines");
+        // text_lines contain raw ANSI; extract segments to check content
+        let seg = longest_ansi_segment(&messages[0].text_lines[0]);
         assert!(
-            !messages[0].text_lines.is_empty(),
-            "should have text lines"
+            seg.as_deref()
+                .is_some_and(|s| s.contains("refactor the authentication")),
+            "longest segment should contain assistant message, got {:?}",
+            seg
         );
-        assert!(
-            messages[0].text_lines[0].contains("refactor the authentication"),
-            "text should contain assistant message"
-        );
-        assert!(
-            !messages[0].tool_calls.is_empty(),
-            "should have tool calls"
-        );
+        assert!(!messages[0].tool_calls.is_empty(), "should have tool calls");
         assert_eq!(messages[0].tool_calls[0].tool_name, "read");
     }
 
@@ -954,11 +1060,12 @@ mod tests {
 
     #[test]
     fn test_build_filters_from_messages() {
+        // text_lines must contain raw ANSI so longest_ansi_segment works
         let messages = vec![
             PaneMessage {
                 text_lines: vec![
-                    "Short line".to_string(),
-                    "This is a long enough assistant text line for filtering purposes".to_string(),
+                    "\x1b[38;2;242;244;248mShort line\x1b[0m".to_string(),
+                    "\x1b[38;2;242;244;248mThis is a long enough assistant text line for filtering purposes\x1b[0m".to_string(),
                 ],
                 tool_calls: vec![ParsedToolCall {
                     tool_name: "read".to_string(),
@@ -967,7 +1074,9 @@ mod tests {
                 depth: 0,
             },
             PaneMessage {
-                text_lines: vec!["Another message without tools but long enough text here".to_string()],
+                text_lines: vec![
+                    "\x1b[38;2;242;244;248mAnother message without tools but long enough text here\x1b[0m".to_string()
+                ],
                 tool_calls: vec![],
                 depth: 1,
             },
@@ -980,11 +1089,15 @@ mod tests {
         let f0 = &filters[0];
         assert_eq!(f0.depth, 0);
         assert!(
-            f0.criteria.iter().any(|c| matches!(c, FilterCriterion::TextContains(_))),
+            f0.criteria
+                .iter()
+                .any(|c| matches!(c, FilterCriterion::TextContains(_))),
             "should have TextContains criterion"
         );
         assert!(
-            f0.criteria.iter().any(|c| matches!(c, FilterCriterion::ToolFieldEquals { .. })),
+            f0.criteria
+                .iter()
+                .any(|c| matches!(c, FilterCriterion::ToolFieldEquals { .. })),
             "should have ToolFieldEquals criterion"
         );
     }

@@ -217,12 +217,13 @@ pub(crate) fn session_matches_filters_from_db(
     session_id: &str,
     filters: &[crate::session_detect::SessionFilter],
     last_n: usize,
+    project_dir: &str,
 ) -> bool {
     let conn = match open_db() {
         Ok(c) => c,
         Err(_) => return false,
     };
-    session_matches_filters_from_conn(&conn, session_id, filters, last_n)
+    session_matches_filters_from_conn(&conn, session_id, filters, last_n, project_dir)
 }
 
 /// Testable version using an existing connection.
@@ -231,6 +232,7 @@ pub(crate) fn session_matches_filters_from_conn(
     session_id: &str,
     filters: &[crate::session_detect::SessionFilter],
     last_n: usize,
+    project_dir: &str,
 ) -> bool {
     // Get the last `last_n` message IDs
     let mut stmt = match conn
@@ -252,29 +254,53 @@ pub(crate) fn session_matches_filters_from_conn(
         return false;
     }
 
-    // For each filter, check if ANY message in the window satisfies ALL criteria
-    for filter in filters {
-        let mut filter_matched = false;
-        for msg_id in &msg_ids {
-            let parts = match get_parts_for_message(conn, msg_id) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if message_parts_match_criteria(&parts, &filter.criteria) {
-                filter_matched = true;
-                break;
-            }
+    // Collect ALL parts from ALL messages in the window.
+    // OpenCode spreads a single assistant turn across multiple DB messages
+    // (one for text, one per tool call, etc.), so criteria from one TUI
+    // "message" may land in different DB messages.  We match criteria
+    // against the combined pool instead of per-message.
+    let mut all_parts: Vec<serde_json::Value> = Vec::new();
+    for msg_id in &msg_ids {
+        if let Ok(parts) = get_parts_for_message(conn, msg_id) {
+            all_parts.extend(parts);
         }
-        if !filter_matched {
+    }
+
+    for filter in filters {
+        if !message_parts_match_criteria(&all_parts, &filter.criteria, project_dir) {
             return false;
         }
     }
     true
 }
 
+/// Resolve a relative path against a base directory (lexical, no filesystem).
+fn resolve_path(rel: &str, base: &str) -> String {
+    use std::path::{Component, Path};
+
+    let p = Path::new(rel);
+    if p.is_absolute() || base.is_empty() {
+        return rel.to_string();
+    }
+    let joined = Path::new(base).join(p);
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in joined.components() {
+        match comp {
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::CurDir => {}
+            other => parts.push(other.as_os_str()),
+        }
+    }
+    let resolved: std::path::PathBuf = parts.iter().collect();
+    resolved.to_string_lossy().to_string()
+}
+
 fn message_parts_match_criteria(
     parts: &[serde_json::Value],
     criteria: &[crate::session_detect::FilterCriterion],
+    project_dir: &str,
 ) -> bool {
     // ALL criteria must be satisfied by parts of THIS message
     for criterion in criteria {
@@ -292,19 +318,37 @@ fn message_parts_match_criteria(
                 tool_name,
                 field,
                 value,
-            } => parts.iter().any(|part| {
-                part.get("type").and_then(|t| t.as_str()) == Some("tool")
-                    && part
-                        .get("tool")
-                        .and_then(|t| t.as_str())
-                        .is_some_and(|t| t == tool_name)
-                    && part
-                        .get("state")
-                        .and_then(|s| s.get("input"))
-                        .and_then(|i| i.get(field.as_str()))
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|v| v == value)
-            }),
+            } => {
+                // For path-like fields, resolve relative paths against
+                // the candidate session's project directory before comparing.
+                let resolved = if (field == "filePath" || field == "path")
+                    && !value.is_empty()
+                    && !std::path::Path::new(value.as_str()).is_absolute()
+                {
+                    resolve_path(value, project_dir)
+                } else {
+                    value.clone()
+                };
+                parts.iter().any(|part| {
+                    part.get("type").and_then(|t| t.as_str()) == Some("tool")
+                        && part
+                            .get("tool")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| t == tool_name)
+                        && part
+                            .get("state")
+                            .and_then(|s| s.get("input"))
+                            .and_then(|i| i.get(field.as_str()))
+                            .is_some_and(|v| {
+                                // Handle both string and numeric JSON values
+                                if let Some(s) = v.as_str() {
+                                    s == resolved
+                                } else {
+                                    v.to_string() == resolved
+                                }
+                            })
+                })
+            }
         };
         if !matched {
             return false;
@@ -1048,7 +1092,7 @@ mod tests {
         }];
 
         assert!(session_matches_filters_from_conn(
-            &conn, "ses_001", &filters, 5
+            &conn, "ses_001", &filters, 5, "/proj"
         ));
 
         // Non-matching text
@@ -1062,7 +1106,8 @@ mod tests {
             &conn,
             "ses_001",
             &filters_bad,
-            5
+            5,
+            "/proj"
         ));
     }
 
@@ -1098,7 +1143,7 @@ mod tests {
         }];
 
         assert!(session_matches_filters_from_conn(
-            &conn, "ses_001", &filters, 5
+            &conn, "ses_001", &filters, 5, "/proj"
         ));
 
         // Wrong tool name
@@ -1114,7 +1159,8 @@ mod tests {
             &conn,
             "ses_001",
             &filters_bad,
-            5
+            5,
+            "/proj"
         ));
     }
 
@@ -1145,10 +1191,11 @@ mod tests {
             "msg_001",
             "ses_001",
             1705314600100,
-            r#"{"type":"tool","tool":"read","state":{"input":{"filePath":"src/main.rs"},"output":"fn main(){}"}}"#,
+            r#"{"type":"tool","tool":"read","state":{"input":{"filePath":"/proj/src/main.rs"},"output":"fn main(){}"}}"#,
         );
 
-        // Both criteria must match in the same message
+        // Both criteria must match in the same message.
+        // The filter value is relative — it gets resolved against project_dir "/proj".
         let filters = vec![crate::session_detect::SessionFilter {
             depth: 0,
             criteria: vec![
@@ -1162,7 +1209,7 @@ mod tests {
         }];
 
         assert!(session_matches_filters_from_conn(
-            &conn, "ses_001", &filters, 5
+            &conn, "ses_001", &filters, 5, "/proj"
         ));
     }
 
@@ -1179,7 +1226,8 @@ mod tests {
             &conn,
             "ses_missing",
             &filters,
-            5
+            5,
+            ""
         ));
     }
 
@@ -1225,12 +1273,12 @@ mod tests {
 
         // Window of 1 should NOT find old message (only msg_003 is in window)
         assert!(!session_matches_filters_from_conn(
-            &conn, "ses_001", &filters, 1
+            &conn, "ses_001", &filters, 1, "/proj"
         ));
 
         // Window of 3 SHOULD find it
         assert!(session_matches_filters_from_conn(
-            &conn, "ses_001", &filters, 3
+            &conn, "ses_001", &filters, 3, "/proj"
         ));
     }
 }
