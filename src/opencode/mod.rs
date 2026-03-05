@@ -325,6 +325,20 @@ pub fn session_tail_contains_text(session_id: &str, needle: &str, last_n: usize)
     db::session_tail_contains_text_from_db(session_id, needle, last_n)
 }
 
+/// Check if a session's recent messages match the given structured filters.
+///
+/// Each filter specifies a depth (position from end) and criteria.
+/// For each filter, searches the last `last_n` messages. A filter matches
+/// if ANY single message within the search window satisfies ALL its criteria.
+pub(crate) fn session_matches_filters(
+    session_id: &str,
+    filters: &[crate::session_detect::SessionFilter],
+    last_n: usize,
+) -> bool {
+    // Try DB first (most reliable)
+    db::session_matches_filters_from_db(session_id, filters, last_n)
+}
+
 /// Check if an OpenCode part JSON contains the needle in searchable fields.
 ///
 /// Searches:

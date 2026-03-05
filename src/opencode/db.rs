@@ -212,6 +212,107 @@ pub fn session_tail_contains_text_from_conn(
     false
 }
 
+/// Check if a session's recent messages match structured filters.
+pub(crate) fn session_matches_filters_from_db(
+    session_id: &str,
+    filters: &[crate::session_detect::SessionFilter],
+    last_n: usize,
+) -> bool {
+    let conn = match open_db() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    session_matches_filters_from_conn(&conn, session_id, filters, last_n)
+}
+
+/// Testable version using an existing connection.
+pub(crate) fn session_matches_filters_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    filters: &[crate::session_detect::SessionFilter],
+    last_n: usize,
+) -> bool {
+    // Get the last `last_n` message IDs
+    let mut stmt = match conn
+        .prepare("SELECT id FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT ?")
+    {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let msg_ids: Vec<String> = match stmt
+        .query_map(rusqlite::params![session_id, last_n as i64], |row| {
+            row.get(0)
+        }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => return false,
+    };
+
+    if msg_ids.is_empty() {
+        return false;
+    }
+
+    // For each filter, check if ANY message in the window satisfies ALL criteria
+    for filter in filters {
+        let mut filter_matched = false;
+        for msg_id in &msg_ids {
+            let parts = match get_parts_for_message(conn, msg_id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if message_parts_match_criteria(&parts, &filter.criteria) {
+                filter_matched = true;
+                break;
+            }
+        }
+        if !filter_matched {
+            return false;
+        }
+    }
+    true
+}
+
+fn message_parts_match_criteria(
+    parts: &[serde_json::Value],
+    criteria: &[crate::session_detect::FilterCriterion],
+) -> bool {
+    // ALL criteria must be satisfied by parts of THIS message
+    for criterion in criteria {
+        let matched = match criterion {
+            crate::session_detect::FilterCriterion::TextContains(needle) => {
+                parts.iter().any(|part| {
+                    part.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && part
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| t.contains(needle.as_str()))
+                })
+            }
+            crate::session_detect::FilterCriterion::ToolFieldEquals {
+                tool_name,
+                field,
+                value,
+            } => parts.iter().any(|part| {
+                part.get("type").and_then(|t| t.as_str()) == Some("tool")
+                    && part
+                        .get("tool")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t == tool_name)
+                    && part
+                        .get("state")
+                        .and_then(|s| s.get("input"))
+                        .and_then(|i| i.get(field.as_str()))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|v| v == value)
+            }),
+        };
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
 /// Check if any part in a session contains a write/edit tool targeting the given file path.
 ///
 /// Queries all parts for the session, parses their `data` JSON, and applies
@@ -912,6 +1013,224 @@ mod tests {
             &conn,
             "ses_missing",
             "/home/user/src/main.rs"
+        ));
+    }
+
+    // === session_matches_filters tests ===
+
+    #[test]
+    fn test_session_matches_filters_text_contains() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"Hello world, this is a test message"}"#,
+        );
+
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::TextContains(
+                "this is a test".to_string(),
+            )],
+        }];
+
+        assert!(session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 5
+        ));
+
+        // Non-matching text
+        let filters_bad = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::TextContains(
+                "nonexistent text".to_string(),
+            )],
+        }];
+        assert!(!session_matches_filters_from_conn(
+            &conn,
+            "ses_001",
+            &filters_bad,
+            5
+        ));
+    }
+
+    #[test]
+    fn test_session_matches_filters_tool_field_equals() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"grep","state":{"input":{"pattern":"foo","path":"src/"},"output":"found"}}"#,
+        );
+
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::ToolFieldEquals {
+                tool_name: "grep".to_string(),
+                field: "pattern".to_string(),
+                value: "foo".to_string(),
+            }],
+        }];
+
+        assert!(session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 5
+        ));
+
+        // Wrong tool name
+        let filters_bad = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::ToolFieldEquals {
+                tool_name: "read".to_string(),
+                field: "pattern".to_string(),
+                value: "foo".to_string(),
+            }],
+        }];
+        assert!(!session_matches_filters_from_conn(
+            &conn,
+            "ses_001",
+            &filters_bad,
+            5
+        ));
+    }
+
+    #[test]
+    fn test_session_matches_filters_combined_criteria() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"Implementing the new feature"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_002",
+            "msg_001",
+            "ses_001",
+            1705314600100,
+            r#"{"type":"tool","tool":"read","state":{"input":{"filePath":"src/main.rs"},"output":"fn main(){}"}}"#,
+        );
+
+        // Both criteria must match in the same message
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![
+                crate::session_detect::FilterCriterion::TextContains("new feature".to_string()),
+                crate::session_detect::FilterCriterion::ToolFieldEquals {
+                    tool_name: "read".to_string(),
+                    field: "filePath".to_string(),
+                    value: "src/main.rs".to_string(),
+                },
+            ],
+        }];
+
+        assert!(session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 5
+        ));
+    }
+
+    #[test]
+    fn test_session_matches_filters_empty_session() {
+        let conn = setup_test_db();
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::TextContains(
+                "anything".to_string(),
+            )],
+        }];
+        assert!(!session_matches_filters_from_conn(
+            &conn,
+            "ses_missing",
+            &filters,
+            5
+        ));
+    }
+
+    #[test]
+    fn test_session_matches_filters_window_limit() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "user", 1705314600000);
+        insert_message(&conn, "msg_002", "ses_001", "assistant", 1705314601000);
+        insert_message(&conn, "msg_003", "ses_001", "user", 1705314602000);
+
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"text","text":"old message content"}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_003",
+            "msg_003",
+            "ses_001",
+            1705314602000,
+            r#"{"type":"text","text":"latest message content"}"#,
+        );
+
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::TextContains(
+                "old message".to_string(),
+            )],
+        }];
+
+        // Window of 1 should NOT find old message (only msg_003 is in window)
+        assert!(!session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 1
+        ));
+
+        // Window of 3 SHOULD find it
+        assert!(session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 3
         ));
     }
 }
