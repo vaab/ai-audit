@@ -18,9 +18,10 @@ fn resolve_session(explicit: Option<String>) -> Result<String> {
         Some(id) => Ok(id),
         None => {
             let detected = crate::session_detect::detect_current_session()?;
-            eprintln!(
+            log::info!(
                 "Auto-detected session: {} ({:?})",
-                detected.session_id, detected.provider
+                detected.session_id,
+                detected.provider
             );
             Ok(detected.session_id)
         }

@@ -167,7 +167,7 @@ fn run_aggregated(
     timespan: Option<&str>,
     project: Option<&str>,
     format: OutputFormat,
-    quiet: bool,
+    _quiet: bool,
 ) -> Result<()> {
     let ts_filter = match timespan {
         Some(ts_str) => {
@@ -242,12 +242,7 @@ fn run_aggregated(
                             });
                         }
                         Err(e) => {
-                            if !quiet {
-                                eprintln!(
-                                    "Warning: failed to read messages for {}: {}",
-                                    s.session_id, e
-                                );
-                            }
+                            log::warn!("Failed to read messages for {}: {}", s.session_id, e);
                         }
                     }
                 }
@@ -332,10 +327,8 @@ fn run_aggregated(
         }
     }
 
-    if !errors.is_empty() && !quiet {
-        for e in &errors {
-            eprintln!("Warning: failed to list sessions from {}", e);
-        }
+    for e in &errors {
+        log::warn!("Failed to list sessions from {}", e);
     }
 
     if usage_records.is_empty() && !errors.is_empty() {

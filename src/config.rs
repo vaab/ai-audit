@@ -75,7 +75,7 @@ impl Config {
                         });
                     }
                     Err(e) => {
-                        eprintln!("Warning: Invalid regex pattern '{}': {}", pattern, e);
+                        log::warn!("Invalid regex pattern '{}': {}", pattern, e);
                     }
                 }
             }

@@ -29,12 +29,40 @@ fn setup_pager(format: OutputFormat) {
     }
 }
 
+/// Set up logging with level derived from `-q`/`-v` flags.
+///
+/// Level mapping: `-q` → Error, default → Warn, `-v` → Info,
+/// `-vv` → Debug, `-vvv` → Trace.  The `RUST_LOG` env var
+/// overrides if set.
+fn setup_logging(verbose: u8, quiet: bool) {
+    use env_logger::Builder;
+    use log::LevelFilter;
+
+    let level = if quiet {
+        LevelFilter::Error
+    } else {
+        match verbose {
+            0 => LevelFilter::Warn,
+            1 => LevelFilter::Info,
+            2 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        }
+    };
+
+    Builder::new()
+        .filter_level(level)
+        .parse_default_env()
+        .format_timestamp(None)
+        .init();
+}
+
 /// CLI entry point.
 pub fn run() -> Result<()> {
     #[cfg(unix)]
     reset_sigpipe();
 
     let args = Args::parse();
+    setup_logging(args.verbose, args.quiet);
     // Detect TTY before pager fork (pager turns stdout into a pipe).
     color::init();
     setup_pager(args.command.output_format());

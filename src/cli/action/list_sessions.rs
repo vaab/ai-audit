@@ -46,7 +46,7 @@ pub fn run(
     file: Option<&str>,
     all: bool,
     format: OutputFormat,
-    quiet: bool,
+    _quiet: bool,
 ) -> Result<()> {
     let ts_filter = match timespan {
         Some(ts_str) => {
@@ -239,11 +239,8 @@ pub fn run(
         }
     }
 
-    // Report errors to stderr (unless quiet)
-    if !errors.is_empty() && !quiet {
-        for e in &errors {
-            eprintln!("Warning: failed to list sessions from {}", e);
-        }
+    for e in &errors {
+        log::warn!("Failed to list sessions from {}", e);
     }
 
     // Return error if ALL providers failed

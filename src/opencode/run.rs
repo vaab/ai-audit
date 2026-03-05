@@ -317,19 +317,15 @@ where
     let stdout_handle = child.stdout.take().expect("stdout should be piped");
     let reader = std::io::BufReader::new(stdout_handle);
 
-    // Capture stderr in a separate thread to extract agent name (and print if verbose)
+    // Capture stderr in a separate thread to extract agent name (and log at debug level)
     let stderr_handle = child.stderr.take().expect("stderr should be piped");
-    let verbose = options.verbose;
     let stderr_thread = std::thread::spawn(move || {
         let stderr_reader = std::io::BufReader::new(stderr_handle);
         let mut agent_name: Option<String> = None;
         use std::io::BufRead;
         for line in stderr_reader.lines() {
             if let Ok(line) = line {
-                // Print to stderr if verbose
-                if verbose {
-                    eprintln!("{}", line);
-                }
+                log::debug!("{}", line);
                 // Parse agent from log lines like: service=llm ... agent=sisyphus mode=primary
                 if line.contains("service=llm") && line.contains("mode=primary") {
                     if let Some(agent_start) = line.find("agent=") {
