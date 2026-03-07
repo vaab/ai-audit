@@ -254,6 +254,13 @@ pub(crate) fn session_matches_filters_from_conn(
         return false;
     }
 
+    log::trace!(
+        "session_matches_filters: session={}, window={}, msg_ids={:?}",
+        session_id,
+        last_n,
+        msg_ids
+    );
+
     // Collect ALL parts from ALL messages in the window.
     // OpenCode spreads a single assistant turn across multiple DB messages
     // (one for text, one per tool call, etc.), so criteria from one TUI
@@ -266,8 +273,23 @@ pub(crate) fn session_matches_filters_from_conn(
         }
     }
 
-    for filter in filters {
-        if !message_parts_match_criteria(&all_parts, &filter.criteria, project_dir) {
+    log::trace!(
+        "session_matches_filters: session={}, total_parts={}",
+        session_id,
+        all_parts.len()
+    );
+
+    for (i, filter) in filters.iter().enumerate() {
+        let matched =
+            message_parts_match_criteria(&all_parts, &filter.criteria, project_dir, session_id);
+        log::trace!(
+            "session_matches_filters: session={}, filter[{}] depth={} => {}",
+            session_id,
+            i,
+            filter.depth,
+            if matched { "MATCH" } else { "NO MATCH" }
+        );
+        if !matched {
             return false;
         }
     }
@@ -301,18 +323,35 @@ fn message_parts_match_criteria(
     parts: &[serde_json::Value],
     criteria: &[crate::session_detect::FilterCriterion],
     project_dir: &str,
+    session_id: &str,
 ) -> bool {
     // ALL criteria must be satisfied by parts of THIS message
-    for criterion in criteria {
+    for (ci, criterion) in criteria.iter().enumerate() {
         let matched = match criterion {
             crate::session_detect::FilterCriterion::TextContains(needle) => {
-                parts.iter().any(|part| {
-                    part.get("type").and_then(|t| t.as_str()) == Some("text")
-                        && part
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(|t| t.contains(needle.as_str()))
-                })
+                let text_parts: Vec<_> = parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .collect();
+                log::trace!(
+                    "  criterion[{}] TextContains({:?}): {} text parts in pool (session={})",
+                    ci,
+                    needle,
+                    text_parts.len(),
+                    session_id
+                );
+                let found = text_parts.iter().any(|part| {
+                    let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let hit = text.contains(needle.as_str());
+                    if hit {
+                        log::trace!("    MATCH in text part (len={})", text.len());
+                    }
+                    hit
+                });
+                if !found {
+                    log::trace!("    no text part contains the needle");
+                }
+                found
             }
             crate::session_detect::FilterCriterion::ToolFieldEquals {
                 tool_name,
@@ -325,29 +364,82 @@ fn message_parts_match_criteria(
                     && !value.is_empty()
                     && !std::path::Path::new(value.as_str()).is_absolute()
                 {
-                    resolve_path(value, project_dir)
+                    let r = resolve_path(value, project_dir);
+                    log::trace!(
+                        "  criterion[{}] ToolFieldEquals: resolved {:?} against {:?} => {:?}",
+                        ci,
+                        value,
+                        project_dir,
+                        r
+                    );
+                    r
                 } else {
                     value.clone()
                 };
-                parts.iter().any(|part| {
-                    part.get("type").and_then(|t| t.as_str()) == Some("tool")
-                        && part
-                            .get("tool")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(|t| t == tool_name)
-                        && part
-                            .get("state")
-                            .and_then(|s| s.get("input"))
-                            .and_then(|i| i.get(field.as_str()))
-                            .is_some_and(|v| {
-                                // Handle both string and numeric JSON values
-                                if let Some(s) = v.as_str() {
-                                    s == resolved
-                                } else {
-                                    v.to_string() == resolved
-                                }
-                            })
-                })
+
+                let tool_parts: Vec<_> = parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool"))
+                    .collect();
+                log::trace!(
+                    "  criterion[{}] ToolFieldEquals(tool={}, {}={:?}): {} tool parts (session={})",
+                    ci,
+                    tool_name,
+                    field,
+                    resolved,
+                    tool_parts.len(),
+                    session_id
+                );
+
+                let found = tool_parts.iter().any(|part| {
+                    let part_tool = part.get("tool").and_then(|t| t.as_str()).unwrap_or("");
+                    let tool_match = part_tool == tool_name;
+
+                    if !tool_match {
+                        return false;
+                    }
+
+                    let field_val = part
+                        .get("state")
+                        .and_then(|s| s.get("input"))
+                        .and_then(|i| i.get(field.as_str()));
+
+                    let field_match = field_val.is_some_and(|v| {
+                        if let Some(s) = v.as_str() {
+                            s == resolved
+                        } else {
+                            v.to_string() == resolved
+                        }
+                    });
+
+                    log::trace!(
+                        "    tool={:?} tool_match={}, field {:?}={:?} vs expected {:?} => {}",
+                        part_tool,
+                        tool_match,
+                        field,
+                        field_val
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "MISSING".into()),
+                        resolved,
+                        if field_match { "MATCH" } else { "NO MATCH" }
+                    );
+
+                    field_match
+                });
+
+                if !found && log::log_enabled!(log::Level::Trace) {
+                    let tool_names: Vec<&str> = tool_parts
+                        .iter()
+                        .filter_map(|p| p.get("tool").and_then(|t| t.as_str()))
+                        .collect();
+                    log::trace!(
+                        "    NO MATCH for session {}: tool names in pool: {:?}",
+                        session_id,
+                        tool_names
+                    );
+                }
+
+                found
             }
         };
         if !matched {
@@ -449,12 +541,35 @@ pub fn get_parts_for_message(
     })?;
 
     let mut parts = Vec::new();
+    let mut raw_count = 0u32;
+    let mut parse_failures = 0u32;
     for row in rows {
+        raw_count += 1;
         let data_str = row?;
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str) {
-            parts.push(val);
+        match serde_json::from_str::<serde_json::Value>(&data_str) {
+            Ok(val) => parts.push(val),
+            Err(e) => {
+                parse_failures += 1;
+                log::warn!(
+                    "get_parts_for_message: failed to parse part JSON for message {}: {}",
+                    message_id,
+                    e
+                );
+                log::trace!(
+                    "get_parts_for_message: raw data (first 200 chars): {:?}",
+                    &data_str[..data_str.len().min(200)]
+                );
+            }
         }
     }
+
+    log::trace!(
+        "get_parts_for_message: message={}, raw_rows={}, parsed={}, failures={}",
+        message_id,
+        raw_count,
+        parts.len(),
+        parse_failures
+    );
 
     Ok(parts)
 }
