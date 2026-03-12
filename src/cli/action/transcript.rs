@@ -94,6 +94,7 @@ fn format_human_label(entry: &TranscriptEntry) -> String {
         (Role::Assistant, EntryType::ToolUse) => "[assistant/tool_use]".to_string(),
         (Role::Assistant, EntryType::Thinking) => "[assistant/thinking]".to_string(),
         (_, EntryType::ToolResult) => "[tool_result]".to_string(),
+        (_, EntryType::Error) => "[error]".to_string(),
         (role, entry_type) => format!("[{}/{}]", role.as_str(), entry_type.as_str()),
     }
 }

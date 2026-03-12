@@ -72,6 +72,20 @@ pub fn parse_transcript_from_conn(
             .single()
             .unwrap_or_else(Utc::now);
 
+        // Check for message-level error (e.g. API validation errors)
+        if let Some(error) = data.get("error") {
+            if let Some(msg) = extract_error_message(error) {
+                entries.push(TranscriptEntry {
+                    timestamp: msg_timestamp,
+                    role: role.clone(),
+                    entry_type: EntryType::Error,
+                    content: msg,
+                    tool_name: None,
+                    tool_input: None,
+                });
+            }
+        }
+
         let parts = super::db::get_parts_for_message(conn, msg_id)?;
 
         for part in &parts {
@@ -81,6 +95,20 @@ pub fn parse_transcript_from_conn(
 
     entries.sort_by_key(|e| e.timestamp);
     Ok(entries)
+}
+
+/// Extract an error message from a message-level `"error"` field.
+///
+/// OpenCode stores API errors (e.g. image too large, rate limits) on the
+/// message itself, not in parts. Structure: `error.data.message` with
+/// fallback to `error.name`.
+fn extract_error_message(error: &Value) -> Option<String> {
+    error
+        .get("data")
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| error.get("name").and_then(|n| n.as_str()))
+        .map(|s| s.to_string())
 }
 
 /// Convert a part JSON value into transcript entries.
@@ -261,6 +289,20 @@ fn parse_transcript_from_dir(storage_dir: &Path, session_id: &str) -> Result<Vec
             .single()
             .unwrap_or_else(Utc::now);
 
+        // Check for message-level error (e.g. API validation errors)
+        if let Some(error) = &message.error {
+            if let Some(msg) = extract_error_message(error) {
+                entries.push(TranscriptEntry {
+                    timestamp: msg_timestamp,
+                    role: role.clone(),
+                    entry_type: EntryType::Error,
+                    content: msg,
+                    tool_name: None,
+                    tool_input: None,
+                });
+            }
+        }
+
         // Read parts for this message
         let msg_part_dir = part_dir.join(&message.id);
         if !msg_part_dir.exists() {
@@ -299,6 +341,7 @@ struct MessageMeta {
     id: String,
     role: Option<String>,
     time: TimeMeta,
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -670,6 +713,74 @@ mod tests {
         let conn = setup_transcript_db();
         let result = parse_transcript_from_conn(&conn, "ses_missing");
         assert!(result.is_err());
+    }
+
+    fn insert_msg_with_data(
+        conn: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        ts: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, ts, ts, data],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_message_error() {
+        let conn = setup_transcript_db();
+        insert_msg_with_data(
+            &conn,
+            "msg_001",
+            "ses_err1",
+            1705314600000,
+            r#"{"role":"assistant","time":{"created":1705314600000},"error":{"name":"APIError","data":{"message":"image too large","statusCode":400}}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_err1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Error));
+        assert!(matches!(entries[0].role, Role::Assistant));
+        assert_eq!(entries[0].content, "image too large");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_message_error_name_fallback() {
+        let conn = setup_transcript_db();
+        insert_msg_with_data(
+            &conn,
+            "msg_001",
+            "ses_err2",
+            1705314600000,
+            r#"{"role":"assistant","time":{"created":1705314600000},"error":{"name":"RateLimitError"}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_err2").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Error));
+        assert_eq!(entries[0].content, "RateLimitError");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_dir_message_error() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        // Create message dir and file with error, but no part dir
+        let session_id = "ses_err_file";
+        let message_dir = storage.join("message").join(session_id);
+        fs::create_dir_all(&message_dir).unwrap();
+
+        let msg_json = r#"{"id":"msg_001","role":"assistant","time":{"created":1705314600000},"error":{"name":"APIError","data":{"message":"image dimension exceeds 8000 pixels","statusCode":400}}}"#;
+        fs::write(message_dir.join("msg_001.json"), msg_json).unwrap();
+
+        let entries = parse_transcript_from_dir(storage, session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Error));
+        assert!(matches!(entries[0].role, Role::Assistant));
+        assert_eq!(entries[0].content, "image dimension exceeds 8000 pixels");
     }
 
     // --- Merge tests ---

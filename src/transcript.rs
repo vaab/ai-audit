@@ -27,6 +27,7 @@ pub enum EntryType {
     ToolUse,
     ToolResult,
     Thinking,
+    Error,
 }
 
 impl EntryType {
@@ -36,6 +37,7 @@ impl EntryType {
             EntryType::ToolUse => "tool_use",
             EntryType::ToolResult => "tool_result",
             EntryType::Thinking => "thinking",
+            EntryType::Error => "error",
         }
     }
 }
