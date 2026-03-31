@@ -84,6 +84,8 @@ pub fn run(
             session_id: None,
             verbose: false,
             cache: !no_cache,
+            server_url: None,
+            password: None,
         };
 
         // Streaming callback for live display (when not quiet)

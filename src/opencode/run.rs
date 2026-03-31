@@ -142,6 +142,12 @@ pub struct RunOptions<'a> {
     /// Set to false to bypass cache read and recompute fresh.
     /// Note: Results are ALWAYS written to cache regardless of this flag.
     pub cache: bool,
+    /// Remote opencode server URL (e.g., "http://localhost:4096").
+    /// When set, uses `--attach` to connect to a running opencode server.
+    pub server_url: Option<&'a str>,
+    /// Basic auth password for the remote server.
+    /// Used with `--password` when connecting to a remote server.
+    pub password: Option<&'a str>,
 }
 
 impl<'a> Default for RunOptions<'a> {
@@ -153,6 +159,8 @@ impl<'a> Default for RunOptions<'a> {
             session_id: None,
             verbose: false,
             cache: true,
+            server_url: None,
+            password: None,
         }
     }
 }
@@ -279,6 +287,20 @@ where
     if let Some(session) = options.session_id {
         session_flag = format!("--session={}", session);
         args.push(&session_flag);
+    }
+
+    // Add server attachment if specified (connect to remote opencode server)
+    let attach_flag: String;
+    if let Some(url) = options.server_url {
+        attach_flag = format!("--attach={}", url);
+        args.push(&attach_flag);
+    }
+
+    // Add password if specified (basic auth for remote server)
+    let password_flag: String;
+    if let Some(pw) = options.password {
+        password_flag = format!("--password={}", pw);
+        args.push(&password_flag);
     }
 
     // Add format=json to capture structured output
@@ -552,6 +574,8 @@ mod tests {
         assert_eq!(opts.session_id, None);
         assert!(!opts.verbose);
         assert!(opts.cache); // cache is true by default
+        assert_eq!(opts.server_url, None);
+        assert_eq!(opts.password, None);
     }
 
     #[test]
