@@ -364,6 +364,7 @@ struct MessageContent {
 pub fn parse_claudecode_messages(
     session_path: &Path,
     config: &Config,
+    project_dir: Option<&str>,
 ) -> Result<Vec<ActivityEvent>> {
     let file = fs::File::open(session_path)
         .with_context(|| format!("Failed to open session file: {}", session_path.display()))?;
@@ -429,12 +430,15 @@ pub fn parse_claudecode_messages(
             continue;
         }
 
-        // Get project path from cwd
-        let project_path = entry
-            .cwd
-            .as_deref()
-            .map(|p| config.simplify_path(p))
-            .unwrap_or_else(|| "unknown".to_string());
+        // Get project path from project_dir if provided, otherwise from cwd
+        let project_path = match project_dir {
+            Some(dir) => dir.to_string(),
+            None => entry
+                .cwd
+                .as_deref()
+                .map(|p| config.simplify_path(p))
+                .unwrap_or_else(|| "unknown".to_string()),
+        };
 
         let ident = format!(
             "{}-{}@{}",
@@ -465,6 +469,7 @@ pub fn parse_claudecode_permissions(
     debug_path: &Path,
     session_path: Option<&Path>,
     config: &Config,
+    project_dir: Option<&str>,
 ) -> Result<Vec<ActivityEvent>> {
     let content = fs::read_to_string(debug_path)
         .with_context(|| format!("Failed to read debug file: {}", debug_path.display()))?;
@@ -476,11 +481,14 @@ pub fn parse_claudecode_permissions(
         r#"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s+\[DEBUG\]\s+Applying permission update:\s+Adding\s+\d+\s+allow rule\(s\)[^:]*:\s*\[([^\]]+)\]"#,
     )?;
 
-    // Try to get project path from session file
-    let project_path = session_path
-        .and_then(|p| get_project_path_from_session(p, config).ok())
-        .or_else(|| get_project_path_from_debug_path(debug_path, config))
-        .unwrap_or_else(|| "unknown".to_string());
+    // Use canonical project_dir if provided, otherwise derive from session file
+    let project_path = match project_dir {
+        Some(dir) => dir.to_string(),
+        None => session_path
+            .and_then(|p| get_project_path_from_session(p, config).ok())
+            .or_else(|| get_project_path_from_debug_path(debug_path, config))
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
 
     let session_id = debug_path
         .file_stem()
@@ -1036,10 +1044,12 @@ pub fn fetch_activities(
                 Some(p) => p,
                 None => continue,
             };
-            if let Ok(events) = parse_claudecode_messages(session_file, config) {
+            if let Ok(events) =
+                parse_claudecode_messages(session_file, config, Some(&meta.project_dir))
+            {
                 for event in events {
                     if event.timestamp >= start_ts
-                        && event.timestamp <= end_ts
+                        && event.timestamp < end_ts
                         && filter.matches_ident(&event.ident)
                     {
                         all_events.push(event);
@@ -1051,6 +1061,14 @@ pub fn fetch_activities(
 
     // Claude Code permissions — still scanned from debug logs
     if filter.include_claude && filter.include_permissions {
+        // Build session_id → project_dir lookup from the index
+        let perm_dir_map: std::collections::HashMap<&str, &str> = index
+            .sessions
+            .iter()
+            .filter(|s| s.provider == Provider::ClaudeCode)
+            .map(|s| (s.id.as_str(), s.project_dir.as_str()))
+            .collect();
+
         let debug_dir = crate::claudecode::debug_dir();
         if debug_dir.exists() {
             for entry in fs::read_dir(&debug_dir)? {
@@ -1062,12 +1080,20 @@ pub fn fetch_activities(
                         .as_ref()
                         .and_then(|id| crate::claudecode::session::find_session_file(id));
 
-                    if let Ok(events) =
-                        parse_claudecode_permissions(&path, session_file.as_deref(), config)
-                    {
+                    // Look up canonical project_dir from session index
+                    let perm_project_dir = session_id
+                        .as_deref()
+                        .and_then(|id| perm_dir_map.get(id).copied());
+
+                    if let Ok(events) = parse_claudecode_permissions(
+                        &path,
+                        session_file.as_deref(),
+                        config,
+                        perm_project_dir,
+                    ) {
                         for event in events {
                             if event.timestamp >= start_ts
-                                && event.timestamp <= end_ts
+                                && event.timestamp < end_ts
                                 && filter.matches_ident(&event.ident)
                             {
                                 all_events.push(event);
@@ -1097,7 +1123,7 @@ pub fn fetch_activities(
         let merged_events = merge_activity_events(file_events, db_events);
         for event in merged_events {
             if event.timestamp >= start_ts
-                && event.timestamp <= end_ts
+                && event.timestamp < end_ts
                 && filter.matches_ident(&event.ident)
             {
                 all_events.push(event);
@@ -1164,24 +1190,18 @@ struct IdentifierFilter {
     include_opencode: bool,
     include_messages: bool,
     include_permissions: bool,
-    /// Specific project path filters (empty = all)
-    project_filters: Vec<String>,
+    /// Full identifier filters (empty = all)
+    ident_filters: Vec<String>,
 }
 
 impl IdentifierFilter {
     fn matches_ident(&self, ident: &str) -> bool {
-        if self.project_filters.is_empty() {
+        if self.ident_filters.is_empty() {
             return true;
         }
 
-        // Check if any filter matches
-        for filter in &self.project_filters {
-            if ident.contains(filter) {
-                return true;
-            }
-        }
-
-        false
+        // Check for exact match against full identifiers
+        self.ident_filters.iter().any(|f| f == ident)
     }
 }
 
@@ -1193,7 +1213,7 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
             include_opencode: true,
             include_messages: true,
             include_permissions: true,
-            project_filters: Vec::new(),
+            ident_filters: Vec::new(),
         };
     }
 
@@ -1201,13 +1221,14 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
     let mut include_opencode = false;
     let mut include_messages = false;
     let mut include_permissions = false;
-    let mut project_filters = Vec::new();
+    let mut ident_filters = Vec::new();
 
     for ident in identifiers {
-        // Parse format: CLIENT-TYPE@PROJECT_PATH
-        if let Some((prefix, project)) = ident.split_once('@') {
-            project_filters.push(project.to_string());
+        // Store the full identifier for exact matching
+        ident_filters.push(ident.clone());
 
+        // Parse format: CLIENT-TYPE@PROJECT_PATH
+        if let Some((prefix, _project)) = ident.split_once('@') {
             if prefix.starts_with("claudecode") {
                 include_claude = true;
             }
@@ -1222,7 +1243,6 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
             }
         } else {
             // Just a project path, include all types
-            project_filters.push(ident.clone());
             include_claude = true;
             include_opencode = true;
             include_messages = true;
@@ -1245,7 +1265,7 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
         include_opencode,
         include_messages,
         include_permissions,
-        project_filters,
+        ident_filters,
     }
 }
 
@@ -1450,7 +1470,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].activity_type, ActivityType::Message);
@@ -1473,7 +1493,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         assert_eq!(events.len(), 0);
     }
@@ -1489,7 +1509,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         assert_eq!(events.len(), 1);
         if let ActivityData::Message { content } = &events[0].data {
@@ -1510,7 +1530,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         assert_eq!(events.len(), 0);
     }
@@ -1568,7 +1588,7 @@ mod tests {
         .unwrap();
 
         let events =
-            parse_claudecode_permissions(&file.path().to_path_buf(), None, &config).unwrap();
+            parse_claudecode_permissions(&file.path().to_path_buf(), None, &config, None).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].activity_type, ActivityType::Permission);
@@ -1596,7 +1616,7 @@ mod tests {
         .unwrap();
 
         let events =
-            parse_claudecode_permissions(&file.path().to_path_buf(), None, &config).unwrap();
+            parse_claudecode_permissions(&file.path().to_path_buf(), None, &config, None).unwrap();
 
         assert_eq!(events.len(), 2);
 
@@ -1627,7 +1647,7 @@ mod tests {
         .unwrap();
 
         let events =
-            parse_claudecode_permissions(&file.path().to_path_buf(), None, &config).unwrap();
+            parse_claudecode_permissions(&file.path().to_path_buf(), None, &config, None).unwrap();
 
         assert_eq!(events.len(), 0);
     }
@@ -1655,6 +1675,7 @@ mod tests {
             &debug_file.path().to_path_buf(),
             Some(&session_file.path().to_path_buf()),
             &config,
+            None,
         )
         .unwrap();
 
@@ -1678,7 +1699,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         assert_eq!(events.len(), 2);
         if let ActivityData::Message { content } = &events[0].data {
@@ -1702,7 +1723,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         // Should only have user messages
         assert_eq!(events.len(), 2);
@@ -1719,7 +1740,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config).unwrap();
+        let events = parse_claudecode_messages(&file.path().to_path_buf(), &config, None).unwrap();
 
         assert_eq!(events.len(), 1);
         // 2024-01-15T10:30:00Z = 1705314600 unix timestamp
@@ -1956,7 +1977,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_messages(&session_file, &config).unwrap();
+        let events = parse_claudecode_messages(&session_file, &config, None).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, "abc-def-1234");
@@ -1974,7 +1995,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_claudecode_permissions(&debug_file, None, &config).unwrap();
+        let events = parse_claudecode_permissions(&debug_file, None, &config, None).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, "my-session-uuid");
