@@ -98,6 +98,10 @@ pub enum Commands {
         #[arg(short, long)]
         all: bool,
 
+        /// List only sub-sessions of this parent session ID
+        #[arg(long)]
+        children_of: Option<String>,
+
         #[command(flatten)]
         output: OutputOpts,
     },

@@ -39,6 +39,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             project,
             file,
             all,
+            children_of,
             output,
         } => list_sessions::run(
             session_type,
@@ -48,6 +49,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             project.as_deref(),
             file.as_deref(),
             all,
+            children_of.as_deref(),
             output.format(),
             quiet,
         ),

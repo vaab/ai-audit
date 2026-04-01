@@ -45,6 +45,7 @@ pub fn run(
     project: Option<&str>,
     file: Option<&str>,
     all: bool,
+    children_of: Option<&str>,
     format: OutputFormat,
     _quiet: bool,
 ) -> Result<()> {
@@ -106,8 +107,14 @@ pub fn run(
         match p.list_sessions() {
             Ok(provider_sessions) => {
                 for s in provider_sessions {
-                    // Filters: cheapest first (parent, session_id, project, timespan, file, then search)
-                    if !all && s.parent_id.is_some() {
+                    // Filters: cheapest first (parent/children, session_id, project, timespan, file, then search)
+                    if let Some(parent) = children_of {
+                        // --children-of: only include sessions whose parent_id matches
+                        match &s.parent_id {
+                            Some(pid) if pid == parent => {}
+                            _ => continue,
+                        }
+                    } else if !all && s.parent_id.is_some() {
                         continue;
                     }
                     if let Some(id) = session_id {
@@ -313,6 +320,59 @@ mod tests {
         match args.command {
             crate::cli::def::Commands::ListSessions { all, .. } => {
                 assert!(all);
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_children_of_default_is_none() {
+        let args =
+            Args::try_parse_from(["ai-audit", "list-sessions"]).expect("bare list-sessions works");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { children_of, .. } => {
+                assert!(children_of.is_none());
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_children_of() {
+        let args = Args::try_parse_from([
+            "ai-audit",
+            "list-sessions",
+            "--children-of",
+            "ses_parent123",
+        ])
+        .expect("--children-of should be accepted");
+        match args.command {
+            crate::cli::def::Commands::ListSessions { children_of, .. } => {
+                assert_eq!(children_of.as_deref(), Some("ses_parent123"));
+            }
+            _ => panic!("expected ListSessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_children_of_implies_showing_subsessions() {
+        // --children-of without --all should still work (children_of bypasses the all filter)
+        let args = Args::try_parse_from([
+            "ai-audit",
+            "list-sessions",
+            "--children-of",
+            "ses_parent123",
+        ])
+        .expect("--children-of without --all should be accepted");
+        match args.command {
+            crate::cli::def::Commands::ListSessions {
+                children_of, all, ..
+            } => {
+                assert_eq!(children_of.as_deref(), Some("ses_parent123"));
+                assert!(
+                    !all,
+                    "--all should default to false when using --children-of"
+                );
             }
             _ => panic!("expected ListSessions command"),
         }
