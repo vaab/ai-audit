@@ -11,7 +11,7 @@
 //! The `--match` flag (`find_session_by_match`) provides a separate
 //! code path that searches session message text directly.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::env;
 
@@ -79,6 +79,8 @@ pub struct DetectedSession {
 pub struct LastSessionOptions {
     /// Optional provider filter.
     pub provider_filter: Option<Provider>,
+    /// Read scrollback from file instead of capturing from tmux pane.
+    pub scrollback_file: Option<std::path::PathBuf>,
 }
 
 /// Options for match-based session detection.
@@ -741,6 +743,14 @@ pub fn detect_current_session() -> Result<DetectedSession> {
 /// 1. If in tmux → capture scrollback → parse messages → build filters → search
 /// 2. Otherwise bail with error
 pub fn detect_last_session(opts: &LastSessionOptions) -> Result<DetectedSession> {
+    // If a scrollback file is provided, use it directly instead of tmux
+    if let Some(ref path) = opts.scrollback_file {
+        log::debug!("detect_last_session: reading scrollback from {:?}", path);
+        let scrollback = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read scrollback file {:?}", path))?;
+        return detect_last_session_from_scrollback(&scrollback, opts.provider_filter);
+    }
+
     #[cfg(unix)]
     if is_tmux_available() {
         log::debug!("detect_last_session: tmux available, trying fingerprinting");
@@ -754,6 +764,39 @@ pub fn detect_last_session(opts: &LastSessionOptions) -> Result<DetectedSession>
          Run inside tmux for scrollback fingerprinting, \
          or use --session to specify explicitly."
     );
+}
+
+/// Run the detection pipeline from pre-captured scrollback content.
+fn detect_last_session_from_scrollback(
+    scrollback: &str,
+    provider_filter: Option<Provider>,
+) -> Result<DetectedSession> {
+    let messages = parse_pane_messages(scrollback);
+    if messages.is_empty() {
+        bail!("Could not detect last session.\nNo messages parsed from scrollback file.");
+    }
+
+    log::debug!(
+        "detect_last_session_from_scrollback: parsed {} messages",
+        messages.len()
+    );
+
+    let filters = build_filters(&messages);
+    if filters.is_empty() {
+        bail!("Could not detect last session.\nNo filters built from scrollback file.");
+    }
+
+    log::debug!(
+        "detect_last_session_from_scrollback: built {} filters",
+        filters.len()
+    );
+
+    find_session_by_filters(&filters, provider_filter).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not detect last session.\n\
+             Filters built from scrollback file matched no session."
+        )
+    })
 }
 
 // ── Tmux helpers ────────────────────────────────────────────────

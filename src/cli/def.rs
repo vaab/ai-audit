@@ -156,6 +156,10 @@ pub enum Commands {
         #[arg(short = 't', long = "type")]
         session_type: Option<SessionType>,
 
+        /// Read scrollback from file instead of capturing from tmux pane
+        #[arg(long)]
+        scrollback_file: Option<PathBuf>,
+
         #[command(flatten)]
         output: OutputOpts,
     },

@@ -1,5 +1,7 @@
 //! Last session detection handler.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 
 use crate::session_detect;
@@ -7,6 +9,7 @@ use crate::OutputFormat;
 
 pub fn run(
     session_type: Option<super::super::def::SessionType>,
+    scrollback_file: Option<PathBuf>,
     format: OutputFormat,
 ) -> Result<()> {
     let provider_filter = session_type.map(|t| match t {
@@ -16,6 +19,7 @@ pub fn run(
 
     let detected = session_detect::detect_last_session(&session_detect::LastSessionOptions {
         provider_filter,
+        scrollback_file,
     })?;
 
     match format {

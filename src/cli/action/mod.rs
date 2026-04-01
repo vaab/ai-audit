@@ -115,8 +115,9 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
         }
         Commands::LastSession {
             session_type,
+            scrollback_file,
             output,
-        } => last_session::run(session_type, output.format()),
+        } => last_session::run(session_type, scrollback_file, output.format()),
         Commands::Activity { action } => activity::run(action),
         Commands::Rate {
             instruction,
