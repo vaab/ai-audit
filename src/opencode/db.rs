@@ -329,27 +329,23 @@ fn message_parts_match_criteria(
     for (ci, criterion) in criteria.iter().enumerate() {
         let matched = match criterion {
             crate::session_detect::FilterCriterion::TextContains(needle) => {
-                let text_parts: Vec<_> = parts
-                    .iter()
-                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .collect();
                 log::trace!(
-                    "  criterion[{}] TextContains({:?}): {} text parts in pool (session={})",
+                    "  criterion[{}] TextContains({:?}): {} parts in pool (session={})",
                     ci,
                     needle,
-                    text_parts.len(),
+                    parts.len(),
                     session_id
                 );
-                let found = text_parts.iter().any(|part| {
-                    let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    let hit = text.contains(needle.as_str());
+                let found = parts.iter().any(|part| {
+                    let hit = super::part_contains_needle(part, needle);
                     if hit {
-                        log::trace!("    MATCH in text part (len={})", text.len());
+                        let ptype = part.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                        log::trace!("    MATCH in {} part", ptype);
                     }
                     hit
                 });
                 if !found {
-                    log::trace!("    no text part contains the needle");
+                    log::trace!("    no part contains the needle");
                 }
                 found
             }
@@ -406,9 +402,9 @@ fn message_parts_match_criteria(
 
                     let field_match = field_val.is_some_and(|v| {
                         if let Some(s) = v.as_str() {
-                            s == resolved
+                            s.starts_with(resolved.as_str())
                         } else {
-                            v.to_string() == resolved
+                            v.to_string().starts_with(resolved.as_str())
                         }
                     });
 
@@ -1227,6 +1223,56 @@ mod tests {
     }
 
     #[test]
+    fn test_session_matches_filters_text_contains_in_tool_output() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        // Only a tool part with output — no text parts at all
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"bash","state":{"input":{"command":"tmux capture-pane -t %616 -p"},"output":"╭ vaab@wen ~/dev/charm/0k-charms ── 6m59 2026-03-16 15:05:24\n╰ $"}}"#,
+        );
+
+        // TextContains should find text inside tool output
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::TextContains(
+                "vaab@wen ~/dev/charm/0k-charms".to_string(),
+            )],
+        }];
+        assert!(session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 5, "/proj"
+        ));
+
+        // Non-matching text still fails
+        let filters_bad = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::TextContains(
+                "nonexistent output".to_string(),
+            )],
+        }];
+        assert!(!session_matches_filters_from_conn(
+            &conn,
+            "ses_001",
+            &filters_bad,
+            5,
+            "/proj"
+        ));
+    }
+
+    #[test]
     fn test_session_matches_filters_tool_field_equals() {
         let conn = setup_test_db();
         insert_session(
@@ -1268,6 +1314,78 @@ mod tests {
                 tool_name: "read".to_string(),
                 field: "pattern".to_string(),
                 value: "foo".to_string(),
+            }],
+        }];
+        assert!(!session_matches_filters_from_conn(
+            &conn,
+            "ses_001",
+            &filters_bad,
+            5,
+            "/proj"
+        ));
+    }
+
+    #[test]
+    fn test_session_matches_filters_tool_field_prefix_match() {
+        let conn = setup_test_db();
+        insert_session(
+            &conn,
+            "ses_001",
+            None,
+            "/proj",
+            "Test",
+            1705314600000,
+            1705314605000,
+        );
+        insert_message(&conn, "msg_001", "ses_001", "assistant", 1705314600000);
+        insert_part(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_001",
+            1705314600000,
+            r#"{"type":"tool","tool":"interactive_bash","state":{"input":{"tmux_command":"send-keys -t %581 \"Rathole server connection details for vps-03.0k.io: Server host: vps-03 -- Port: 2333 -- Token: abc123\""},"output":"(no output)"}}"#,
+        );
+
+        // Truncated prefix (as TUI would show) should match
+        let filters = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::ToolFieldEquals {
+                tool_name: "interactive_bash".to_string(),
+                field: "tmux_command".to_string(),
+                value:
+                    "send-keys -t %581 \"Rathole server connection details for vps-03.0k.io: Server"
+                        .to_string(),
+            }],
+        }];
+        assert!(session_matches_filters_from_conn(
+            &conn, "ses_001", &filters, 5, "/proj"
+        ));
+
+        // Exact match still works
+        let filters_exact = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::ToolFieldEquals {
+                tool_name: "interactive_bash".to_string(),
+                field: "tmux_command".to_string(),
+                value: "send-keys -t %581 \"Rathole server connection details for vps-03.0k.io: Server host: vps-03 -- Port: 2333 -- Token: abc123\"".to_string(),
+            }],
+        }];
+        assert!(session_matches_filters_from_conn(
+            &conn,
+            "ses_001",
+            &filters_exact,
+            5,
+            "/proj"
+        ));
+
+        // Wrong prefix should not match
+        let filters_bad = vec![crate::session_detect::SessionFilter {
+            depth: 0,
+            criteria: vec![crate::session_detect::FilterCriterion::ToolFieldEquals {
+                tool_name: "interactive_bash".to_string(),
+                field: "tmux_command".to_string(),
+                value: "send-keys -t %999 \"Something else".to_string(),
             }],
         }];
         assert!(!session_matches_filters_from_conn(

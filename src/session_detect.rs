@@ -32,6 +32,7 @@ enum TuiLineKind {
     ToolInvocation(String),
     PanelContent,
     CompletionMarker,
+    SessionTitle,
     Footer,
     Empty,
     Other,
@@ -97,16 +98,58 @@ pub struct MatchOptions {
 
 // ── ANSI / TUI helpers ──────────────────────────────────────────
 
-/// Strip ANSI escape codes from a string.
+/// Strip ANSI escape codes (CSI and OSC sequences) from a string.
 fn strip_ansi(s: &str) -> String {
-    let re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
+    // CSI: \x1b[ ... letter   OSC: \x1b] ... \x1b\\ or \x1b] ... \x07
+    let re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x1b\\|\x07)")
+        .expect("valid regex");
     re.replace_all(s, "").to_string()
 }
 
-/// Split a string by ANSI escape codes, returning the text segments between them.
+/// Split a string by ANSI escape codes (CSI and OSC), returning the text segments between them.
 fn ansi_segments(s: &str) -> Vec<&str> {
-    let re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
+    let re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x1b\\|\x07)")
+        .expect("valid regex");
     re.split(s).filter(|seg| !seg.is_empty()).collect()
+}
+
+/// Extract the foreground color code active at the first visible character.
+///
+/// Walks through ANSI escapes until the first non-whitespace text,
+/// returning the last `38;...` foreground color seen before it.
+fn leading_fg_color(raw_line: &str) -> Option<String> {
+    let re = Regex::new(r"\x1b\[([0-9;]*)[a-zA-Z]").expect("valid regex");
+    let mut last_fg: Option<String> = None;
+    let mut pos = 0;
+
+    for m in re.find_iter(raw_line) {
+        // Check for visible text between previous position and this escape
+        let between = &raw_line[pos..m.start()];
+        if between.chars().any(|c| !c.is_whitespace()) {
+            // Hit visible text — return whatever fg we had
+            return last_fg;
+        }
+        // Extract the params from the escape
+        let params_match = Regex::new(r"\x1b\[([0-9;]*)[a-zA-Z]").expect("valid regex");
+        if let Some(caps) = params_match.captures(m.as_str()) {
+            let params = &caps[1];
+            if params.starts_with("38;") {
+                last_fg = Some(params.to_string());
+            }
+        }
+        pos = m.end();
+    }
+    // Check remaining text after last escape
+    let remaining = &raw_line[pos..];
+    if remaining.chars().any(|c| !c.is_whitespace()) {
+        return last_fg;
+    }
+    last_fg
+}
+
+/// Check if a line starts with a visible character rendered in the given fg color.
+fn line_starts_with_fg_color(raw_line: &str, fg_color: &str) -> bool {
+    leading_fg_color(raw_line).as_deref() == Some(fg_color)
 }
 
 /// Find the longest text segment between ANSI escape codes in a string.
@@ -142,8 +185,29 @@ fn classify_tui_line(raw_line: &str) -> TuiLineKind {
         return TuiLineKind::CompletionMarker;
     }
 
-    // PanelContent: raw has background color AND stripped has ┃
-    if raw_line.contains("48;2;") && stripped.contains('┃') {
+    // SessionTitle: bold # heading with cost/token stats.
+    // Raw line has \x1b[1m (bold) before the #, and stripped line
+    // contains "# " after the panel border and ends with cost like "($...)"
+    if raw_line.contains("\x1b[1m") {
+        // Strip panel border (┃) and check for "# " heading
+        let after_border = if let Some(pos) = trimmed.find('┃') {
+            trimmed[pos + '┃'.len_utf8()..].trim_start()
+        } else {
+            trimmed
+        };
+        if after_border.starts_with("# ") && trimmed.contains("($") {
+            return TuiLineKind::SessionTitle;
+        }
+    }
+
+    // PanelContent: raw has background color AND stripped has ┃,
+    // but NOT if the line also has assistant text foreground — those
+    // lines carry session content rendered inside the panel and should
+    // be collected as AssistantText instead.
+    if raw_line.contains("48;2;")
+        && stripped.contains('┃')
+        && !raw_line.contains("38;2;242;244;248")
+    {
         return TuiLineKind::PanelContent;
     }
 
@@ -158,9 +222,12 @@ fn classify_tui_line(raw_line: &str) -> TuiLineKind {
         }
     }
 
-    // AssistantText: light gray foreground WITHOUT background color
+    // AssistantText: light gray foreground (with or without background).
+    // Lines inside the ┃ panel that carry assistant text color contain
+    // session content (system reminders, titles, responses) and should
+    // be collected for fingerprinting.
     // Store the raw line so we can extract ANSI segments later.
-    if raw_line.contains("38;2;242;244;248") && !raw_line.contains("48;2;") {
+    if raw_line.contains("38;2;242;244;248") {
         return TuiLineKind::AssistantText(raw_line.to_string());
     }
 
@@ -288,13 +355,46 @@ fn parse_pane_messages(content: &str) -> Vec<PaneMessage> {
         lines.len()
     );
 
-    // Walk upward from footer, collecting messages
+    // Detect the footer's leading foreground color (the ╹ character color).
+    // Lines above the footer that start with the same fg color are the
+    // input/compose prompt area — skip them.
+    let footer_fg = leading_fg_color(lines[footer_idx]);
+    let mut content_start = footer_idx;
+    if let Some(ref fg) = footer_fg {
+        // Skip lines with same fg color as footer (prompt/input area)
+        for i in (0..footer_idx).rev() {
+            if line_starts_with_fg_color(lines[i], fg) {
+                content_start = i;
+            } else {
+                break;
+            }
+        }
+        // Also skip a blank line + ▣ CompletionMarker above the prompt area
+        let mut skip_to = content_start;
+        if skip_to > 0 && matches!(classified[skip_to - 1], TuiLineKind::Empty) {
+            skip_to -= 1;
+            if skip_to > 0 && matches!(classified[skip_to - 1], TuiLineKind::CompletionMarker) {
+                skip_to -= 1;
+            }
+        }
+        if content_start < footer_idx || skip_to < content_start {
+            content_start = skip_to;
+            log::debug!(
+                "parse_pane_messages: skipping prompt area lines {}..{} (fg color {})",
+                content_start,
+                footer_idx,
+                fg
+            );
+        }
+    }
+
+    // Walk upward from content boundary, collecting messages
     let mut messages: Vec<PaneMessage> = Vec::new();
     let mut current_text: Vec<String> = Vec::new();
     let mut current_tools: Vec<ParsedToolCall> = Vec::new();
     let mut completion_count = 0;
 
-    for i in (0..footer_idx).rev() {
+    for i in (0..content_start).rev() {
         if messages.len() >= 10 || completion_count >= 3 {
             break;
         }
@@ -325,8 +425,8 @@ fn parse_pane_messages(content: &str) -> Vec<PaneMessage> {
                     current_tools.push(parsed);
                 }
             }
-            TuiLineKind::Footer => {
-                // Another footer above — stop
+            TuiLineKind::Footer | TuiLineKind::SessionTitle => {
+                // Another footer or session title above — stop
                 break;
             }
             _ => {}
@@ -374,18 +474,25 @@ fn build_filters(messages: &[PaneMessage]) -> Vec<SessionFilter> {
         return Vec::new();
     }
 
-    // Score messages: prefer those with both text and tools
+    // Score messages by actual content quality.
+    // Primary: max ANSI segment length (longer = more distinctive needle).
+    // Secondary: number of tool call fields (more fields = stronger filter).
+    // This ensures messages with long, meaningful text rank above those with
+    // only short syntax-highlighted fragments (e.g. CSS diffs).
     let mut scored: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .map(|(idx, msg)| {
-            let has_text = !msg.text_lines.is_empty();
-            let has_tools = !msg.tool_calls.is_empty();
-            let score = match (has_text, has_tools) {
-                (true, true) => 2,
-                (true, false) | (false, true) => 1,
-                (false, false) => 0,
-            };
+            let max_seg_len = msg
+                .text_lines
+                .iter()
+                .filter_map(|raw| longest_ansi_segment(raw))
+                .map(|seg| seg.len())
+                .max()
+                .unwrap_or(0);
+            let tool_field_count: usize = msg.tool_calls.iter().map(|tc| tc.fields.len()).sum();
+            // Combine: segment length dominates, tool fields add minor boost
+            let score = max_seg_len + tool_field_count;
             (idx, score)
         })
         .collect();
@@ -411,7 +518,16 @@ fn build_filters(messages: &[PaneMessage]) -> Vec<SessionFilter> {
             .filter(|seg| seg.len() >= MIN_NEEDLE_LENGTH)
             .max_by_key(|seg| seg.len())
         {
-            criteria.push(FilterCriterion::TextContains(longest));
+            // Strip TUI "$ " command prefix — the DB stores
+            // commands without this shell-prompt chrome.
+            let needle = if longest.starts_with("$ ") {
+                longest[2..].to_string()
+            } else {
+                longest
+            };
+            if needle.len() >= MIN_NEEDLE_LENGTH {
+                criteria.push(FilterCriterion::TextContains(needle));
+            }
         }
 
         // Tool call fields as ToolFieldEquals
@@ -952,6 +1068,29 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_tui_line_panel_with_assistant_text_is_assistant() {
+        // Panel line with assistant text foreground color should be
+        // AssistantText, not PanelContent — it carries session content.
+        let raw = "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m  \x1b[38;2;242;244;248mFind vigil-watch PermissionEntry struct\x1b[0m";
+        match classify_tui_line(raw) {
+            TuiLineKind::AssistantText(text) => {
+                assert!(text.contains("Find vigil-watch"));
+            }
+            other => panic!(
+                "panel line with assistant text color should be AssistantText, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_classify_tui_line_panel_empty_stays_panel() {
+        // Empty panel border line (no assistant text color) stays PanelContent.
+        let raw = "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m                              \x1b[0m";
+        assert_eq!(classify_tui_line(raw), TuiLineKind::PanelContent);
+    }
+
+    #[test]
     fn test_classify_tui_line_completion() {
         let raw = "  ▣  Sisyphus · claude-opus-4-6 · 9.9s";
         assert_eq!(classify_tui_line(raw), TuiLineKind::CompletionMarker);
@@ -1102,6 +1241,154 @@ mod tests {
     // === build_filters tests ===
 
     #[test]
+    fn test_parse_pane_messages_panel_text_extracted() {
+        // Reproduces the bug: a QUEUED session where all visible content is
+        // inside ┃ panels with background color.  The system-reminder text
+        // must be extracted as AssistantText, not discarded as PanelContent.
+        let content = [
+            // Empty panel border (no assistant color) → PanelContent
+            "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m                              \x1b[0m",
+            // System reminder text (has assistant color inside panel)
+            "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m  \x1b[38;2;242;244;248m<system-reminder>\x1b[0m",
+            "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m  \x1b[38;2;242;244;248mFind vigil-watch PermissionEntry struct and list_all_permissions to understand value field\x1b[0m",
+            "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m  \x1b[38;2;242;244;248m</system-reminder>\x1b[0m",
+            // Empty panel border → PanelContent
+            "\x1b[38;2;0;206;209m┃\x1b[48;2;26;26;26m                              \x1b[0m",
+            // Completion marker
+            "  ▣  Sisyphus · claude-opus-4-6",
+            "",
+            // Footer
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+        ]
+        .join("\n");
+
+        let messages = parse_pane_messages(&content);
+        assert!(
+            !messages.is_empty(),
+            "should extract messages from panel text"
+        );
+
+        // The system-reminder text lines should be collected
+        let all_text: Vec<&str> = messages
+            .iter()
+            .flat_map(|m| m.text_lines.iter().map(|s| s.as_str()))
+            .collect();
+        assert!(
+            all_text.iter().any(|t| t.contains("PermissionEntry")),
+            "should have extracted the system-reminder text, got: {:?}",
+            all_text
+        );
+
+        // build_filters should produce a filter from the long text
+        let filters = build_filters(&messages);
+        assert!(
+            !filters.is_empty(),
+            "system-reminder text should produce filters"
+        );
+        assert!(
+            filters.iter().any(|f| f.criteria.iter().any(|c| matches!(
+                c,
+                FilterCriterion::TextContains(s) if s.contains("PermissionEntry")
+            ))),
+            "filter should contain the distinctive text"
+        );
+    }
+
+    #[test]
+    fn test_build_filters_prefers_long_segments_over_short_fragments() {
+        // Reproduces the CSS-diff scenario: messages near the footer have
+        // syntax-highlighted fragments (all < MIN_NEEDLE_LENGTH), while a
+        // deeper message has a long distinctive text segment.  The scoring
+        // must rank the deeper message higher so its segment becomes a filter.
+        let messages = vec![
+            // msg[0] depth=0: model selector, 15 chars — too short
+            PaneMessage {
+                text_lines: vec![
+                    "\x1b[38;2;242;244;248mClaude Opus 4.6\x1b[0m".to_string(),
+                ],
+                tool_calls: vec![],
+                depth: 0,
+            },
+            // msg[1] depth=1: "Done.", 5 chars — too short
+            PaneMessage {
+                text_lines: vec!["\x1b[38;2;242;244;248mDone.\x1b[0m".to_string()],
+                tool_calls: vec![],
+                depth: 1,
+            },
+            // msg[2] depth=2: CSS diff with syntax-highlighted fragments, all < 20 chars
+            PaneMessage {
+                text_lines: vec![
+                    "\x1b[38;2;100;200;100m.back-btn\x1b[0m \x1b[38;2;200;100;100m{\x1b[0m".to_string(),
+                    "\x1b[38;2;150;150;255m  padding\x1b[0m\x1b[38;2;200;200;200m:\x1b[0m \x1b[38;2;200;150;50m0rem\x1b[0m".to_string(),
+                    "\x1b[38;2;200;100;100m}\x1b[0m".to_string(),
+                ],
+                tool_calls: vec![],
+                depth: 2,
+            },
+            // msg[3] depth=3: tool calls only (Read + Edit)
+            PaneMessage {
+                text_lines: vec![],
+                tool_calls: vec![
+                    ParsedToolCall {
+                        tool_name: "Read".to_string(),
+                        fields: vec![("filePath".to_string(), "style.css".to_string())],
+                    },
+                    ParsedToolCall {
+                        tool_name: "Edit".to_string(),
+                        fields: vec![("filePath".to_string(), "style.css".to_string())],
+                    },
+                ],
+                depth: 3,
+            },
+            // msg[4] depth=4: long distinctive text, 46 chars — the good one
+            PaneMessage {
+                text_lines: vec![
+                    "\x1b[38;2;242;244;248m`.back-btn` should have `padding: 0rem .6rem;`\x1b[0m"
+                        .to_string(),
+                ],
+                tool_calls: vec![],
+                depth: 4,
+            },
+        ];
+
+        let filters = build_filters(&messages);
+        assert!(
+            !filters.is_empty(),
+            "should produce at least one filter from the long segment in msg[4]"
+        );
+
+        // The filter with the TextContains criterion must come from msg[4] (depth=4)
+        // because it has the only segment >= MIN_NEEDLE_LENGTH.
+        let text_filter = filters
+            .iter()
+            .find(|f| {
+                f.criteria
+                    .iter()
+                    .any(|c| matches!(c, FilterCriterion::TextContains(_)))
+            })
+            .expect("should have a TextContains filter");
+        assert_eq!(
+            text_filter.depth, 4,
+            "TextContains filter should come from msg[4] (depth=4), not shallow messages"
+        );
+
+        // Verify the needle content is from msg[4]
+        let needle = text_filter
+            .criteria
+            .iter()
+            .find_map(|c| match c {
+                FilterCriterion::TextContains(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            needle.contains("`.back-btn` should have"),
+            "needle should contain the distinctive text from msg[4], got: {:?}",
+            needle
+        );
+    }
+
+    #[test]
     fn test_build_filters_from_messages() {
         // text_lines must contain raw ANSI so longest_ansi_segment works
         let messages = vec![
@@ -1143,5 +1430,63 @@ mod tests {
                 .any(|c| matches!(c, FilterCriterion::ToolFieldEquals { .. })),
             "should have ToolFieldEquals criterion"
         );
+    }
+
+    /// Integration test against the real saved scrollback from the bug report.
+    /// Skipped if the scrollback file is absent (e.g. CI).
+    #[test]
+    fn test_build_filters_against_saved_scrollback() {
+        let path = "/tmp/pane-579-scrollback-raw.txt";
+        let Ok(scrollback) = std::fs::read_to_string(path) else {
+            eprintln!("SKIP: {} not found", path);
+            return;
+        };
+
+        let messages = parse_pane_messages(&scrollback);
+        assert!(
+            !messages.is_empty(),
+            "should parse messages from saved scrollback"
+        );
+
+        let filters = build_filters(&messages);
+        assert!(
+            !filters.is_empty(),
+            "should produce filters from saved scrollback (was 0 before fix)"
+        );
+
+        // Must have at least one TextContains filter
+        let has_text_filter = filters.iter().any(|f| {
+            f.criteria
+                .iter()
+                .any(|c| matches!(c, FilterCriterion::TextContains(_)))
+        });
+        assert!(
+            has_text_filter,
+            "should have at least one TextContains filter from the scrollback"
+        );
+
+        // Log what we got for diagnostic purposes
+        for (i, f) in filters.iter().enumerate() {
+            for c in &f.criteria {
+                match c {
+                    FilterCriterion::TextContains(needle) => {
+                        eprintln!(
+                            "  filter[{}] depth={}: TextContains({:?})",
+                            i, f.depth, needle
+                        );
+                    }
+                    FilterCriterion::ToolFieldEquals {
+                        tool_name,
+                        field,
+                        value,
+                    } => {
+                        eprintln!(
+                            "  filter[{}] depth={}: ToolFieldEquals({}:{}={:?})",
+                            i, f.depth, tool_name, field, value
+                        );
+                    }
+                }
+            }
+        }
     }
 }
