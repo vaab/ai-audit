@@ -3,6 +3,7 @@ pub mod claudecode;
 pub mod cli;
 pub mod config;
 pub mod opencode;
+pub mod pi;
 pub mod provider;
 pub mod rate;
 pub mod session_detect;

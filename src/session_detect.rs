@@ -603,6 +603,7 @@ fn find_session_by_filters(
     let include_opencode = provider_filter.is_none() || provider_filter == Some(Provider::OpenCode);
     let include_claudecode =
         provider_filter.is_none() || provider_filter == Some(Provider::ClaudeCode);
+    let include_pi = provider_filter.is_none() || provider_filter == Some(Provider::Pi);
 
     if include_opencode {
         if let Ok(sessions) = crate::opencode::list_sessions() {
@@ -630,6 +631,19 @@ fn find_session_by_filters(
                     s.updated_at,
                     String::new(),
                 ));
+            }
+        }
+    }
+
+    if include_pi {
+        if let Ok(sessions) = crate::pi::session::list_sessions() {
+            for s in sessions {
+                // Skip sub-agent sessions (parent_id is set when the session
+                // file lives nested under another session's directory).
+                if s.parent_id.is_some() {
+                    continue;
+                }
+                all_sessions.push((s.session_id, Provider::Pi, s.updated_at, s.project_dir));
             }
         }
     }
@@ -681,6 +695,26 @@ fn find_session_by_filters(
                                 for criterion in &filter.criteria {
                                     if let FilterCriterion::TextContains(needle) = criterion {
                                         if crate::claudecode::session::session_tail_contains_text(
+                                            session_id, needle, window,
+                                        ) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                            false
+                        }
+                        Provider::Pi => {
+                            // Same fallback as Claude Code: depth-0
+                            // TextContains only.  Pi's TUI uses different
+                            // ANSI codes than OpenCode, so the structured
+                            // ToolFieldEquals filters built from OpenCode
+                            // icons (→ ✱ ← ⚙) will not match — defer
+                            // pi-specific TUI parsing to a future pass.
+                            if filter.depth == 0 {
+                                for criterion in &filter.criteria {
+                                    if let FilterCriterion::TextContains(needle) = criterion {
+                                        if crate::pi::session::session_tail_contains_text(
                                             session_id, needle, window,
                                         ) {
                                             return true;
@@ -744,6 +778,7 @@ pub fn find_session_by_match(opts: &MatchOptions) -> Result<DetectedSession> {
         opts.provider_filter.is_none() || opts.provider_filter == Some(Provider::OpenCode);
     let include_claudecode =
         opts.provider_filter.is_none() || opts.provider_filter == Some(Provider::ClaudeCode);
+    let include_pi = opts.provider_filter.is_none() || opts.provider_filter == Some(Provider::Pi);
 
     if include_opencode {
         if let Ok(sessions) = crate::opencode::list_sessions() {
@@ -789,6 +824,28 @@ pub fn find_session_by_match(opts: &MatchOptions) -> Result<DetectedSession> {
         }
     }
 
+    if include_pi {
+        if let Ok(sessions) = crate::pi::session::list_sessions() {
+            for s in sessions {
+                if let Some(ref expected) = project_path {
+                    if s.project_dir != *expected {
+                        continue;
+                    }
+                }
+                if crate::pi::session::session_tail_contains_text(
+                    &s.session_id,
+                    &opts.needle,
+                    opts.last_messages,
+                ) {
+                    matches.push(DetectedSession {
+                        session_id: s.session_id,
+                        provider: Provider::Pi,
+                    });
+                }
+            }
+        }
+    }
+
     match matches.len() {
         0 => bail!(
             "No session found matching \"{}\" in last {} messages",
@@ -812,7 +869,9 @@ pub fn find_session_by_match(opts: &MatchOptions) -> Result<DetectedSession> {
 /// Try to auto-detect the current session.
 ///
 /// Strategy:
-/// 1. Check env vars `OPENCODE_SESSION_ID` / `CLAUDE_SESSION_ID`
+/// 1. Check env vars `OPENCODE_SESSION_ID` / `CLAUDE_SESSION_ID` /
+///    `PI_SESSION_ID` (the latter is exported by the
+///    `pi-env-session-id` extension at session_start)
 /// 2. If in tmux → tmux scrollback fingerprinting
 /// 3. Otherwise bail with error
 pub fn detect_current_session() -> Result<DetectedSession> {
@@ -835,6 +894,15 @@ pub fn detect_current_session() -> Result<DetectedSession> {
             });
         }
     }
+    if let Ok(sid) = env::var("PI_SESSION_ID") {
+        if !sid.is_empty() {
+            log::debug!("detect_current_session: found PI_SESSION_ID={}", sid);
+            return Ok(DetectedSession {
+                session_id: sid,
+                provider: Provider::Pi,
+            });
+        }
+    }
 
     // Step 2: Try tmux scrollback fingerprinting
     #[cfg(unix)]
@@ -848,7 +916,7 @@ pub fn detect_current_session() -> Result<DetectedSession> {
     // Step 3: No detection possible
     bail!(
         "Could not detect current session.\n\
-         Set OPENCODE_SESSION_ID or CLAUDE_SESSION_ID, \
+         Set OPENCODE_SESSION_ID, CLAUDE_SESSION_ID, or PI_SESSION_ID, \
          or run inside tmux for scrollback fingerprinting."
     );
 }

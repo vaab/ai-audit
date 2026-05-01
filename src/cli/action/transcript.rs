@@ -24,7 +24,7 @@ pub fn run(
     verbose: u8,
 ) -> Result<()> {
     // Auto-detect provider
-    let provider = crate::provider::provider_for_session(session);
+    let provider = crate::provider::provider_for_session(session)?;
     let mut entries = provider.parse_transcript(session)?;
 
     // Filter thinking entries unless verbose

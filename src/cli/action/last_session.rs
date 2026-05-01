@@ -15,6 +15,7 @@ pub fn run(
     let provider_filter = session_type.map(|t| match t {
         super::super::def::SessionType::OpenCode => crate::provider::Provider::OpenCode,
         super::super::def::SessionType::ClaudeCode => crate::provider::Provider::ClaudeCode,
+        super::super::def::SessionType::Pi => crate::provider::Provider::Pi,
     });
 
     let detected = session_detect::detect_last_session(&session_detect::LastSessionOptions {

@@ -6,7 +6,7 @@
 //! uses these abstractions exclusively, so adding a new provider
 //! requires only implementing `SessionProvider` — no other code changes.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::ops::Add;
@@ -19,6 +19,7 @@ use crate::transcript::TranscriptEntry;
 pub enum Provider {
     ClaudeCode,
     OpenCode,
+    Pi,
 }
 
 impl Provider {
@@ -26,6 +27,7 @@ impl Provider {
         match self {
             Provider::ClaudeCode => "claudecode",
             Provider::OpenCode => "opencode",
+            Provider::Pi => "pi",
         }
     }
 }
@@ -38,14 +40,46 @@ impl std::fmt::Display for Provider {
 
 /// Detect the provider for a session ID based on its format.
 ///
-/// - `ses_*` prefix -> OpenCode
-/// - UUID format -> Claude Code
-pub fn detect_provider(session_id: &str) -> Provider {
+/// Recognised formats:
+/// - `ses_*` prefix → OpenCode
+/// - UUIDv4 (version digit `4`) → Claude Code
+/// - UUIDv7 (version digit `7`) → Pi
+///
+/// Anything else (malformed strings, unknown UUID versions) returns an
+/// error.  Loud failure here is intentional: unrecognised IDs are almost
+/// always user error or a sign that a new provider exists which the
+/// codebase has not yet been taught about.
+pub fn detect_provider(session_id: &str) -> Result<Provider> {
     if session_id.starts_with("ses_") {
-        Provider::OpenCode
-    } else {
-        Provider::ClaudeCode
+        return Ok(Provider::OpenCode);
     }
+    if !looks_like_hyphenated_uuid(session_id) {
+        bail!(
+            "Unrecognised session ID format: {:?} (expected ses_* for OpenCode, \
+             UUIDv4 for Claude Code, or UUIDv7 for pi)",
+            session_id
+        );
+    }
+    // Version nibble is the 15th character (index 14) of a hyphenated UUID.
+    match session_id.as_bytes()[14] {
+        b'4' => Ok(Provider::ClaudeCode),
+        b'7' => Ok(Provider::Pi),
+        other => bail!(
+            "Unsupported UUID version {} in session ID {:?} (only v4=Claude Code, \
+             v7=pi are recognised)",
+            other as char,
+            session_id
+        ),
+    }
+}
+
+/// Cheap structural check for a hyphenated 36-char UUID.
+fn looks_like_hyphenated_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    bytes[8] == b'-' && bytes[13] == b'-' && bytes[18] == b'-' && bytes[23] == b'-'
 }
 
 /// Provider-agnostic session metadata.
@@ -183,11 +217,9 @@ pub trait SessionProvider {
 /// Get the provider adapter for a given session ID.
 ///
 /// Returns a boxed `SessionProvider` based on the session ID format.
-pub fn provider_for_session(session_id: &str) -> Box<dyn SessionProvider> {
-    match detect_provider(session_id) {
-        Provider::ClaudeCode => Box::new(crate::claudecode::ClaudeCodeProvider),
-        Provider::OpenCode => Box::new(crate::opencode::OpenCodeProvider),
-    }
+/// Errors when the format is not recognised (see [`detect_provider`]).
+pub fn provider_for_session(session_id: &str) -> Result<Box<dyn SessionProvider>> {
+    Ok(provider_for(detect_provider(session_id)?))
 }
 
 /// Get all available provider adapters.
@@ -195,6 +227,7 @@ pub fn all_providers() -> Vec<Box<dyn SessionProvider>> {
     vec![
         Box::new(crate::claudecode::ClaudeCodeProvider),
         Box::new(crate::opencode::OpenCodeProvider),
+        Box::new(crate::pi::PiProvider),
     ]
 }
 
@@ -203,6 +236,7 @@ pub fn provider_for(provider: Provider) -> Box<dyn SessionProvider> {
     match provider {
         Provider::ClaudeCode => Box::new(crate::claudecode::ClaudeCodeProvider),
         Provider::OpenCode => Box::new(crate::opencode::OpenCodeProvider),
+        Provider::Pi => Box::new(crate::pi::PiProvider),
     }
 }
 
@@ -212,29 +246,54 @@ mod tests {
 
     #[test]
     fn test_detect_provider_opencode() {
-        assert_eq!(detect_provider("ses_abc123"), Provider::OpenCode);
-        assert_eq!(detect_provider("ses_"), Provider::OpenCode);
+        assert_eq!(detect_provider("ses_abc123").unwrap(), Provider::OpenCode);
+        assert_eq!(detect_provider("ses_").unwrap(), Provider::OpenCode);
     }
 
     #[test]
-    fn test_detect_provider_claudecode() {
+    fn test_detect_provider_claudecode_uuidv4() {
         assert_eq!(
-            detect_provider("550e8400-e29b-41d4-a716-446655440000"),
+            detect_provider("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             Provider::ClaudeCode
         );
-        assert_eq!(detect_provider("some-uuid"), Provider::ClaudeCode);
+    }
+
+    #[test]
+    fn test_detect_provider_pi_uuidv7() {
+        // Real UUIDv7 from a pi session
+        assert_eq!(
+            detect_provider("019dddbf-6e66-7709-9a3b-b5a18736f890").unwrap(),
+            Provider::Pi
+        );
+    }
+
+    #[test]
+    fn test_detect_provider_rejects_malformed() {
+        // Wrong length, missing hyphens, garbage — all must error.
+        assert!(detect_provider("some-uuid").is_err());
+        assert!(detect_provider("").is_err());
+        assert!(detect_provider("not-a-uuid-at-all-really-not-one-here").is_err());
+    }
+
+    #[test]
+    fn test_detect_provider_rejects_unknown_uuid_version() {
+        // UUIDv1 (version digit `1`) is a recognisable UUID but not a
+        // version we map to a provider — must error.
+        assert!(detect_provider("550e8400-e29b-11d4-a716-446655440000").is_err());
     }
 
     #[test]
     fn test_provider_as_str() {
         assert_eq!(Provider::ClaudeCode.as_str(), "claudecode");
         assert_eq!(Provider::OpenCode.as_str(), "opencode");
+        assert_eq!(Provider::Pi.as_str(), "pi");
     }
 
     #[test]
     fn test_provider_display() {
         assert_eq!(format!("{}", Provider::ClaudeCode), "claudecode");
         assert_eq!(format!("{}", Provider::OpenCode), "opencode");
+        assert_eq!(format!("{}", Provider::Pi), "pi");
     }
 
     #[test]

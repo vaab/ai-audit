@@ -108,11 +108,16 @@ fn resolve_session_type(
     if !wants_status_features {
         return Ok(session_type);
     }
-    if session_type == Some(SessionType::ClaudeCode) {
+    if session_type == Some(SessionType::ClaudeCode) || session_type == Some(SessionType::Pi) {
         require_opencode_for("status")?;
     }
-    if session_id.is_some_and(|id| detect_provider(id) == crate::provider::Provider::ClaudeCode) {
-        require_opencode_for("status")?;
+    if let Some(id) = session_id {
+        match detect_provider(id)? {
+            crate::provider::Provider::OpenCode => {}
+            crate::provider::Provider::ClaudeCode | crate::provider::Provider::Pi => {
+                require_opencode_for("status")?;
+            }
+        }
     }
     Ok(Some(SessionType::OpenCode))
 }

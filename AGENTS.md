@@ -3,7 +3,7 @@
 ## Purpose
 
 CLI tool to audit and monitor AI assistant sessions. Supports Claude
-Code and OpenCode.
+Code, OpenCode, and pi (badlogic/pi-mono).
 
 ## Architecture
 
@@ -34,6 +34,10 @@ src/
 │   ├── permissions.rs   # Permission parsing from part files + logs
 │   ├── run.rs           # Agent invocation (for rate command)
 │   └── cache.rs         # Caching support
+├── pi/
+│   ├── mod.rs           # Data dir, sessions dir, PiProvider impl
+│   ├── session.rs       # JSONL parsing, text search, tool-call extraction
+│   └── transcript.rs    # Transcript parser (JSONL → TranscriptEntry)
 ├── session_detect.rs    # Auto-detect current session (env vars, tmux fingerprinting)
 ├── transcript.rs        # Common transcript types (Role, EntryType, TranscriptEntry)
 ├── activity.rs          # Activity event parsing (messages + permissions)
@@ -75,6 +79,22 @@ ai-audit rate <instruction> --test <path>
 - Parts: `~/.local/share/opencode/storage/part/<msg-id>/prt_*.json`
 - Logs: `~/.local/share/opencode/log/*.log`
 
+### Pi (badlogic/pi-mono)
+- Sessions: `~/.pi/agent/sessions/--<encoded-cwd>--/<iso-ts>_<uuidv7>.jsonl`
+- Sub-agent sessions (e.g. spawned by `pi-subagents`):
+  `~/.pi/agent/sessions/--<encoded-cwd>--/<iso-ts>_<parent-uuid>/<entry-id>/run-N/session.jsonl`
+- Settings: `~/.pi/agent/settings.json`
+- Base dir override: `PI_CODING_AGENT_DIR` environment variable.
+- **Authoritative `cwd`**: read from the JSONL header line.  NEVER
+  decode the `--<encoded-cwd>--` directory name (the encoding `/` → `-`
+  is lossy and ambiguous).
+- Pi has **no permission/approval model**, so the `permissions` command
+  errors out for pi sessions and only `pi-msg@<project>` activity
+  identifiers are emitted.
+- `PI_SESSION_ID` is exported into the agent environment by the
+  separate `pi-env-session-id` pi extension, so child processes spawned
+  by pi's `bash` tool inherit it.
+
 ## Session Detection Rules
 
 **BLOCKING**: These rules have no exceptions.
@@ -87,15 +107,24 @@ ai-audit rate <instruction> --test <path>
   session is active. CWD can change independently of the session.
 - **Only two valid detection methods**:
   1. **Environment variables** (`OPENCODE_SESSION_ID`,
-     `CLAUDE_SESSION_ID`) — authoritative when set.
+     `CLAUDE_SESSION_ID`, `PI_SESSION_ID`) — authoritative when set.
+     `PI_SESSION_ID` requires the companion `pi-env-session-id` pi
+     extension; pi itself does not export the session ID.
   2. **Tmux scrollback fingerprinting** — parse TUI ANSI rendering
      into structured filters, then match against session databases.
+     For pi, only depth-0 `TextContains` matching is used (pi's TUI
+     icons differ from OpenCode's, so structured tool-field filters
+     do not apply).
 - If neither method yields a result, return an error (exit code 1).
   Never fall back to heuristics.
 
 ## Development Notes
 
-- Session ID format: `ses_*` = OpenCode, UUID = Claude Code (auto-detected)
+- Session ID format (auto-detected via UUID version nibble at index 14):
+  - `ses_*` → OpenCode
+  - UUIDv4 (version `4`) → Claude Code
+  - UUIDv7 (version `7`) → pi
+  - Anything else → loud error (no silent fallback).
 - Config: `~/.config/ai-audit/config.yml` (path simplification rules)
 - Tests: `cargo test` (300+ unit tests)
 - Build: `cargo build --release`

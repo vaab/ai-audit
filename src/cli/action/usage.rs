@@ -66,11 +66,15 @@ fn run_single(session_id: &str, status: &SessionStatusOpts, format: OutputFormat
         || status.last_message_in.is_some()
         || status.output_live_status
         || status.live_status.is_some();
-    if wants_status_features && detect_provider(session_id) == crate::provider::Provider::ClaudeCode
-    {
-        return require_opencode_for("status");
+    if wants_status_features {
+        match detect_provider(session_id)? {
+            crate::provider::Provider::OpenCode => {}
+            crate::provider::Provider::ClaudeCode | crate::provider::Provider::Pi => {
+                return require_opencode_for("status");
+            }
+        }
     }
-    let provider = provider_for_session(session_id);
+    let provider = provider_for_session(session_id)?;
     let messages = provider.list_messages(session_id)?;
     let total_tokens: TokenUsage = messages
         .iter()
@@ -200,7 +204,9 @@ fn run_aggregated(
         || status.last_message_in.is_some()
         || status.output_live_status
         || live_statuses.is_some();
-    if session_type == Some(SessionType::ClaudeCode) && wants_status_features {
+    if (session_type == Some(SessionType::ClaudeCode) || session_type == Some(SessionType::Pi))
+        && wants_status_features
+    {
         return require_opencode_for("status");
     }
     let wants_live = status.output_live_status || live_statuses.is_some();
@@ -232,7 +238,7 @@ fn run_aggregated(
 
     let mut usage_records = Vec::new();
     for session in sessions {
-        let provider = provider_for_session(&session.base.session_id);
+        let provider = provider_for_session(&session.base.session_id)?;
         let messages = provider.list_messages(&session.base.session_id)?;
         let tokens: TokenUsage = messages
             .iter()

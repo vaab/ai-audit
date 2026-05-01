@@ -27,8 +27,11 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
         bail!("SESSION_ID cannot be combined with --project, --search, --last-message-in, or --status")
     }
     if let Some(session_id) = args.session.as_deref() {
-        if detect_provider(session_id) == crate::provider::Provider::ClaudeCode {
-            return super::super::require_opencode_for("session nudge");
+        match detect_provider(session_id)? {
+            crate::provider::Provider::OpenCode => {}
+            crate::provider::Provider::ClaudeCode | crate::provider::Provider::Pi => {
+                return super::super::require_opencode_for("session nudge");
+            }
         }
     }
     let config = Config::load()?;

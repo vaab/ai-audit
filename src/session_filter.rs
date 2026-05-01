@@ -44,6 +44,7 @@ pub fn list_filtered(filter: &SessionFilter) -> Result<Vec<EnrichedSession>> {
     let providers = match filter.session_type {
         Some(SessionType::ClaudeCode) => vec![provider::provider_for(Provider::ClaudeCode)],
         Some(SessionType::OpenCode) => vec![provider::provider_for(Provider::OpenCode)],
+        Some(SessionType::Pi) => vec![provider::provider_for(Provider::Pi)],
         None => provider::all_providers(),
     };
     list_filtered_from_providers(filter, providers)

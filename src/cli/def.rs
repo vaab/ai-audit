@@ -30,6 +30,9 @@ pub enum SessionType {
     /// OpenCode sessions
     #[value(name = "opencode")]
     OpenCode,
+    /// pi (badlogic/pi-mono) sessions
+    #[value(name = "pi")]
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

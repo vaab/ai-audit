@@ -334,6 +334,153 @@ fn scan_opencode_sessions_to_meta_from_conn(
         .collect()
 }
 
+/// Scan all Pi session files and build `SessionMeta` entries.
+///
+/// Pi stores sessions under `~/.pi/agent/sessions/--<encoded-cwd>--/`,
+/// with sub-agent sessions nested deeper.  We iterate via
+/// [`crate::pi::session::list_sessions`], which already handles the
+/// recursive walk and reads cwd from each JSONL header.
+fn scan_pi_sessions(config: &Config) -> Vec<SessionMeta> {
+    let pi_sessions = match crate::pi::session::list_sessions() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    pi_sessions
+        .into_iter()
+        .map(|s| {
+            let project_dir = if s.project_dir.is_empty() {
+                "unknown".to_string()
+            } else {
+                config.simplify_path(&s.project_dir)
+            };
+            // Re-derive the on-disk path so downstream message parsing
+            // does not have to walk the tree again.
+            let session_file = crate::pi::session::find_session_file(&s.session_id);
+            SessionMeta {
+                id: s.session_id,
+                project_dir,
+                is_child: s.parent_id.is_some(),
+                provider: Provider::Pi,
+                session_file,
+            }
+        })
+        .collect()
+}
+
+/// Parse user messages from a Pi session JSONL file.
+pub fn parse_pi_messages(
+    session_path: &Path,
+    config: &Config,
+    project_dir: Option<&str>,
+) -> Result<Vec<ActivityEvent>> {
+    let file = fs::File::open(session_path)
+        .with_context(|| format!("Failed to open session file: {}", session_path.display()))?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+
+    let mut session_id: Option<String> = None;
+    let mut header_cwd: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Capture session id and cwd from the header line.
+        if entry_type == "session" {
+            session_id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            header_cwd = entry
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            continue;
+        }
+
+        if entry_type != "message" {
+            continue;
+        }
+
+        let message = match entry.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        if message.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+
+        let timestamp = match entry.get("timestamp").and_then(|v| v.as_str()) {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(dt) => dt.with_timezone(&Utc).timestamp(),
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+
+        // Extract user text content.  Pi user messages can be either a
+        // plain string or an array of content blocks (text/image/...).
+        let content = match message.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| {
+                    if let serde_json::Value::Object(obj) = v {
+                        if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            return obj.get("text").and_then(|t| t.as_str()).map(String::from);
+                        }
+                    }
+                    None
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        let project_path = match project_dir {
+            Some(dir) => dir.to_string(),
+            None => header_cwd
+                .as_deref()
+                .map(|p| config.simplify_path(p))
+                .unwrap_or_else(|| "unknown".to_string()),
+        };
+
+        let sid = session_id.clone().unwrap_or_default();
+        let ident = format!(
+            "{}-{}@{}",
+            Provider::Pi.as_str(),
+            ActivityType::Message.as_str(),
+            project_path,
+        );
+
+        events.push(ActivityEvent {
+            timestamp,
+            ident,
+            session_id: sid,
+            activity_type: ActivityType::Message,
+            data: ActivityData::Message { content },
+        });
+    }
+
+    events.sort_by_key(|e| e.timestamp);
+    events.dedup_by(|a, b| a.timestamp == b.timestamp && a.data == b.data);
+    Ok(events)
+}
+
 /// Merge two lists of `SessionMeta`, deduplicating by session ID.
 /// The second list (DB) wins on conflict.
 fn merge_session_metas(
@@ -926,6 +1073,7 @@ pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
     let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
     let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
     all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
+    all_sessions.extend(scan_pi_sessions(config));
     let index = SessionIndex {
         sessions: all_sessions,
     };
@@ -960,6 +1108,19 @@ pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
                 let msg_ident = format!(
                     "{}-{}@{}",
                     Provider::OpenCode.as_str(),
+                    ActivityType::Message.as_str(),
+                    meta.project_dir
+                );
+
+                if !identifiers.contains(&msg_ident) {
+                    identifiers.push(msg_ident);
+                }
+            }
+            Provider::Pi => {
+                // Pi has no permission/approval events, so only msg.
+                let msg_ident = format!(
+                    "{}-{}@{}",
+                    Provider::Pi.as_str(),
                     ActivityType::Message.as_str(),
                     meta.project_dir
                 );
@@ -1030,6 +1191,9 @@ pub fn fetch_activities(
         let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
         all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
     }
+    if filter.include_pi {
+        all_sessions.extend(scan_pi_sessions(config));
+    }
     let index = SessionIndex {
         sessions: all_sessions,
     };
@@ -1099,6 +1263,30 @@ pub fn fetch_activities(
                                 all_events.push(event);
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pi messages — iterate the pre-built index, skip children.
+    // Pi has no permission events, so messages-only.
+    if filter.include_pi && filter.include_messages {
+        for meta in index.non_child() {
+            if meta.provider != Provider::Pi {
+                continue;
+            }
+            let session_file = match &meta.session_file {
+                Some(p) => p,
+                None => continue,
+            };
+            if let Ok(events) = parse_pi_messages(session_file, config, Some(&meta.project_dir)) {
+                for event in events {
+                    if event.timestamp >= start_ts
+                        && event.timestamp < end_ts
+                        && filter.matches_ident(&event.ident)
+                    {
+                        all_events.push(event);
                     }
                 }
             }
@@ -1188,6 +1376,7 @@ fn strip_preload_permissions(events: &mut Vec<ActivityEvent>) {
 struct IdentifierFilter {
     include_claude: bool,
     include_opencode: bool,
+    include_pi: bool,
     include_messages: bool,
     include_permissions: bool,
     /// Full identifier filters (empty = all)
@@ -1211,6 +1400,7 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
         return IdentifierFilter {
             include_claude: true,
             include_opencode: true,
+            include_pi: true,
             include_messages: true,
             include_permissions: true,
             ident_filters: Vec::new(),
@@ -1219,6 +1409,7 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
 
     let mut include_claude = false;
     let mut include_opencode = false;
+    let mut include_pi = false;
     let mut include_messages = false;
     let mut include_permissions = false;
     let mut ident_filters = Vec::new();
@@ -1235,6 +1426,9 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
             if prefix.starts_with("opencode") {
                 include_opencode = true;
             }
+            if prefix.starts_with("pi-") || prefix == "pi" {
+                include_pi = true;
+            }
             if prefix.ends_with("-msg") {
                 include_messages = true;
             }
@@ -1245,6 +1439,7 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
             // Just a project path, include all types
             include_claude = true;
             include_opencode = true;
+            include_pi = true;
             include_messages = true;
             include_permissions = true;
         }
@@ -1255,14 +1450,16 @@ fn parse_identifier_filter(identifiers: &[String]) -> IdentifierFilter {
         include_messages = true;
         include_permissions = true;
     }
-    if !include_claude && !include_opencode {
+    if !include_claude && !include_opencode && !include_pi {
         include_claude = true;
         include_opencode = true;
+        include_pi = true;
     }
 
     IdentifierFilter {
         include_claude,
         include_opencode,
+        include_pi,
         include_messages,
         include_permissions,
         ident_filters,

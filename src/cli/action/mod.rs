@@ -82,6 +82,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, verbose: u8) -> Result<()> {
             let provider_filter = session_type.map(|t| match t {
                 super::def::SessionType::OpenCode => crate::provider::Provider::OpenCode,
                 super::def::SessionType::ClaudeCode => crate::provider::Provider::ClaudeCode,
+                super::def::SessionType::Pi => crate::provider::Provider::Pi,
             });
             let detected = if let Some(needle) = r#match {
                 crate::session_detect::find_session_by_match(

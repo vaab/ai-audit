@@ -2,7 +2,7 @@
 name = "ai-audit"
 version = "0.1.0"
 edition = "2021"
-description = "Audit tool for AI assistant sessions (Claude Code logs)"
+description = "Audit tool for AI assistant sessions (Claude Code, OpenCode, pi)"
 authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
 license = "MIT"
 
@@ -15,7 +15,7 @@ serde_yaml = "0.9"
 regex = "1"
 anyhow = "1"
 dirs = "5"
-kal-time = "0.1"
+kal-time = "0.2"
 pager = "0.16"
 colored = "2"
 wait-timeout = "0.2"

@@ -7,7 +7,7 @@ use crate::provider::{self, Provider};
 use crate::{claudecode, opencode, OutputFormat};
 
 pub fn run(session: &str, format: OutputFormat) -> Result<()> {
-    match provider::detect_provider(session) {
+    match provider::detect_provider(session)? {
         Provider::OpenCode => {
             let events = opencode::permissions::parse_events(session)?;
             opencode::permissions::display_events(&events, format);
@@ -28,6 +28,9 @@ pub fn run(session: &str, format: OutputFormat) -> Result<()> {
             }
 
             claudecode::permissions::display_events(&events, format);
+        }
+        Provider::Pi => {
+            anyhow::bail!("permissions: pi has no permission/approval events to display");
         }
     }
 
