@@ -148,6 +148,10 @@ pub struct RunOptions<'a> {
     /// Basic auth password for the remote server.
     /// Used with `--password` when connecting to a remote server.
     pub password: Option<&'a str>,
+    /// Directory to run opencode in.
+    /// When attaching to a server, this is passed as `--dir` so new sessions
+    /// are attributed to the caller's project instead of the server cwd.
+    pub directory: Option<&'a Path>,
 }
 
 impl<'a> Default for RunOptions<'a> {
@@ -161,6 +165,7 @@ impl<'a> Default for RunOptions<'a> {
             cache: true,
             server_url: None,
             password: None,
+            directory: None,
         }
     }
 }
@@ -269,49 +274,7 @@ where
     log::debug!("Instruction file: {}", instruction_str);
     log::debug!("Prompt: {}", full_prompt);
 
-    // Build command args
-    let model_flag = format!("--model={}", model);
-    let file_flag = format!("-f={}", instruction_str);
-
-    let mut args = vec!["run", &model_flag, &file_flag];
-
-    // Add agent if specified
-    let agent_flag: String;
-    if let Some(a) = agent {
-        agent_flag = format!("--agent={}", a);
-        args.push(&agent_flag);
-    }
-
-    // Add session if specified
-    let session_flag: String;
-    if let Some(session) = options.session_id {
-        session_flag = format!("--session={}", session);
-        args.push(&session_flag);
-    }
-
-    // Add server attachment if specified (connect to remote opencode server)
-    let attach_flag: String;
-    if let Some(url) = options.server_url {
-        attach_flag = format!("--attach={}", url);
-        args.push(&attach_flag);
-    }
-
-    // Add password if specified (basic auth for remote server)
-    let password_flag: String;
-    if let Some(pw) = options.password {
-        password_flag = format!("--password={}", pw);
-        args.push(&password_flag);
-    }
-
-    // Add format=json to capture structured output
-    args.push("--format=json");
-
-    // Always add print-logs to capture agent name from stderr
-    args.push("--print-logs");
-
-    // Separator and prompt
-    args.push("--");
-    args.push(&full_prompt);
+    let args = build_opencode_args(model, instruction_str, agent, options, &full_prompt)?;
 
     log::trace!("opencode args: {:?}", args);
 
@@ -497,6 +460,54 @@ where
     })
 }
 
+fn build_opencode_args(
+    model: &str,
+    instruction_str: &str,
+    agent: Option<&str>,
+    options: &RunOptions<'_>,
+    full_prompt: &str,
+) -> Result<Vec<String>> {
+    let mut args = vec![
+        "run".to_string(),
+        format!("--model={model}"),
+        format!("-f={instruction_str}"),
+    ];
+
+    if let Some(a) = agent {
+        args.push(format!("--agent={a}"));
+    }
+
+    if let Some(session) = options.session_id {
+        args.push(format!("--session={session}"));
+    }
+
+    if let Some(url) = options.server_url {
+        args.push(format!("--attach={url}"));
+    }
+
+    if let Some(directory) = options.directory {
+        let directory = path_to_string(directory)?;
+        args.push(format!("--dir={directory}"));
+    }
+
+    if let Some(pw) = options.password {
+        args.push(format!("--password={pw}"));
+    }
+
+    args.push("--format=json".to_string());
+    args.push("--print-logs".to_string());
+    args.push("--".to_string());
+    args.push(full_prompt.to_string());
+
+    Ok(args)
+}
+
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(|s| s.to_string())
+        .context("opencode directory path is not valid UTF-8")
+}
+
 /// Extract text content from JSON output lines.
 ///
 /// Parses the streaming JSON output and concatenates all text parts.
@@ -520,6 +531,7 @@ pub fn extract_text_content(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     // Note: extract_session_id tests removed - session ID is now captured during streaming
 
@@ -576,6 +588,87 @@ mod tests {
         assert!(opts.cache); // cache is true by default
         assert_eq!(opts.server_url, None);
         assert_eq!(opts.password, None);
+        assert_eq!(opts.directory, None);
+    }
+
+    #[test]
+    fn test_build_opencode_args_includes_directory() {
+        let directory = PathBuf::from("/home/user/project");
+        let options = RunOptions {
+            model: Some("anthropic/claude-sonnet-4"),
+            agent: Some("build"),
+            timeout_secs: Some(60),
+            session_id: None,
+            verbose: false,
+            cache: false,
+            server_url: Some("http://localhost:4096"),
+            password: None,
+            directory: Some(directory.as_path()),
+        };
+
+        let args = build_opencode_args(
+            "anthropic/claude-sonnet-4",
+            "/tmp/instructions.md",
+            Some("build"),
+            &options,
+            "full prompt",
+        )
+        .expect("args should build");
+
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--model=anthropic/claude-sonnet-4",
+                "-f=/tmp/instructions.md",
+                "--agent=build",
+                "--attach=http://localhost:4096",
+                "--dir=/home/user/project",
+                "--format=json",
+                "--print-logs",
+                "--",
+                "full prompt",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_opencode_args_omits_directory_when_unset() {
+        let options = RunOptions {
+            model: Some("anthropic/claude-sonnet-4"),
+            agent: None,
+            timeout_secs: None,
+            session_id: Some("ses_123"),
+            verbose: false,
+            cache: true,
+            server_url: None,
+            password: Some("secret"),
+            directory: None,
+        };
+
+        let args = build_opencode_args(
+            "anthropic/claude-sonnet-4",
+            "/tmp/instructions.md",
+            None,
+            &options,
+            "full prompt",
+        )
+        .expect("args should build");
+
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--model=anthropic/claude-sonnet-4",
+                "-f=/tmp/instructions.md",
+                "--session=ses_123",
+                "--password=secret",
+                "--format=json",
+                "--print-logs",
+                "--",
+                "full prompt",
+            ]
+        );
     }
 
     #[test]

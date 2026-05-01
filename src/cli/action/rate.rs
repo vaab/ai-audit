@@ -86,6 +86,7 @@ pub fn run(
             cache: !no_cache,
             server_url: None,
             password: None,
+            directory: None,
         };
 
         // Streaming callback for live display (when not quiet)
