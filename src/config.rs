@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
+use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -22,6 +23,10 @@ pub struct Config {
     /// Compiled path rules
     #[serde(skip)]
     path_rules: Vec<PathRule>,
+
+    /// Provider-specific config blocks parsed lazily by providers.
+    #[serde(flatten, default)]
+    pub provider_blocks: HashMap<String, Value>,
 }
 
 impl Config {
@@ -90,6 +95,10 @@ impl Config {
         &self.path_rules
     }
 
+    pub fn provider_block(&self, key: &str) -> Option<&Value> {
+        self.provider_blocks.get(key)
+    }
+
     /// Simplify a project path using configured rules
     /// Example: /home/user/dev/rs/ai-audit -> rs/ai-audit
     pub fn simplify_path(&self, path: &str) -> String {
@@ -143,6 +152,7 @@ impl Config {
         Ok(Self {
             path_rules_raw: Vec::new(),
             path_rules: compiled_rules,
+            provider_blocks: HashMap::new(),
         })
     }
 }
@@ -150,6 +160,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn test_simplify_path_chained_rules() {
@@ -211,5 +222,38 @@ mod tests {
 
         let path = format!("{}/dev/project", home.display());
         assert_eq!(config.simplify_path(&path), "DEV>project");
+    }
+
+    #[test]
+    fn test_parses_opencode_server_block() {
+        let config: Config = serde_yaml::from_str(indoc! {"
+            opencode-server:
+              url: http://127.0.0.1:4096
+              password: hunter2
+        "})
+        .unwrap();
+
+        let block = config.provider_block("opencode-server").unwrap();
+        assert_eq!(block["url"].as_str(), Some("http://127.0.0.1:4096"));
+        assert_eq!(block["password"].as_str(), Some("hunter2"));
+    }
+
+    #[test]
+    fn test_missing_provider_block_returns_none() {
+        let config: Config = serde_yaml::from_str("").unwrap();
+        assert!(config.provider_block("opencode-server").is_none());
+    }
+
+    #[test]
+    fn test_partial_provider_block_keeps_missing_fields_none() {
+        let config: Config = serde_yaml::from_str(indoc! {"
+            opencode-server:
+              url: http://127.0.0.1:4096
+        "})
+        .unwrap();
+
+        let block = config.provider_block("opencode-server").unwrap();
+        assert_eq!(block["url"].as_str(), Some("http://127.0.0.1:4096"));
+        assert!(block.get("password").is_none());
     }
 }

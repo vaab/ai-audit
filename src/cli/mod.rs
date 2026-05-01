@@ -2,7 +2,7 @@
 
 mod action;
 pub(crate) mod color;
-mod def;
+pub(crate) mod def;
 
 pub use def::{Args, Commands};
 

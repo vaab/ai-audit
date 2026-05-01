@@ -5,10 +5,11 @@ mod last_session;
 mod list_sessions;
 mod permissions;
 mod rate;
+mod session;
 mod transcript;
 mod usage;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use super::def::Commands;
 
@@ -28,7 +29,14 @@ fn resolve_session(explicit: Option<String>) -> Result<String> {
     }
 }
 
-pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
+pub(super) fn require_opencode_for(feature: &str) -> Result<()> {
+    Err(anyhow!(
+        "not implemented for claudecode (only opencode is supported for {} features)",
+        feature
+    ))
+}
+
+pub fn dispatch(cmd: Commands, quiet: bool, verbose: u8) -> Result<()> {
     match cmd {
         Commands::Permissions { session, output } => permissions::run(&session, output.format()),
         Commands::ListSessions {
@@ -40,6 +48,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             file,
             all,
             children_of,
+            status,
             output,
         } => list_sessions::run(
             session_type,
@@ -50,6 +59,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             file.as_deref(),
             all,
             children_of.as_deref(),
+            &status,
             output.format(),
             quiet,
         ),
@@ -60,13 +70,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             output,
         } => {
             let session_id = resolve_session(session)?;
-            transcript::run(
-                &session_id,
-                last,
-                file.as_deref(),
-                output.format(),
-                _verbose,
-            )
+            transcript::run(&session_id, last, file.as_deref(), output.format(), verbose)
         }
         Commands::CurrentSession {
             r#match,
@@ -80,7 +84,6 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
                 super::def::SessionType::ClaudeCode => crate::provider::Provider::ClaudeCode,
             });
             let detected = if let Some(needle) = r#match {
-                // Match-based detection: search recent messages for the given text
                 crate::session_detect::find_session_by_match(
                     &crate::session_detect::MatchOptions {
                         needle,
@@ -90,11 +93,9 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
                     },
                 )?
             } else {
-                // Standard auto-detection (env vars, process tree, tmux pane matching)
                 crate::session_detect::detect_current_session()?
             };
-            let format = output.format();
-            match format {
+            match output.format() {
                 crate::OutputFormat::Json => {
                     println!(
                         "{}",
@@ -119,6 +120,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             output,
         } => last_session::run(session_type, scrollback_file, output.format()),
         Commands::Activity { action } => activity::run(action),
+        Commands::Session { action } => session::run(action),
         Commands::Rate {
             instruction,
             test,
@@ -144,12 +146,14 @@ pub fn dispatch(cmd: Commands, quiet: bool, _verbose: u8) -> Result<()> {
             session_type,
             timespan,
             project,
+            status,
             output,
         } => usage::run(
             session,
             session_type,
             timespan.as_deref(),
             project.as_deref(),
+            &status,
             output.format(),
             quiet,
         ),

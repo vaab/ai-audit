@@ -22,7 +22,7 @@ pub struct Args {
 }
 
 /// Session type filter
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SessionType {
     /// Claude Code sessions
     #[value(name = "claudecode")]
@@ -30,6 +30,30 @@ pub enum SessionType {
     /// OpenCode sessions
     #[value(name = "opencode")]
     OpenCode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum StaticStatusArg {
+    #[value(name = "completed")]
+    Completed,
+    #[value(name = "user-pending")]
+    UserPending,
+    #[value(name = "assistant-empty")]
+    AssistantEmpty,
+    #[value(name = "assistant-partial")]
+    AssistantPartial,
+    #[value(name = "assistant-tool-stuck")]
+    AssistantToolStuck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LiveStatusArg {
+    #[value(name = "running")]
+    Running,
+    #[value(name = "idle")]
+    Idle,
+    #[value(name = "server-unreachable")]
+    ServerUnreachable,
 }
 
 /// Output format options (mutually exclusive)
@@ -56,6 +80,108 @@ impl OutputOpts {
             OutputFormat::Human
         }
     }
+}
+
+#[derive(ClapArgs, Debug, Default, Clone)]
+pub struct SessionStatusOpts {
+    /// Filter by static status values (comma-separated)
+    #[arg(
+        long = "status",
+        alias = "filter-by-static-status",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub status: Option<Vec<StaticStatusArg>>,
+
+    /// Shorthand for the resumable static status set
+    #[arg(long)]
+    pub resumable: bool,
+
+    /// Filter by last message timestamp timespan
+    #[arg(long = "last-message-in")]
+    pub last_message_in: Option<String>,
+
+    /// Include live status in output
+    #[arg(long = "output-live-status")]
+    pub output_live_status: bool,
+
+    /// Filter by live status values (comma-separated)
+    #[arg(long = "filter-by-live-status", value_enum, value_delimiter = ',')]
+    pub live_status: Option<Vec<LiveStatusArg>>,
+
+    /// OpenCode server URL
+    #[arg(long = "server-url")]
+    pub server_url: Option<String>,
+
+    /// OpenCode server password
+    #[arg(long = "server-password", hide = true)]
+    pub server_password: Option<String>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+#[command(group = ArgGroup::new("session-target").required(true).args(["session", "all"]))]
+pub struct SessionNudgeArgs {
+    /// Session ID to nudge
+    pub session: Option<String>,
+
+    /// Filter by project path
+    #[arg(short, long)]
+    pub project: Option<String>,
+
+    /// Only nudge sessions containing a message matching this string
+    #[arg(short, long)]
+    pub search: Option<String>,
+
+    /// Filter by last message timestamp timespan
+    #[arg(long = "last-message-in")]
+    pub last_message_in: Option<String>,
+
+    /// Filter by static status values (comma-separated)
+    #[arg(
+        long = "status",
+        alias = "filter-by-static-status",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub status: Option<Vec<StaticStatusArg>>,
+
+    /// Nudge all sessions matching filters
+    #[arg(long)]
+    pub all: bool,
+
+    /// Show the nudge plan without posting prompts
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// OpenCode server URL
+    #[arg(long = "server-url")]
+    pub server_url: Option<String>,
+
+    /// OpenCode server password
+    #[arg(long = "server-password", hide = true)]
+    pub server_password: Option<String>,
+
+    /// Prompt to post as the nudge user message
+    #[arg(long = "continue-prompt", default_value = "continue")]
+    pub continue_prompt: String,
+
+    /// Allow nudging sessions whose project directories no longer exist
+    #[arg(long = "allow-revive-orphan-sessions")]
+    pub allow_revive_orphan_sessions: bool,
+
+    /// Also nudge sessions that are already running
+    #[arg(long = "force-nudge-already-running")]
+    pub force_nudge_already_running: bool,
+
+    /// Maximum concurrent prompt_async requests
+    #[arg(long, default_value_t = 10)]
+    pub concurrency: usize,
+}
+
+#[derive(Subcommand)]
+pub enum SessionAction {
+    /// Nudge resumable OpenCode sessions
+    Nudge(SessionNudgeArgs),
 }
 
 #[derive(Subcommand)]
@@ -101,6 +227,9 @@ pub enum Commands {
         /// List only sub-sessions of this parent session ID
         #[arg(long)]
         children_of: Option<String>,
+
+        #[command(flatten)]
+        status: SessionStatusOpts,
 
         #[command(flatten)]
         output: OutputOpts,
@@ -163,6 +292,11 @@ pub enum Commands {
         #[command(flatten)]
         output: OutputOpts,
     },
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// Show token usage for a session or across all sessions
     Usage {
         /// Session ID. If omitted, shows aggregated usage across all sessions.
@@ -179,6 +313,9 @@ pub enum Commands {
         /// Filter by project path
         #[arg(short, long)]
         project: Option<String>,
+
+        #[command(flatten)]
+        status: SessionStatusOpts,
 
         #[command(flatten)]
         output: OutputOpts,
@@ -220,8 +357,6 @@ pub enum Commands {
 
 impl Commands {
     /// Extract the output format from any command variant.
-    ///
-    /// Commands without output options (Activity, Rate) default to Human.
     pub fn output_format(&self) -> OutputFormat {
         match self {
             Commands::Permissions { output, .. }
@@ -230,12 +365,12 @@ impl Commands {
             | Commands::CurrentSession { output, .. }
             | Commands::LastSession { output, .. }
             | Commands::Usage { output, .. } => output.format(),
+            Commands::Session { .. } | Commands::Rate { .. } => OutputFormat::Human,
             Commands::Activity { action } => match action {
                 ActivityAction::List { output, .. } | ActivityAction::Get { output, .. } => {
                     output.format()
                 }
             },
-            Commands::Rate { .. } => OutputFormat::Human,
         }
     }
 }
@@ -263,4 +398,40 @@ pub enum ActivityAction {
         #[command(flatten)]
         output: OutputOpts,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn session_nudge_requires_target() {
+        assert!(Args::try_parse_from(["ai-audit", "session", "nudge"]).is_err());
+    }
+
+    #[test]
+    fn session_nudge_rejects_both_target_modes() {
+        assert!(Args::try_parse_from(["ai-audit", "session", "nudge", "ses_1", "--all"]).is_err());
+    }
+
+    #[test]
+    fn session_nudge_accepts_all_and_project() {
+        assert!(
+            Args::try_parse_from(["ai-audit", "session", "nudge", "--all", "-p", "/tmp/foo"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn session_nudge_accepts_force_running() {
+        assert!(Args::try_parse_from([
+            "ai-audit",
+            "session",
+            "nudge",
+            "--all",
+            "--force-nudge-already-running",
+        ])
+        .is_ok());
+    }
 }

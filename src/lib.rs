@@ -6,6 +6,7 @@ pub mod opencode;
 pub mod provider;
 pub mod rate;
 pub mod session_detect;
+pub mod session_filter;
 pub mod transcript;
 
 use std::path::PathBuf;

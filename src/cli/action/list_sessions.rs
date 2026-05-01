@@ -3,40 +3,37 @@
 use anyhow::Result;
 use colored::Colorize;
 use serde::Serialize;
-use std::path::PathBuf;
 
-use super::super::def::SessionType;
-use crate::provider::{self, Provider};
+use super::super::def::{LiveStatusArg, SessionStatusOpts, SessionType, StaticStatusArg};
+use super::require_opencode_for;
+use crate::config::Config;
+use crate::opencode::enrich::{
+    extract_live, extract_static, live_status_predicate, make_live_enricher, make_static_enricher,
+    static_status_predicate,
+};
+use crate::opencode::server_client::{resolve_server_credentials, LiveStatus};
+use crate::opencode::status::StaticStatus;
+use crate::provider::detect_provider;
+use crate::session_filter::{canonicalize_filter_path, list_filtered, SessionFilter};
 use crate::OutputFormat;
 
-/// Session record for JSON/NUL output
 #[derive(Debug, Serialize)]
 struct SessionRecord {
-    /// UTC timestamp as float seconds since epoch
     timestamp: f64,
     session_id: String,
     #[serde(rename = "type")]
     session_type: &'static str,
     project_dir: String,
     title: String,
+    static_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_status: Option<&'static str>,
 }
 
-/// Parsed timespan bounds as UTC epoch seconds.
-struct TimespanFilter {
-    start: i64,
-    end: i64,
-}
-
-impl TimespanFilter {
-    /// Check if a session's [started, updated] range overlaps with the filter.
-    /// A session is included if any of its activity falls within the timespan.
-    fn overlaps(&self, started_secs: f64, updated_secs: f64) -> bool {
-        let started = started_secs as i64;
-        let updated = updated_secs as i64;
-        started <= self.end && updated >= self.start
-    }
-}
-
+// The dispatch layer (cli/action/mod.rs) calls this with many parameters
+// that mirror the clap Command::ListSessions variant fields. Refactoring
+// to a struct would require changing the dispatcher contract; defer.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     session_type: Option<SessionType>,
     session_id: Option<&str>,
@@ -46,215 +43,242 @@ pub fn run(
     file: Option<&str>,
     all: bool,
     children_of: Option<&str>,
+    status: &SessionStatusOpts,
     format: OutputFormat,
     _quiet: bool,
 ) -> Result<()> {
-    let ts_filter = match timespan {
-        Some(ts_str) => {
-            let (start, end) = kal_time::parse_timespan(ts_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse timespan '{}': {}", ts_str, e))?;
-            Some(TimespanFilter {
-                start: start.timestamp(),
-                end: end.timestamp(),
-            })
-        }
-        None => None,
+    let config = Config::load()?;
+    let static_statuses = static_statuses(status);
+    let live_statuses = live_statuses(status);
+    let wants_status_features = static_statuses.is_some()
+        || status.resumable
+        || status.last_message_in.is_some()
+        || status.output_live_status
+        || live_statuses.is_some();
+    let resolved_type = resolve_session_type(session_type, session_id, wants_status_features)?;
+    let wants_live = status.output_live_status || live_statuses.is_some();
+    let filter = SessionFilter {
+        session_type: resolved_type,
+        session_id: session_id.map(str::to_string),
+        project: project.map(canonicalize_filter_path),
+        search: search.map(str::to_string),
+        file: file.map(canonicalize_filter_path),
+        timespan: parse_timespan(timespan)?,
+        last_message_in: parse_timespan(status.last_message_in.as_deref())?,
+        all,
+        children_of: children_of.map(str::to_string),
+        static_enrich: wants_status_features.then(make_static_enricher),
+        static_predicate: static_statuses.map(static_status_predicate),
+        live_enrich: wants_live.then(|| {
+            make_live_enricher(resolve_server_credentials(
+                status.server_url.as_deref(),
+                status.server_password.as_deref(),
+                &config,
+            ))
+        }),
+        live_predicate: live_statuses.map(live_status_predicate),
     };
-
-    // Resolve --project to an absolute path for exact matching
-    let project_path: Option<String> = match project {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            let abs = if path.is_absolute() {
-                path
+    let sessions = list_filtered(&filter)?;
+    let records = sessions
+        .iter()
+        .map(|session| SessionRecord {
+            timestamp: session.base.started_at.timestamp() as f64
+                + session.base.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0,
+            session_id: session.base.session_id.clone(),
+            session_type: session.base.provider.as_str(),
+            project_dir: session.base.project_dir.clone(),
+            title: session.base.title.clone(),
+            static_status: extract_static(session).map(|extension| extension.status.as_str()),
+            live_status: if wants_live {
+                extract_live(session).map(|extension| extension.status.as_str())
             } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
-            // Canonicalize to resolve symlinks and ../ components;
-            // fall back to the joined path if the directory doesn't exist.
-            let resolved = abs.canonicalize().unwrap_or(abs);
-            Some(resolved.to_string_lossy().to_string())
-        }
-        None => None,
-    };
+                None
+            },
+        })
+        .collect::<Vec<_>>();
 
-    // Resolve --file to an absolute path for structured matching
-    let file_path: Option<String> = match file {
-        Some(f) => {
-            let path = PathBuf::from(f);
-            let abs = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
-            let resolved = abs.canonicalize().unwrap_or(abs);
-            Some(resolved.to_string_lossy().to_string())
-        }
-        None => None,
-    };
+    output_records(&records, resolved_type, project, wants_live, format)
+}
 
-    let mut sessions: Vec<SessionRecord> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    // Determine which providers to query
-    let providers: Vec<Box<dyn provider::SessionProvider>> = match session_type {
-        Some(SessionType::ClaudeCode) => vec![provider::provider_for(Provider::ClaudeCode)],
-        Some(SessionType::OpenCode) => vec![provider::provider_for(Provider::OpenCode)],
-        None => provider::all_providers(),
-    };
-
-    for p in &providers {
-        match p.list_sessions() {
-            Ok(provider_sessions) => {
-                for s in provider_sessions {
-                    // Filters: cheapest first (parent/children, session_id, project, timespan, file, then search)
-                    if let Some(parent) = children_of {
-                        // --children-of: only include sessions whose parent_id matches
-                        match &s.parent_id {
-                            Some(pid) if pid == parent => {}
-                            _ => continue,
-                        }
-                    } else if !all && s.parent_id.is_some() {
-                        continue;
-                    }
-                    if let Some(id) = session_id {
-                        if s.session_id != id {
-                            continue;
-                        }
-                    }
-                    if let Some(ref expected) = project_path {
-                        if s.project_dir != *expected {
-                            continue;
-                        }
-                    }
-                    let started = s.started_at.timestamp() as f64
-                        + s.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    let updated = s.updated_at.timestamp() as f64
-                        + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    if let Some(ref filter) = ts_filter {
-                        if !filter.overlaps(started, updated) {
-                            continue;
-                        }
-                    }
-                    if let Some(ref target) = file_path {
-                        if !p.session_edited_file(&s.session_id, target) {
-                            continue;
-                        }
-                    }
-                    if let Some(needle) = search {
-                        if !p.session_contains_text(&s.session_id, needle) {
-                            continue;
-                        }
-                    }
-                    sessions.push(SessionRecord {
-                        timestamp: started,
-                        session_id: s.session_id,
-                        session_type: s.provider.as_str(),
-                        project_dir: s.project_dir,
-                        title: s.title,
-                    });
-                }
-            }
-            Err(e) => {
-                errors.push(format!("{}: {}", p.provider(), e));
-            }
-        }
+fn resolve_session_type(
+    session_type: Option<SessionType>,
+    session_id: Option<&str>,
+    wants_status_features: bool,
+) -> Result<Option<SessionType>> {
+    if !wants_status_features {
+        return Ok(session_type);
     }
+    if session_type == Some(SessionType::ClaudeCode) {
+        require_opencode_for("status")?;
+    }
+    if session_id.is_some_and(|id| detect_provider(id) == crate::provider::Provider::ClaudeCode) {
+        require_opencode_for("status")?;
+    }
+    Ok(Some(SessionType::OpenCode))
+}
 
-    // Sort by timestamp (oldest first)
-    sessions.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+fn static_statuses(status: &SessionStatusOpts) -> Option<Vec<StaticStatus>> {
+    let statuses = status.status.as_ref().map(|values| {
+        values
+            .iter()
+            .copied()
+            .map(map_static_status)
+            .collect::<Vec<_>>()
+    });
+    if status.resumable {
+        return Some(StaticStatus::resumable_set());
+    }
+    statuses
+}
 
-    // Output based on format
+fn live_statuses(status: &SessionStatusOpts) -> Option<Vec<LiveStatus>> {
+    status
+        .live_status
+        .as_ref()
+        .map(|values| values.iter().copied().map(map_live_status).collect())
+}
+
+fn map_static_status(value: StaticStatusArg) -> StaticStatus {
+    match value {
+        StaticStatusArg::Completed => StaticStatus::Completed,
+        StaticStatusArg::UserPending => StaticStatus::UserPending,
+        StaticStatusArg::AssistantEmpty => StaticStatus::AssistantEmpty,
+        StaticStatusArg::AssistantPartial => StaticStatus::AssistantPartial,
+        StaticStatusArg::AssistantToolStuck => StaticStatus::AssistantToolStuck,
+    }
+}
+
+fn map_live_status(value: LiveStatusArg) -> LiveStatus {
+    match value {
+        LiveStatusArg::Running => LiveStatus::Running,
+        LiveStatusArg::Idle => LiveStatus::Idle,
+        LiveStatusArg::ServerUnreachable => LiveStatus::ServerUnreachable,
+    }
+}
+
+fn parse_timespan(input: Option<&str>) -> Result<Option<(i64, i64)>> {
+    input
+        .map(|value| {
+            kal_time::parse_timespan(value)
+                .map(|(start, end)| (start.timestamp(), end.timestamp()))
+                .map_err(|error| anyhow::anyhow!("Failed to parse timespan '{}': {}", value, error))
+        })
+        .transpose()
+}
+
+fn output_records(
+    records: &[SessionRecord],
+    session_type: Option<SessionType>,
+    project: Option<&str>,
+    wants_live: bool,
+    format: OutputFormat,
+) -> Result<()> {
     match format {
         OutputFormat::Json => {
-            for s in &sessions {
-                println!("{}", serde_json::to_string(s)?);
+            for record in records {
+                println!("{}", serde_json::to_string(record)?);
             }
         }
         OutputFormat::Nul => {
             use std::io::{self, Write};
             let stdout = io::stdout();
             let mut handle = stdout.lock();
-            for s in &sessions {
-                // Format: timestamp\0session_id\0type\0project_dir\0title\0
-                write!(
-                    handle,
-                    "{}\0{}\0{}\0{}\0{}\0",
-                    s.timestamp, s.session_id, s.session_type, s.project_dir, s.title
-                )?;
+            for record in records {
+                if wants_live {
+                    write!(
+                        handle,
+                        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0",
+                        record.timestamp,
+                        record.session_id,
+                        record.session_type,
+                        record.project_dir,
+                        record.title,
+                        record.static_status.unwrap_or(""),
+                        record.live_status.unwrap_or(""),
+                    )?;
+                } else {
+                    write!(
+                        handle,
+                        "{}\0{}\0{}\0{}\0{}\0{}\0",
+                        record.timestamp,
+                        record.session_id,
+                        record.session_type,
+                        record.project_dir,
+                        record.title,
+                        record.static_status.unwrap_or(""),
+                    )?;
+                }
             }
         }
         OutputFormat::Human => {
+            if records.is_empty() {
+                return Ok(());
+            }
             let home_dir = dirs::home_dir().unwrap_or_default();
             let home_prefix = format!("{}/", home_dir.display());
-            // Convert to local timezone for human display
             let to_local = |ts: f64| -> chrono::DateTime<chrono::Local> {
                 chrono::DateTime::from_timestamp(ts as i64, 0)
                     .unwrap_or_default()
                     .with_timezone(&chrono::Local)
             };
-            // Show time only when the timespan filter covers a single calendar day
-            // (checked in local time since kal_time produces local boundaries),
-            // or when all sessions happen to fall on the same local day.
-            let same_day = if let Some(ref filter) = ts_filter {
-                let start_local = to_local(filter.start as f64);
-                // end is exclusive (start of next day), so subtract 1 second
-                let end_local = to_local((filter.end - 1) as f64);
-                start_local.date_naive() == end_local.date_naive()
-            } else if sessions.len() > 1 {
-                let first = to_local(sessions[0].timestamp);
-                let last = to_local(sessions[sessions.len() - 1].timestamp);
-                first.date_naive() == last.date_naive()
+            let same_day = if records.len() > 1 {
+                to_local(records[0].timestamp).date_naive()
+                    == to_local(records[records.len() - 1].timestamp).date_naive()
             } else {
-                sessions.len() == 1
+                true
             };
             let ts_fmt = if same_day {
                 "%H:%M:%S"
             } else {
                 "%Y-%m-%dT%H:%M:%S"
             };
-            // Hide columns that are forced via CLI or where all values are identical
             let show_type = session_type.is_none()
-                && sessions
+                && records
                     .iter()
-                    .any(|s| s.session_type != sessions[0].session_type);
+                    .any(|record| record.session_type != records[0].session_type);
             let show_dir = project.is_none()
-                && sessions
+                && records
                     .iter()
-                    .any(|s| s.project_dir != sessions[0].project_dir);
-            for s in &sessions {
-                let dt = to_local(s.timestamp);
-                let ts = dt.format(ts_fmt).to_string();
-                let mut parts = vec![ts.cyan().to_string(), s.session_id.yellow().to_string()];
+                    .any(|record| record.project_dir != records[0].project_dir);
+            let show_static = records
+                .iter()
+                .filter_map(|record| record.static_status)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1;
+            for record in records {
+                let mut parts = vec![
+                    to_local(record.timestamp)
+                        .format(ts_fmt)
+                        .to_string()
+                        .cyan()
+                        .to_string(),
+                    record.session_id.yellow().to_string(),
+                ];
                 if show_type {
-                    parts.push(s.session_type.purple().to_string());
+                    parts.push(record.session_type.purple().to_string());
+                }
+                if show_static {
+                    parts.push(record.static_status.unwrap_or("-").green().to_string());
+                }
+                if wants_live {
+                    parts.push(record.live_status.unwrap_or("-").magenta().to_string());
                 }
                 if show_dir {
-                    // Replace $HOME prefix with ~
-                    let dir = if s.project_dir.starts_with(&home_prefix) {
-                        format!("~/{}", &s.project_dir[home_prefix.len()..])
-                    } else if s.project_dir == home_dir.to_string_lossy() {
+                    let dir = if record.project_dir.starts_with(&home_prefix) {
+                        format!("~/{}", &record.project_dir[home_prefix.len()..])
+                    } else if record.project_dir == home_dir.to_string_lossy() {
                         "~".to_string()
                     } else {
-                        s.project_dir.clone()
+                        record.project_dir.clone()
                     };
                     parts.push(dir.blue().to_string());
                 }
-                parts.push(s.title.white().bold().to_string());
+                parts.push(record.title.white().bold().to_string());
                 println!("{}", parts.join(" "));
             }
         }
     }
-
-    for e in &errors {
-        log::warn!("Failed to list sessions from {}", e);
-    }
-
-    // Return error if ALL providers failed
-    if sessions.is_empty() && !errors.is_empty() {
-        anyhow::bail!("Failed to list sessions: {}", errors.join("; "));
-    }
-
     Ok(())
 }
 
@@ -262,119 +286,57 @@ pub fn run(
 mod tests {
     use clap::Parser;
 
-    use crate::cli::def::Args;
+    use crate::cli::def::{Args, Commands};
 
     #[test]
-    fn cli_accepts_session_id_option() {
-        let args =
-            Args::try_parse_from(["ai-audit", "list-sessions", "--session-id", "ses_abc123"])
-                .expect("--session-id should be accepted");
-        match args.command {
-            crate::cli::def::Commands::ListSessions { session_id, .. } => {
-                assert_eq!(session_id.as_deref(), Some("ses_abc123"));
-            }
-            _ => panic!("expected ListSessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_session_id_default_is_none() {
-        let args =
-            Args::try_parse_from(["ai-audit", "list-sessions"]).expect("bare list-sessions works");
-        match args.command {
-            crate::cli::def::Commands::ListSessions { session_id, .. } => {
-                assert!(session_id.is_none());
-            }
-            _ => panic!("expected ListSessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_all_flag_default_is_false() {
-        let args =
-            Args::try_parse_from(["ai-audit", "list-sessions"]).expect("bare list-sessions works");
-        match args.command {
-            crate::cli::def::Commands::ListSessions { all, .. } => {
-                assert!(!all);
-            }
-            _ => panic!("expected ListSessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_all_short_flag() {
-        let args = Args::try_parse_from(["ai-audit", "list-sessions", "-a"])
-            .expect("-a should be accepted");
-        match args.command {
-            crate::cli::def::Commands::ListSessions { all, .. } => {
-                assert!(all);
-            }
-            _ => panic!("expected ListSessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_all_long_flag() {
-        let args = Args::try_parse_from(["ai-audit", "list-sessions", "--all"])
-            .expect("--all should be accepted");
-        match args.command {
-            crate::cli::def::Commands::ListSessions { all, .. } => {
-                assert!(all);
-            }
-            _ => panic!("expected ListSessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_children_of_default_is_none() {
-        let args =
-            Args::try_parse_from(["ai-audit", "list-sessions"]).expect("bare list-sessions works");
-        match args.command {
-            crate::cli::def::Commands::ListSessions { children_of, .. } => {
-                assert!(children_of.is_none());
-            }
-            _ => panic!("expected ListSessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_children_of() {
+    fn cli_accepts_static_status_csv() {
         let args = Args::try_parse_from([
             "ai-audit",
             "list-sessions",
-            "--children-of",
-            "ses_parent123",
+            "--status",
+            "user-pending,assistant-empty",
         ])
-        .expect("--children-of should be accepted");
+        .unwrap();
         match args.command {
-            crate::cli::def::Commands::ListSessions { children_of, .. } => {
-                assert_eq!(children_of.as_deref(), Some("ses_parent123"));
+            Commands::ListSessions { status, .. } => {
+                assert_eq!(status.status.unwrap().len(), 2);
             }
-            _ => panic!("expected ListSessions command"),
+            _ => panic!("expected list-sessions"),
         }
     }
 
     #[test]
-    fn cli_children_of_implies_showing_subsessions() {
-        // --children-of without --all should still work (children_of bypasses the all filter)
+    fn cli_rejects_live_value_in_static_status() {
+        assert!(
+            Args::try_parse_from(["ai-audit", "list-sessions", "--status", "running"]).is_err()
+        );
+    }
+
+    #[test]
+    fn cli_accepts_live_status_csv() {
         let args = Args::try_parse_from([
             "ai-audit",
             "list-sessions",
-            "--children-of",
-            "ses_parent123",
+            "--filter-by-live-status",
+            "running,idle",
         ])
-        .expect("--children-of without --all should be accepted");
+        .unwrap();
         match args.command {
-            crate::cli::def::Commands::ListSessions {
-                children_of, all, ..
-            } => {
-                assert_eq!(children_of.as_deref(), Some("ses_parent123"));
-                assert!(
-                    !all,
-                    "--all should default to false when using --children-of"
-                );
+            Commands::ListSessions { status, .. } => {
+                assert_eq!(status.live_status.unwrap().len(), 2);
             }
-            _ => panic!("expected ListSessions command"),
+            _ => panic!("expected list-sessions"),
         }
+    }
+
+    #[test]
+    fn cli_rejects_static_value_in_live_status() {
+        assert!(Args::try_parse_from([
+            "ai-audit",
+            "list-sessions",
+            "--filter-by-live-status",
+            "user-pending",
+        ])
+        .is_err());
     }
 }

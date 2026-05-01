@@ -1,7 +1,12 @@
 pub mod cache;
+pub mod config;
 pub mod db;
+pub mod enrich;
+pub mod nudge;
 pub mod permissions;
 pub mod run;
+pub mod server_client;
+pub mod status;
 pub mod transcript;
 
 use anyhow::{Context, Result};

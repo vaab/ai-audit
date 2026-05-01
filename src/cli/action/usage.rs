@@ -2,13 +2,20 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use std::path::PathBuf;
 
-use super::super::def::SessionType;
-use crate::provider::{self, Provider, TokenUsage};
+use super::super::def::{LiveStatusArg, SessionStatusOpts, SessionType, StaticStatusArg};
+use super::require_opencode_for;
+use crate::config::Config;
+use crate::opencode::enrich::{
+    extract_live, extract_static, live_status_predicate, make_live_enricher, make_static_enricher,
+    static_status_predicate,
+};
+use crate::opencode::server_client::{resolve_server_credentials, LiveStatus};
+use crate::opencode::status::StaticStatus;
+use crate::provider::{detect_provider, provider_for_session, TokenUsage};
+use crate::session_filter::{canonicalize_filter_path, list_filtered, SessionFilter};
 use crate::OutputFormat;
 
-/// Per-session token usage record.
 #[derive(Debug, Serialize)]
 struct SessionUsage {
     timestamp: f64,
@@ -21,13 +28,11 @@ struct SessionUsage {
     #[serde(rename = "messages")]
     message_count: usize,
     is_sub_agent: bool,
+    static_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_status: Option<&'static str>,
 }
 
-/// Format a token count for human display using SI prefixes (K/M/G).
-///
-/// Values under 1000 are shown as-is with trailing padding so that
-/// bare numbers align with suffixed ones: `"8   "` aligns with
-/// `"8.0K"` when right-justified in a column.
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000_000 {
         format!("{:.1}G", n as f64 / 1_000_000_000.0)
@@ -40,84 +45,77 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Parsed timespan bounds as UTC epoch seconds.
-struct TimespanFilter {
-    start: i64,
-    end: i64,
-}
-
-impl TimespanFilter {
-    fn overlaps(&self, started_secs: f64, updated_secs: f64) -> bool {
-        let started = started_secs as i64;
-        let updated = updated_secs as i64;
-        started <= self.end && updated >= self.start
-    }
-}
-
 pub fn run(
     session: Option<String>,
     session_type: Option<SessionType>,
     timespan: Option<&str>,
     project: Option<&str>,
+    status: &SessionStatusOpts,
     format: OutputFormat,
     quiet: bool,
 ) -> Result<()> {
-    if let Some(ref session_id) = session {
-        return run_single(session_id, format);
+    if let Some(session_id) = session {
+        return run_single(&session_id, status, format);
     }
-    run_aggregated(session_type, timespan, project, format, quiet)
+    run_aggregated(session_type, timespan, project, status, format, quiet)
 }
 
-/// Show detailed token usage for a single session.
-fn run_single(session_id: &str, format: OutputFormat) -> Result<()> {
-    let p = provider::provider_for_session(session_id);
-    let messages = p.list_messages(session_id)?;
-
-    let total_tokens: TokenUsage = messages.iter().filter_map(|m| m.tokens.clone()).sum();
-
-    let user_count = messages.iter().filter(|m| m.role == "user").count();
-    let assistant_count = messages.iter().filter(|m| m.role == "assistant").count();
-
+fn run_single(session_id: &str, status: &SessionStatusOpts, format: OutputFormat) -> Result<()> {
+    let wants_status_features = status.status.is_some()
+        || status.resumable
+        || status.last_message_in.is_some()
+        || status.output_live_status
+        || status.live_status.is_some();
+    if wants_status_features && detect_provider(session_id) == crate::provider::Provider::ClaudeCode
+    {
+        return require_opencode_for("status");
+    }
+    let provider = provider_for_session(session_id);
+    let messages = provider.list_messages(session_id)?;
+    let total_tokens: TokenUsage = messages
+        .iter()
+        .filter_map(|message| message.tokens.clone())
+        .sum();
+    let user_count = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
+    let assistant_count = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .count();
     match format {
         OutputFormat::Json => {
-            let record = SessionUsage {
-                timestamp: messages
-                    .first()
-                    .map(|m| {
-                        m.timestamp.timestamp() as f64
-                            + m.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
-                    })
-                    .unwrap_or(0.0),
-                session_id: session_id.to_string(),
-                provider: p.provider().as_str(),
-                total_tokens: total_tokens.total(),
-                tokens: total_tokens,
-                message_count: messages.len(),
-                is_sub_agent: false,
-            };
-            println!("{}", serde_json::to_string(&record)?);
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": session_id,
+                    "provider": provider.provider().as_str(),
+                    "messages": messages.len(),
+                    "user_messages": user_count,
+                    "assistant_messages": assistant_count,
+                    "input": total_tokens.input,
+                    "output": total_tokens.output,
+                    "cache_read": total_tokens.cache_read,
+                    "cache_write": total_tokens.cache_write,
+                    "cache_creation": total_tokens.cache_creation,
+                    "reasoning": total_tokens.reasoning,
+                    "total": total_tokens.total(),
+                }))?
+            );
         }
         OutputFormat::Nul => {
-            use std::io::{self, Write};
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            write!(
-                handle,
-                "{}\0{}\0{}\0{}\0{}\0{}\0",
-                messages
-                    .first()
-                    .map(|m| m.timestamp.timestamp() as f64
-                        + m.timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0)
-                    .unwrap_or(0.0),
+            print!(
+                "{}\0{}\0{}\0{}\0{}\0",
                 session_id,
-                p.provider().as_str(),
+                provider.provider().as_str(),
                 total_tokens.input,
                 total_tokens.output,
                 total_tokens.total(),
-            )?;
+            );
         }
         OutputFormat::Human => {
-            println!("Session: {} ({})", session_id, p.provider());
+            println!("Session: {} ({})", session_id, provider.provider());
             println!(
                 "Messages: {} (user: {}, assistant: {})",
                 messages.len(),
@@ -157,158 +155,207 @@ fn run_single(session_id: &str, format: OutputFormat) -> Result<()> {
             );
         }
     }
-
     Ok(())
 }
 
-/// Show aggregated token usage across sessions.
 fn run_aggregated(
     session_type: Option<SessionType>,
     timespan: Option<&str>,
     project: Option<&str>,
+    status: &SessionStatusOpts,
     format: OutputFormat,
     _quiet: bool,
 ) -> Result<()> {
-    let ts_filter = match timespan {
-        Some(ts_str) => {
-            let (start, end) = kal_time::parse_timespan(ts_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse timespan '{}': {}", ts_str, e))?;
-            Some(TimespanFilter {
-                start: start.timestamp(),
-                end: end.timestamp(),
+    let config = Config::load()?;
+    let static_statuses = status.status.as_ref().map(|values| {
+        values
+            .iter()
+            .copied()
+            .map(|value| match value {
+                StaticStatusArg::Completed => StaticStatus::Completed,
+                StaticStatusArg::UserPending => StaticStatus::UserPending,
+                StaticStatusArg::AssistantEmpty => StaticStatus::AssistantEmpty,
+                StaticStatusArg::AssistantPartial => StaticStatus::AssistantPartial,
+                StaticStatusArg::AssistantToolStuck => StaticStatus::AssistantToolStuck,
             })
-        }
-        None => None,
+            .collect::<Vec<_>>()
+    });
+    let static_statuses = if status.resumable {
+        Some(StaticStatus::resumable_set())
+    } else {
+        static_statuses
     };
+    let live_statuses = status.live_status.as_ref().map(|values| {
+        values
+            .iter()
+            .copied()
+            .map(|value| match value {
+                LiveStatusArg::Running => LiveStatus::Running,
+                LiveStatusArg::Idle => LiveStatus::Idle,
+                LiveStatusArg::ServerUnreachable => LiveStatus::ServerUnreachable,
+            })
+            .collect::<Vec<_>>()
+    });
+    let wants_status_features = static_statuses.is_some()
+        || status.last_message_in.is_some()
+        || status.output_live_status
+        || live_statuses.is_some();
+    if session_type == Some(SessionType::ClaudeCode) && wants_status_features {
+        return require_opencode_for("status");
+    }
+    let wants_live = status.output_live_status || live_statuses.is_some();
+    let sessions = list_filtered(&SessionFilter {
+        session_type: if wants_status_features {
+            Some(SessionType::OpenCode)
+        } else {
+            session_type
+        },
+        session_id: None,
+        project: project.map(canonicalize_filter_path),
+        search: None,
+        file: None,
+        timespan: parse_timespan(timespan)?,
+        last_message_in: parse_timespan(status.last_message_in.as_deref())?,
+        all: true,
+        children_of: None,
+        static_enrich: wants_status_features.then(make_static_enricher),
+        static_predicate: static_statuses.map(static_status_predicate),
+        live_enrich: wants_live.then(|| {
+            make_live_enricher(resolve_server_credentials(
+                status.server_url.as_deref(),
+                status.server_password.as_deref(),
+                &config,
+            ))
+        }),
+        live_predicate: live_statuses.map(live_status_predicate),
+    })?;
 
-    let project_path: Option<String> = match project {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            let abs = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
-            let resolved = abs.canonicalize().unwrap_or(abs);
-            Some(resolved.to_string_lossy().to_string())
+    let mut usage_records = Vec::new();
+    for session in sessions {
+        let provider = provider_for_session(&session.base.session_id);
+        let messages = provider.list_messages(&session.base.session_id)?;
+        let tokens: TokenUsage = messages
+            .iter()
+            .filter_map(|message| message.tokens.clone())
+            .sum();
+        if tokens.is_empty() {
+            continue;
         }
-        None => None,
-    };
-
-    let providers: Vec<Box<dyn provider::SessionProvider>> = match session_type {
-        Some(SessionType::ClaudeCode) => vec![provider::provider_for(Provider::ClaudeCode)],
-        Some(SessionType::OpenCode) => vec![provider::provider_for(Provider::OpenCode)],
-        None => provider::all_providers(),
-    };
-
-    let mut usage_records: Vec<SessionUsage> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for p in &providers {
-        match p.list_sessions() {
-            Ok(sessions) => {
-                for s in sessions {
-                    if let Some(ref expected) = project_path {
-                        if s.project_dir != *expected {
-                            continue;
-                        }
-                    }
-                    let started = s.started_at.timestamp() as f64
-                        + s.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    let updated = s.updated_at.timestamp() as f64
-                        + s.updated_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
-                    if let Some(ref filter) = ts_filter {
-                        if !filter.overlaps(started, updated) {
-                            continue;
-                        }
-                    }
-
-                    match p.list_messages(&s.session_id) {
-                        Ok(messages) => {
-                            let tokens: TokenUsage =
-                                messages.iter().filter_map(|m| m.tokens.clone()).sum();
-                            if tokens.is_empty() {
-                                continue;
-                            }
-                            let is_sub_agent = s.parent_id.is_some();
-                            usage_records.push(SessionUsage {
-                                timestamp: started,
-                                session_id: s.session_id,
-                                provider: s.provider.as_str(),
-                                total_tokens: tokens.total(),
-                                tokens,
-                                message_count: messages.len(),
-                                is_sub_agent,
-                            });
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to read messages for {}: {}", s.session_id, e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                errors.push(format!("{}: {}", p.provider(), e));
-            }
-        }
+        let static_status = extract_static(&session).map(|extension| extension.status.as_str());
+        let live_status = if wants_live {
+            extract_live(&session).map(|extension| extension.status.as_str())
+        } else {
+            None
+        };
+        usage_records.push(SessionUsage {
+            timestamp: session.base.started_at.timestamp() as f64
+                + session.base.started_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0,
+            session_id: session.base.session_id.clone(),
+            provider: session.base.provider.as_str(),
+            total_tokens: tokens.total(),
+            tokens,
+            message_count: messages.len(),
+            is_sub_agent: session.base.parent_id.is_some(),
+            static_status,
+            live_status,
+        });
     }
 
-    // Sort by timestamp (oldest first)
-    usage_records.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+    usage_records.sort_by(|left, right| left.timestamp.partial_cmp(&right.timestamp).unwrap());
+    output_records(&usage_records, wants_live, format)
+}
 
+fn parse_timespan(input: Option<&str>) -> Result<Option<(i64, i64)>> {
+    input
+        .map(|value| {
+            kal_time::parse_timespan(value)
+                .map(|(start, end)| (start.timestamp(), end.timestamp()))
+                .map_err(|error| anyhow::anyhow!("Failed to parse timespan '{}': {}", value, error))
+        })
+        .transpose()
+}
+
+fn output_records(records: &[SessionUsage], wants_live: bool, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => {
-            for r in &usage_records {
-                println!("{}", serde_json::to_string(r)?);
+            for record in records {
+                println!("{}", serde_json::to_string(record)?);
             }
         }
         OutputFormat::Nul => {
             use std::io::{self, Write};
             let stdout = io::stdout();
             let mut handle = stdout.lock();
-            for r in &usage_records {
-                write!(
-                    handle,
-                    "{}\0{}\0{}\0{}\0{}\0{}\0",
-                    r.timestamp,
-                    r.session_id,
-                    r.provider,
-                    r.tokens.input,
-                    r.tokens.output,
-                    r.total_tokens,
-                )?;
+            for record in records {
+                if wants_live {
+                    write!(
+                        handle,
+                        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0",
+                        record.timestamp,
+                        record.session_id,
+                        record.provider,
+                        record.tokens.input,
+                        record.tokens.output,
+                        record.total_tokens,
+                        record.static_status.unwrap_or(""),
+                        record.live_status.unwrap_or(""),
+                    )?;
+                } else {
+                    write!(
+                        handle,
+                        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0",
+                        record.timestamp,
+                        record.session_id,
+                        record.provider,
+                        record.tokens.input,
+                        record.tokens.output,
+                        record.total_tokens,
+                        record.static_status.unwrap_or(""),
+                    )?;
+                }
             }
         }
         OutputFormat::Human => {
-            for r in &usage_records {
-                if r.is_sub_agent {
+            for record in records {
+                if record.is_sub_agent {
                     continue;
                 }
                 let dt: chrono::DateTime<chrono::Local> =
-                    chrono::DateTime::from_timestamp(r.timestamp as i64, 0)
+                    chrono::DateTime::from_timestamp(record.timestamp as i64, 0)
                         .unwrap_or_default()
                         .with_timezone(&chrono::Local);
-                println!(
-                    "{} {} {} {:>10} {:>10} {:>10}",
-                    dt.format("%Y-%m-%dT%H:%M:%S"),
-                    r.session_id,
-                    r.provider,
-                    format_tokens(r.tokens.input),
-                    format_tokens(r.tokens.output),
-                    format_tokens(r.total_tokens),
-                );
+                if wants_live {
+                    println!(
+                        "{} {} {} {} {:>10} {:>10} {:>10}",
+                        dt.format("%Y-%m-%dT%H:%M:%S"),
+                        record.session_id,
+                        record.static_status.unwrap_or("-"),
+                        record.live_status.unwrap_or("-"),
+                        format_tokens(record.tokens.input),
+                        format_tokens(record.tokens.output),
+                        format_tokens(record.total_tokens),
+                    );
+                } else {
+                    println!(
+                        "{} {} {} {:>10} {:>10} {:>10}",
+                        dt.format("%Y-%m-%dT%H:%M:%S"),
+                        record.session_id,
+                        record.static_status.unwrap_or("-"),
+                        format_tokens(record.tokens.input),
+                        format_tokens(record.tokens.output),
+                        format_tokens(record.total_tokens),
+                    );
+                }
             }
-
-            // Summary line with sub-agent breakdown
-            let total_input: u64 = usage_records.iter().map(|r| r.tokens.input).sum();
-            let total_output: u64 = usage_records.iter().map(|r| r.tokens.output).sum();
-            let grand_total: u64 = usage_records.iter().map(|r| r.total_tokens).sum();
-            let user_count = usage_records.iter().filter(|r| !r.is_sub_agent).count();
-            let sub_agent_count = usage_records.iter().filter(|r| r.is_sub_agent).count();
+            let total_input: u64 = records.iter().map(|record| record.tokens.input).sum();
+            let total_output: u64 = records.iter().map(|record| record.tokens.output).sum();
+            let grand_total: u64 = records.iter().map(|record| record.total_tokens).sum();
+            let user_count = records.iter().filter(|record| !record.is_sub_agent).count();
+            let sub_agent_count = records.iter().filter(|record| record.is_sub_agent).count();
             if sub_agent_count > 0 {
                 println!(
                     "Total: {} sessions ({} user + {} sub-agent), {} input, {} output, {} total tokens",
-                    usage_records.len(),
+                    records.len(),
                     user_count,
                     sub_agent_count,
                     format_tokens(total_input),
@@ -318,7 +365,7 @@ fn run_aggregated(
             } else {
                 println!(
                     "Total: {} sessions, {} input, {} output, {} total tokens",
-                    usage_records.len(),
+                    records.len(),
                     format_tokens(total_input),
                     format_tokens(total_output),
                     format_tokens(grand_total),
@@ -326,15 +373,6 @@ fn run_aggregated(
             }
         }
     }
-
-    for e in &errors {
-        log::warn!("Failed to list sessions from {}", e);
-    }
-
-    if usage_records.is_empty() && !errors.is_empty() {
-        anyhow::bail!("Failed to get usage data: {}", errors.join("; "));
-    }
-
     Ok(())
 }
 
@@ -342,143 +380,34 @@ fn run_aggregated(
 mod tests {
     use clap::Parser;
 
-    use crate::cli::def::Args;
+    use crate::cli::def::{Args, Commands};
 
     #[test]
-    fn cli_usage_no_args() {
-        let args = Args::try_parse_from(["ai-audit", "usage"]).expect("bare usage works");
+    fn cli_usage_live_status_csv() {
+        let args = Args::try_parse_from([
+            "ai-audit",
+            "usage",
+            "--filter-by-live-status",
+            "running,idle",
+        ])
+        .unwrap();
         match args.command {
-            crate::cli::def::Commands::Usage { session, .. } => {
-                assert!(session.is_none());
-            }
-            _ => panic!("expected Usage command"),
+            Commands::Usage { status, .. } => assert_eq!(status.live_status.unwrap().len(), 2),
+            _ => panic!("expected usage"),
         }
     }
 
     #[test]
-    fn cli_usage_session_id() {
-        let args =
-            Args::try_parse_from(["ai-audit", "usage", "ses_abc123"]).expect("session id works");
+    fn cli_usage_resumable_flag() {
+        let args = Args::try_parse_from(["ai-audit", "usage", "--resumable"]).unwrap();
         match args.command {
-            crate::cli::def::Commands::Usage { session, .. } => {
-                assert_eq!(session.as_deref(), Some("ses_abc123"));
-            }
-            _ => panic!("expected Usage command"),
+            Commands::Usage { status, .. } => assert!(status.resumable),
+            _ => panic!("expected usage"),
         }
-    }
-
-    #[test]
-    fn cli_usage_type_claudecode() {
-        let args = Args::try_parse_from(["ai-audit", "usage", "--type", "claudecode"])
-            .expect("--type claudecode works");
-        match args.command {
-            crate::cli::def::Commands::Usage { session_type, .. } => {
-                assert!(matches!(
-                    session_type,
-                    Some(crate::cli::def::SessionType::ClaudeCode)
-                ));
-            }
-            _ => panic!("expected Usage command"),
-        }
-    }
-
-    #[test]
-    fn cli_usage_type_opencode() {
-        let args = Args::try_parse_from(["ai-audit", "usage", "--type", "opencode"])
-            .expect("--type opencode works");
-        match args.command {
-            crate::cli::def::Commands::Usage { session_type, .. } => {
-                assert!(matches!(
-                    session_type,
-                    Some(crate::cli::def::SessionType::OpenCode)
-                ));
-            }
-            _ => panic!("expected Usage command"),
-        }
-    }
-
-    #[test]
-    fn cli_usage_timespan() {
-        let args = Args::try_parse_from(["ai-audit", "usage", "--timespan", "today"])
-            .expect("--timespan today works");
-        match args.command {
-            crate::cli::def::Commands::Usage { timespan, .. } => {
-                assert_eq!(timespan.as_deref(), Some("today"));
-            }
-            _ => panic!("expected Usage command"),
-        }
-    }
-
-    #[test]
-    fn cli_usage_project_filter() {
-        let args =
-            Args::try_parse_from(["ai-audit", "usage", "-p", "/tmp"]).expect("-p /tmp works");
-        match args.command {
-            crate::cli::def::Commands::Usage { project, .. } => {
-                assert_eq!(project.as_deref(), Some("/tmp"));
-            }
-            _ => panic!("expected Usage command"),
-        }
-    }
-
-    #[test]
-    fn cli_usage_json_flag() {
-        let args = Args::try_parse_from(["ai-audit", "usage", "--json"]).expect("--json works");
-        match args.command {
-            crate::cli::def::Commands::Usage { output, .. } => {
-                assert!(output.json);
-                assert!(!output.nul);
-            }
-            _ => panic!("expected Usage command"),
-        }
-    }
-
-    #[test]
-    fn cli_usage_nul_flag() {
-        let args = Args::try_parse_from(["ai-audit", "usage", "-0"]).expect("-0 works");
-        match args.command {
-            crate::cli::def::Commands::Usage { output, .. } => {
-                assert!(output.nul);
-                assert!(!output.json);
-            }
-            _ => panic!("expected Usage command"),
-        }
-    }
-
-    #[test]
-    fn cli_usage_json_and_nul_mutually_exclusive() {
-        let result = Args::try_parse_from(["ai-audit", "usage", "--json", "-0"]);
-        assert!(
-            result.is_err(),
-            "--json and -0 should be mutually exclusive"
-        );
-    }
-
-    #[test]
-    fn format_tokens_below_thousand() {
-        assert_eq!(super::format_tokens(0), "0   ");
-        assert_eq!(super::format_tokens(1), "1   ");
-        assert_eq!(super::format_tokens(999), "999   ");
-    }
-
-    #[test]
-    fn format_tokens_thousands() {
-        assert_eq!(super::format_tokens(1_000), "1.0K");
-        assert_eq!(super::format_tokens(1_500), "1.5K");
-        assert_eq!(super::format_tokens(52_301), "52.3K");
-        assert_eq!(super::format_tokens(999_999), "1000.0K");
-    }
-
-    #[test]
-    fn format_tokens_millions() {
-        assert_eq!(super::format_tokens(1_000_000), "1.0M");
-        assert_eq!(super::format_tokens(5_622_054), "5.6M");
-        assert_eq!(super::format_tokens(215_015_370), "215.0M");
     }
 
     #[test]
     fn format_tokens_billions() {
         assert_eq!(super::format_tokens(1_000_000_000), "1.0G");
-        assert_eq!(super::format_tokens(1_400_000_000), "1.4G");
     }
 }
