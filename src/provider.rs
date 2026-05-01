@@ -176,11 +176,134 @@ pub struct Message {
     /// Model used for this message (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// LLM provider id as reported by the harness — e.g.
+    /// `"anthropic"`, `"openai-codex"`.  Not always present:
+    /// Claude Code does not record this and it must be inferred
+    /// downstream when needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Harness agent name (OpenCode `agent`, Pi sub-agent label).
+    /// Diagnostic only — never appears in Git trailers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Harness mode (OpenCode `mode`).  Diagnostic only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// When this message was created.
     pub timestamp: DateTime<Utc>,
     /// Token usage (None for user messages, Some for assistant responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenUsage>,
+}
+
+/// Normalized model attribution for a session, suitable for both
+/// human-facing Git trailers and structured (JSON) consumers.
+///
+/// Construction rules — see [`SessionProvider::resolve_attribution`]:
+///
+/// * `model_id` is required.  Missing model metadata is a hard error,
+///   never a silent fallback.
+/// * `llm_provider` is optional; when it has to be inferred (Claude
+///   Code does not record one), `llm_provider_inferred` is `true`.
+/// * `access_surface` is the harness/CLI the human used (e.g.
+///   `"OpenCode"`, `"Pi"`, `"ClaudeCode"`).  Carried in JSON for
+///   debugging only — kernel-style trailers omit it.
+/// * `agent`, `mode`, `variant` are diagnostic-only.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelAttribution {
+    pub harness: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_provider: Option<String>,
+    pub llm_provider_inferred: bool,
+    pub model_id: String,
+    pub access_surface: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+}
+
+/// Map an `llm_provider` id (as reported by a harness, or inferred from
+/// a model id family) to the kernel-style brand name used as
+/// `AGENT_NAME` in the `Assisted-by:` trailer.
+///
+/// The kernel doc spec is:
+///   `Assisted-by: AGENT_NAME:MODEL_VERSION`
+/// where `AGENT_NAME` is the AI vendor brand (e.g. `Claude`, `GPT`),
+/// **not** the access harness.  See
+/// <https://www.kernel.org/doc/html/latest/process/coding-assistants.html>.
+///
+/// Unknown provider ids return `None` — callers must treat this as
+/// "cannot build a kernel-canonical trailer" and either error or
+/// degrade explicitly, never silently substitute the raw id.
+pub fn brand_for_llm_provider(llm_provider: &str) -> Option<&'static str> {
+    match llm_provider {
+        "anthropic" => Some("Claude"),
+        "openai" | "openai-codex" => Some("GPT"),
+        "google" | "gemini" => Some("Gemini"),
+        "xai" | "grok" => Some("Grok"),
+        "meta" | "llama" => Some("Llama"),
+        "mistral" => Some("Mistral"),
+        "deepseek" => Some("DeepSeek"),
+        _ => None,
+    }
+}
+
+/// Best-effort inference of the LLM provider id from a model id, used
+/// when the harness does not record an explicit provider field
+/// (Claude Code is the canonical case).
+///
+/// Returns `Some(provider_id)` only when the model id maps unambiguously
+/// to a known family.  Unknown families return `None` so the caller can
+/// fail loudly instead of inventing attribution.
+pub fn infer_llm_provider_from_model(model_id: &str) -> Option<&'static str> {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.starts_with("claude-") {
+        return Some("anthropic");
+    }
+    if lower.starts_with("gpt-") || lower.starts_with("o1-") || lower.starts_with("o3-") {
+        return Some("openai");
+    }
+    if lower.starts_with("gemini-") {
+        return Some("google");
+    }
+    if lower.starts_with("grok-") {
+        return Some("xai");
+    }
+    if lower.starts_with("llama-") || lower.starts_with("llama3") || lower.starts_with("llama4") {
+        return Some("meta");
+    }
+    None
+}
+
+impl ModelAttribution {
+    /// Render the kernel-canonical `Assisted-by:` trailer for this
+    /// attribution, e.g. `Assisted-by: Claude:claude-sonnet-4-5`.
+    ///
+    /// Returns an error when the LLM provider id is missing entirely,
+    /// or when it does not map to a known brand.  Both situations would
+    /// otherwise produce a non-canonical trailer; see
+    /// [`brand_for_llm_provider`] for the supported set.
+    pub fn trailer(&self) -> Result<String> {
+        let provider_id = self.llm_provider.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot build Assisted-by trailer: no llm_provider available \
+                     for model {:?} (harness={})",
+                self.model_id,
+                self.harness
+            )
+        })?;
+        let brand = brand_for_llm_provider(provider_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot build Assisted-by trailer: unknown llm_provider {:?} \
+                 (no brand mapping; teach `brand_for_llm_provider` if this is real)",
+                provider_id
+            )
+        })?;
+        Ok(format!("Assisted-by: {}:{}", brand, self.model_id))
+    }
 }
 
 /// Trait that each provider backend implements to supply session data.
@@ -212,6 +335,21 @@ pub trait SessionProvider {
     /// Returns messages in chronological order. Token data is present on
     /// assistant messages; user messages have `tokens: None`.
     fn list_messages(&self, session_id: &str) -> Result<Vec<Message>>;
+
+    /// Resolve attribution metadata for the most recent assistant
+    /// activity in this session — i.e. who/what wrote the code.
+    ///
+    /// Implementations should prefer authoritative provider/model fields
+    /// recorded by the harness on assistant messages.  Pi
+    /// implementations may consult `model_change` events when an
+    /// assistant message lacks the metadata.  Claude Code may infer the
+    /// LLM provider from the model id family (and must set
+    /// `llm_provider_inferred = true` when it does).
+    ///
+    /// Missing model metadata MUST return `Err`.  A Git hook needs to
+    /// know whether attribution is unknown — silent fallback to a
+    /// generic value is worse than no trailer at all.
+    fn resolve_attribution(&self, session_id: &str) -> Result<ModelAttribution>;
 }
 
 /// Get the provider adapter for a given session ID.
@@ -344,6 +482,159 @@ mod tests {
         assert_eq!(sum.cache_write, 44);
         assert_eq!(sum.cache_creation, 55);
         assert_eq!(sum.reasoning, 66);
+    }
+
+    #[test]
+    fn test_brand_for_llm_provider_known() {
+        assert_eq!(brand_for_llm_provider("anthropic"), Some("Claude"));
+        assert_eq!(brand_for_llm_provider("openai"), Some("GPT"));
+        assert_eq!(brand_for_llm_provider("openai-codex"), Some("GPT"));
+        assert_eq!(brand_for_llm_provider("google"), Some("Gemini"));
+        assert_eq!(brand_for_llm_provider("gemini"), Some("Gemini"));
+    }
+
+    #[test]
+    fn test_brand_for_llm_provider_unknown_returns_none() {
+        // The only acceptable answer for an unmapped provider is None,
+        // so callers MUST opt in by extending the table.  Silent
+        // fallback would generate non-canonical trailers.
+        assert_eq!(brand_for_llm_provider("nonsense-provider"), None);
+        assert_eq!(brand_for_llm_provider(""), None);
+    }
+
+    #[test]
+    fn test_infer_llm_provider_from_model() {
+        assert_eq!(
+            infer_llm_provider_from_model("claude-sonnet-4-5"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            infer_llm_provider_from_model("Claude-Opus-4-7"),
+            Some("anthropic")
+        );
+        assert_eq!(infer_llm_provider_from_model("gpt-5.5"), Some("openai"));
+        assert_eq!(infer_llm_provider_from_model("o1-preview"), Some("openai"));
+        assert_eq!(
+            infer_llm_provider_from_model("gemini-2.0-pro"),
+            Some("google")
+        );
+        assert_eq!(infer_llm_provider_from_model("unknown-model"), None);
+        assert_eq!(infer_llm_provider_from_model(""), None);
+    }
+
+    #[test]
+    fn test_model_attribution_trailer_anthropic() {
+        let attr = ModelAttribution {
+            harness: Provider::OpenCode,
+            llm_provider: Some("anthropic".to_string()),
+            llm_provider_inferred: false,
+            model_id: "claude-sonnet-4-5".to_string(),
+            access_surface: "OpenCode".to_string(),
+            agent: Some("build".to_string()),
+            mode: Some("build".to_string()),
+            variant: None,
+        };
+        assert_eq!(
+            attr.trailer().unwrap(),
+            "Assisted-by: Claude:claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn test_model_attribution_trailer_openai_codex() {
+        let attr = ModelAttribution {
+            harness: Provider::Pi,
+            llm_provider: Some("openai-codex".to_string()),
+            llm_provider_inferred: false,
+            model_id: "gpt-5.5".to_string(),
+            access_surface: "Pi".to_string(),
+            agent: None,
+            mode: None,
+            variant: None,
+        };
+        assert_eq!(attr.trailer().unwrap(), "Assisted-by: GPT:gpt-5.5");
+    }
+
+    #[test]
+    fn test_model_attribution_trailer_missing_provider_errors() {
+        let attr = ModelAttribution {
+            harness: Provider::Pi,
+            llm_provider: None,
+            llm_provider_inferred: false,
+            model_id: "gpt-5.5".to_string(),
+            access_surface: "Pi".to_string(),
+            agent: None,
+            mode: None,
+            variant: None,
+        };
+        assert!(attr.trailer().is_err());
+    }
+
+    #[test]
+    fn test_model_attribution_trailer_unknown_brand_errors() {
+        let attr = ModelAttribution {
+            harness: Provider::OpenCode,
+            llm_provider: Some("nonsense-provider".to_string()),
+            llm_provider_inferred: false,
+            model_id: "ns-1".to_string(),
+            access_surface: "OpenCode".to_string(),
+            agent: None,
+            mode: None,
+            variant: None,
+        };
+        let err = attr.trailer().unwrap_err().to_string();
+        assert!(err.contains("nonsense-provider"));
+        assert!(err.contains("brand_for_llm_provider"));
+    }
+
+    #[test]
+    fn test_model_attribution_json_shape_is_stable() {
+        // Hooks may parse this JSON with brittle scripts.  Lock the
+        // exact field set so accidental schema drift fails the build.
+        let attr = ModelAttribution {
+            harness: Provider::OpenCode,
+            llm_provider: Some("anthropic".to_string()),
+            llm_provider_inferred: false,
+            model_id: "claude-sonnet-4-5".to_string(),
+            access_surface: "OpenCode".to_string(),
+            agent: Some("build".to_string()),
+            mode: Some("build".to_string()),
+            variant: None,
+        };
+        let actual = serde_json::to_value(&attr).unwrap();
+        let actual_keys: std::collections::BTreeSet<&str> = actual
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let expected_keys: std::collections::BTreeSet<&str> = [
+            "harness",
+            "llm_provider",
+            "llm_provider_inferred",
+            "model_id",
+            "access_surface",
+            "agent",
+            "mode",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "ModelAttribution JSON shape changed — update doc/admin.org \
+             and hook fixtures before changing the schema. Got: {:?}",
+            actual
+        );
+        // NOTE: `Provider` derives serde with `rename_all = "snake_case"`,
+        // which produces `open_code` here.  The CLI action layer
+        // serialises via `Provider::as_str()` instead (yielding
+        // `opencode`), and that's what the user-facing JSON of
+        // `ai-audit assisted-by --json` shows.  This test simply pins
+        // the in-struct shape so refactors notice the divergence.
+        assert_eq!(actual["harness"], "open_code");
+        assert_eq!(actual["llm_provider"], "anthropic");
+        assert_eq!(actual["llm_provider_inferred"], false);
+        assert_eq!(actual["model_id"], "claude-sonnet-4-5");
     }
 
     #[test]

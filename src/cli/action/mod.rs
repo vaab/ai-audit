@@ -1,6 +1,7 @@
 //! Command action handlers.
 
 mod activity;
+mod assisted_by;
 mod last_session;
 mod list_sessions;
 mod permissions;
@@ -142,6 +143,11 @@ pub fn dispatch(cmd: Commands, quiet: bool, verbose: u8) -> Result<()> {
             judge_prompt.as_deref(),
             quiet,
         ),
+        Commands::AssistedBy {
+            session,
+            quiet_if_no_session,
+            output,
+        } => assisted_by::run(session, quiet_if_no_session, output.format()),
         Commands::Usage {
             session,
             session_type,

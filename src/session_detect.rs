@@ -866,59 +866,110 @@ pub fn find_session_by_match(opts: &MatchOptions) -> Result<DetectedSession> {
     }
 }
 
-/// Try to auto-detect the current session.
+/// Authoritative env-var → provider mapping.  Iteration order defines
+/// the canonical precedence for both [`detect_current_sessions`] and
+/// (via the singular wrapper) [`detect_current_session`].
 ///
-/// Strategy:
-/// 1. Check env vars `OPENCODE_SESSION_ID` / `CLAUDE_SESSION_ID` /
-///    `PI_SESSION_ID` (the latter is exported by the
-///    `pi-env-session-id` extension at session_start)
-/// 2. If in tmux → tmux scrollback fingerprinting
-/// 3. Otherwise bail with error
-pub fn detect_current_session() -> Result<DetectedSession> {
-    // Step 1: Check authoritative env vars
-    if let Ok(sid) = env::var("OPENCODE_SESSION_ID") {
-        if !sid.is_empty() {
-            log::debug!("detect_current_session: found OPENCODE_SESSION_ID={}", sid);
-            return Ok(DetectedSession {
-                session_id: sid,
-                provider: Provider::OpenCode,
-            });
-        }
-    }
-    if let Ok(sid) = env::var("CLAUDE_SESSION_ID") {
-        if !sid.is_empty() {
-            log::debug!("detect_current_session: found CLAUDE_SESSION_ID={}", sid);
-            return Ok(DetectedSession {
-                session_id: sid,
-                provider: Provider::ClaudeCode,
-            });
-        }
-    }
-    if let Ok(sid) = env::var("PI_SESSION_ID") {
-        if !sid.is_empty() {
-            log::debug!("detect_current_session: found PI_SESSION_ID={}", sid);
-            return Ok(DetectedSession {
-                session_id: sid,
-                provider: Provider::Pi,
-            });
+/// Precedence is OpenCode → Claude Code → pi.  This mirrors how the
+/// harnesses are typically nested in real shells: OpenCode is
+/// usually the outermost (long-lived terminal), pi is usually the
+/// innermost (one-shot bash invocations spawned by the assistant).
+/// Singular callers that have to pick exactly one will pick the
+/// outermost; multi-aware callers (e.g. `assisted-by`) see all of
+/// them.
+const SESSION_ENV_VARS: &[(&str, Provider)] = &[
+    ("OPENCODE_SESSION_ID", Provider::OpenCode),
+    ("CLAUDE_SESSION_ID", Provider::ClaudeCode),
+    ("PI_SESSION_ID", Provider::Pi),
+];
+
+/// Auto-detect *every* current AI session reachable from the current
+/// process environment.
+///
+/// Returns one [`DetectedSession`] per `*_SESSION_ID` env var that is
+/// set and non-empty, in canonical precedence order (see
+/// [`SESSION_ENV_VARS`]).  When no env var is set, falls back to tmux
+/// scrollback fingerprinting (which can only ever yield a single
+/// match by construction — one TUI per pane).
+///
+/// This is the multi-aware foundation; callers that need exactly one
+/// session should use [`detect_current_session`] which wraps this and
+/// errors on ambiguity.
+///
+/// **Why we need both**: contributions can be assisted by multiple
+/// stacked harnesses simultaneously (the realistic case is
+/// `pi`-spawned-by-OpenCode, where both `OPENCODE_SESSION_ID` and
+/// `PI_SESSION_ID` are inherited by the commit-msg hook).  The
+/// kernel `Assisted-by:` policy supports multiple trailers, so for
+/// attribution we want all of them; for `transcript`, `permissions`,
+/// etc. we still need a single unambiguous answer.
+pub fn detect_current_sessions() -> Result<Vec<DetectedSession>> {
+    let mut found: Vec<DetectedSession> = Vec::new();
+    for (var, provider) in SESSION_ENV_VARS {
+        if let Ok(sid) = env::var(var) {
+            if !sid.is_empty() {
+                log::debug!("detect_current_sessions: found {}={}", var, sid);
+                found.push(DetectedSession {
+                    session_id: sid,
+                    provider: *provider,
+                });
+            }
         }
     }
 
-    // Step 2: Try tmux scrollback fingerprinting
+    if !found.is_empty() {
+        return Ok(found);
+    }
+
+    // No env vars set — fall back to tmux scrollback fingerprinting.
+    // By construction this can only produce a single match (a tmux
+    // pane shows exactly one TUI at a time), so the result list has
+    // length 0 or 1.
     #[cfg(unix)]
     if is_tmux_available() {
-        log::debug!("detect_current_session: tmux available, trying fingerprinting");
+        log::debug!("detect_current_sessions: tmux available, trying fingerprinting");
         if let Some(result) = detect_last_session_via_tmux(None) {
-            return Ok(result);
+            return Ok(vec![result]);
         }
     }
 
-    // Step 3: No detection possible
     bail!(
         "Could not detect current session.\n\
          Set OPENCODE_SESSION_ID, CLAUDE_SESSION_ID, or PI_SESSION_ID, \
          or run inside tmux for scrollback fingerprinting."
     );
+}
+
+/// Auto-detect the current session, requiring exactly one match.
+///
+/// Built on [`detect_current_sessions`].  When several env vars are
+/// set simultaneously (e.g. pi spawned from inside OpenCode inherits
+/// both `OPENCODE_SESSION_ID` and `PI_SESSION_ID`), this returns an
+/// error rather than silently picking one — silent precedence picks
+/// the outermost harness, which is rarely what a single-session
+/// caller wants.  Callers must then either use a multi-aware code
+/// path (see `assisted-by`) or pass `--session ID` explicitly.
+pub fn detect_current_session() -> Result<DetectedSession> {
+    let mut all = detect_current_sessions()?;
+    match all.len() {
+        0 => unreachable!("detect_current_sessions returns Err on empty"),
+        1 => Ok(all.remove(0)),
+        _ => {
+            let listing = all
+                .iter()
+                .map(|s| format!("  {} ({})", s.session_id, s.provider.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "Multiple AI sessions detected in this environment:\n{}\n\n\
+                 This command needs exactly one. Pass --session <ID> to pick \
+                 the right one, or unset the unwanted *_SESSION_ID env \
+                 vars. (For Assisted-by trailers, `ai-audit assisted-by` \
+                 handles multiple sessions natively.)",
+                listing
+            );
+        }
+    }
 }
 
 /// Detect the last AI session used in the current tmux pane.
@@ -1556,5 +1607,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── detect_current_sessions / detect_current_session ─────────────
+    //
+    // These tests mutate process env vars and therefore must run
+    // serially.  We use a shared `Mutex` to enforce that, and
+    // carefully clean up in each test so leftover state cannot leak
+    // into other tests.  The unsafe is required because `env::set_var`
+    // is `unsafe` since Rust 1.84.
+    use std::sync::Mutex;
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Clear all `*_SESSION_ID` env vars.  Call at the top of every
+    /// detection test before setting the ones the test cares about.
+    fn clear_session_env() {
+        for (var, _) in SESSION_ENV_VARS {
+            // SAFETY: tests holding ENV_GUARD are serialised, so we
+            // are the only writer to these vars.
+            unsafe { env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn test_detect_current_sessions_single_env_var() {
+        let _g = ENV_GUARD.lock().unwrap();
+        clear_session_env();
+        unsafe { env::set_var("PI_SESSION_ID", "019dddbf-6e66-7709-9a3b-b5a18736f890") };
+
+        let found = detect_current_sessions().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].provider, Provider::Pi);
+        assert_eq!(found[0].session_id, "019dddbf-6e66-7709-9a3b-b5a18736f890");
+
+        clear_session_env();
+    }
+
+    #[test]
+    fn test_detect_current_sessions_returns_all_set_vars_in_priority_order() {
+        // The realistic case: pi spawned from inside OpenCode.  Both
+        // env vars are inherited by child processes; both should
+        // surface here, in the canonical priority order.
+        let _g = ENV_GUARD.lock().unwrap();
+        clear_session_env();
+        unsafe { env::set_var("OPENCODE_SESSION_ID", "ses_outer") };
+        unsafe { env::set_var("PI_SESSION_ID", "019dddbf-6e66-7709-9a3b-b5a18736f890") };
+
+        let found = detect_current_sessions().unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].provider, Provider::OpenCode);
+        assert_eq!(found[0].session_id, "ses_outer");
+        assert_eq!(found[1].provider, Provider::Pi);
+
+        clear_session_env();
+    }
+
+    #[test]
+    fn test_detect_current_sessions_ignores_empty_string() {
+        // A var set to "" is conventionally "unset" in shell pipelines;
+        // detection must not treat it as a real session id.
+        let _g = ENV_GUARD.lock().unwrap();
+        clear_session_env();
+        unsafe { env::set_var("OPENCODE_SESSION_ID", "") };
+        unsafe { env::set_var("PI_SESSION_ID", "019dddbf-6e66-7709-9a3b-b5a18736f890") };
+
+        let found = detect_current_sessions().unwrap();
+        assert_eq!(found.len(), 1, "empty OPENCODE_SESSION_ID must be skipped");
+        assert_eq!(found[0].provider, Provider::Pi);
+
+        clear_session_env();
+    }
+
+    #[test]
+    fn test_detect_current_session_errors_on_ambiguity() {
+        // Singular caller must NOT silently pick the outermost when
+        // multiple env vars are set — that's wrong attribution for
+        // commit trailers and equally wrong as a session-detection
+        // default.  The error must list every candidate so the user
+        // can pick.
+        let _g = ENV_GUARD.lock().unwrap();
+        clear_session_env();
+        unsafe { env::set_var("OPENCODE_SESSION_ID", "ses_outer") };
+        unsafe { env::set_var("PI_SESSION_ID", "019dddbf-6e66-7709-9a3b-b5a18736f890") };
+
+        let err = detect_current_session().expect_err("must error on ambiguity");
+        let msg = err.to_string();
+        assert!(msg.contains("Multiple AI sessions"), "got: {msg}");
+        assert!(msg.contains("ses_outer"), "got: {msg}");
+        assert!(msg.contains("019dddbf"), "got: {msg}");
+        assert!(msg.contains("--session"), "got: {msg}");
+
+        clear_session_env();
+    }
+
+    #[test]
+    fn test_detect_current_session_unambiguous() {
+        // With exactly one var set, the singular wrapper returns
+        // it cleanly.
+        let _g = ENV_GUARD.lock().unwrap();
+        clear_session_env();
+        unsafe { env::set_var("PI_SESSION_ID", "019dddbf-6e66-7709-9a3b-b5a18736f890") };
+
+        let detected = detect_current_session().unwrap();
+        assert_eq!(detected.provider, Provider::Pi);
+
+        clear_session_env();
     }
 }

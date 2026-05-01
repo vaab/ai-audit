@@ -537,8 +537,17 @@ pub fn parse_messages(content: &str, session_id: &str) -> Result<Vec<Message>> {
             _ => continue,
         };
 
+        // Pi assistant messages have used several shapes over time:
+        //   * current shape:  message.model     (string), message.provider (string)
+        //   * older shape:    message.modelID   (string), no provider field
+        // Read both so legacy fixtures and live sessions both work.
         let model = message
-            .get("modelID")
+            .get("model")
+            .and_then(|v| v.as_str())
+            .or_else(|| message.get("modelID").and_then(|v| v.as_str()))
+            .map(|s| s.to_string());
+        let provider_id = message
+            .get("provider")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -560,11 +569,75 @@ pub fn parse_messages(content: &str, session_id: &str) -> Result<Vec<Message>> {
             provider: Provider::Pi,
             role: role_str.to_string(),
             model,
+            provider_id,
+            agent: None,
+            mode: None,
             timestamp,
             tokens,
         });
     }
     Ok(messages)
+}
+
+/// A `model_change` event from a Pi session JSONL.
+///
+/// Pi emits these when the user switches models mid-session.  We use
+/// them as a fallback attribution source when the most recent assistant
+/// message itself lacks `provider` / `model` fields (legacy or partial
+/// shapes).
+#[derive(Debug, Clone)]
+pub struct ModelChangeEvent {
+    pub timestamp: DateTime<Utc>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Scan a Pi session JSONL stream for `model_change` events, in
+/// chronological order.  Lines that fail to parse or that are not
+/// `model_change` are skipped silently — this is the same lenient
+/// parsing used elsewhere for Pi.
+pub fn parse_model_changes(content: &str) -> Vec<ModelChangeEvent> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if entry.get("type").and_then(|v| v.as_str()) != Some("model_change") {
+            continue;
+        }
+        let Some(ts) = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        else {
+            continue;
+        };
+        out.push(ModelChangeEvent {
+            timestamp: ts.with_timezone(&Utc),
+            provider: entry
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            model: entry
+                .get("modelId")
+                .and_then(|v| v.as_str())
+                .or_else(|| entry.get("modelID").and_then(|v| v.as_str()))
+                .map(|s| s.to_string()),
+        });
+    }
+    out
+}
+
+/// Read the raw JSONL content of a Pi session by id.  Used by callers
+/// that need both messages and `model_change` events without parsing
+/// twice (e.g. attribution resolution).
+pub fn read_session_jsonl(session_id: &str) -> Result<String> {
+    let path = find_session_file(session_id).context("Session file not found")?;
+    fs::read_to_string(&path).context("Failed to read session file")
 }
 
 #[cfg(test)]
@@ -746,5 +819,50 @@ mod tests {
         "#};
         let msgs = parse_messages(jsonl, "ses").unwrap();
         assert_eq!(msgs.len(), 1);
+    }
+
+    // === Attribution-related parsing (acceptance tests for `assisted-by`) ===
+
+    #[test]
+    fn test_parse_messages_captures_current_pi_shape() {
+        // Current Pi assistant message: message.provider + message.model
+        let jsonl = indoc! {r#"
+            {"type":"session","version":3,"id":"x","timestamp":"2026-04-30T09:36:43Z","cwd":"/tmp"}
+            {"type":"message","id":"a1","timestamp":"2026-04-30T09:37:01Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.5","usage":{"input":1,"output":1}}}
+        "#};
+        let msgs = parse_messages(jsonl, "ses").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(msgs[0].provider_id.as_deref(), Some("openai-codex"));
+    }
+
+    #[test]
+    fn test_parse_messages_keeps_legacy_modelid_shape() {
+        // Legacy: only message.modelID, no provider field.
+        let jsonl = indoc! {r#"
+            {"type":"session","version":3,"id":"x","timestamp":"2026-04-30T09:36:43Z","cwd":"/tmp"}
+            {"type":"message","id":"a1","timestamp":"2026-04-30T09:37:01Z","message":{"role":"assistant","modelID":"gpt-5.5","usage":{"input":1,"output":1}}}
+        "#};
+        let msgs = parse_messages(jsonl, "ses").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].model.as_deref(), Some("gpt-5.5"));
+        assert!(msgs[0].provider_id.is_none());
+    }
+
+    #[test]
+    fn test_parse_model_changes_chronological() {
+        let jsonl = indoc! {r#"
+            {"type":"session","version":3,"id":"x","timestamp":"2026-04-30T09:36:43Z","cwd":"/tmp"}
+            {"type":"model_change","id":"m1","timestamp":"2026-04-30T09:36:44Z","provider":"anthropic","modelId":"claude-opus-4-7"}
+            {"type":"message","id":"u1","timestamp":"2026-04-30T09:36:50Z","message":{"role":"user","content":"hi"}}
+            {"type":"model_change","id":"m2","timestamp":"2026-04-30T09:37:30Z","provider":"openai-codex","modelId":"gpt-5.5"}
+        "#};
+        let events = parse_model_changes(jsonl);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(events[0].model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(events[1].provider.as_deref(), Some("openai-codex"));
+        assert_eq!(events[1].model.as_deref(), Some("gpt-5.5"));
+        assert!(events[0].timestamp <= events[1].timestamp);
     }
 }

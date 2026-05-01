@@ -323,6 +323,24 @@ pub enum Commands {
         #[command(flatten)]
         output: OutputOpts,
     },
+    /// Resolve the kernel-canonical Assisted-by trailer for a session
+    ///
+    /// Defaults to the auto-detected current session (same detection
+    /// path as `current-session`).  Use `--session` to bypass detection.
+    AssistedBy {
+        /// Session ID to resolve.  If omitted, auto-detects.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Exit 0 silently when no current session can be detected.
+        /// Useful for `commit-msg` hooks running in human shells where
+        /// missing AI context should not block the commit.
+        #[arg(long = "quiet-if-no-session")]
+        quiet_if_no_session: bool,
+
+        #[command(flatten)]
+        output: OutputOpts,
+    },
     /// Rate agent instructions against test cases
     Rate {
         /// Path to agent instruction file (system prompt)
@@ -367,7 +385,8 @@ impl Commands {
             | Commands::Transcript { output, .. }
             | Commands::CurrentSession { output, .. }
             | Commands::LastSession { output, .. }
-            | Commands::Usage { output, .. } => output.format(),
+            | Commands::Usage { output, .. }
+            | Commands::AssistedBy { output, .. } => output.format(),
             Commands::Session { .. } | Commands::Rate { .. } => OutputFormat::Human,
             Commands::Activity { action } => match action {
                 ActivityAction::List { output, .. } | ActivityAction::Get { output, .. } => {

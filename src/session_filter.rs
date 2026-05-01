@@ -257,9 +257,19 @@ mod tests {
                 provider: self.provider,
                 role: "assistant".to_string(),
                 model: None,
+                provider_id: None,
+                agent: None,
+                mode: None,
                 timestamp: Utc::now(),
                 tokens: Some(TokenUsage::default()),
             }])
+        }
+
+        fn resolve_attribution(
+            &self,
+            _session_id: &str,
+        ) -> Result<crate::provider::ModelAttribution> {
+            anyhow::bail!("FakeProvider does not implement resolve_attribution")
         }
     }
 

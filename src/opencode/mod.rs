@@ -15,7 +15,10 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::provider::{Message, Provider, Session, SessionProvider, TokenUsage};
+use crate::provider::{
+    brand_for_llm_provider, Message, ModelAttribution, Provider, Session, SessionProvider,
+    TokenUsage,
+};
 use crate::transcript::TranscriptEntry;
 
 /// OpenCode provider adapter.
@@ -61,6 +64,66 @@ impl SessionProvider for OpenCodeProvider {
     fn list_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         self::list_messages(session_id)
     }
+
+    fn resolve_attribution(&self, session_id: &str) -> Result<ModelAttribution> {
+        let messages = list_messages(session_id)?;
+        resolve_attribution_from_messages(&messages, session_id)
+    }
+}
+
+/// Build a [`ModelAttribution`] from a list of OpenCode messages.
+///
+/// Strategy: walk assistant messages newest-first, take the first one
+/// that carries a `modelID`.  Prefer that message's `providerID` for
+/// the LLM provider; if the message has no `providerID`, error out —
+/// OpenCode normally records both, so a missing provider field is a
+/// real anomaly we want to surface, not paper over.
+pub fn resolve_attribution_from_messages(
+    messages: &[Message],
+    session_id: &str,
+) -> Result<ModelAttribution> {
+    let msg = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && m.model.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no assistant message with a model id found in OpenCode session {}",
+                session_id
+            )
+        })?;
+    let model_id = msg
+        .model
+        .clone()
+        .expect("filtered for model.is_some() above");
+    let llm_provider = msg.provider_id.clone();
+    if let Some(ref pid) = llm_provider {
+        if brand_for_llm_provider(pid).is_none() {
+            anyhow::bail!(
+                "OpenCode session {} reports llm_provider {:?} which has no brand mapping; \
+                 teach `provider::brand_for_llm_provider` if this is a real provider",
+                session_id,
+                pid
+            );
+        }
+    } else {
+        anyhow::bail!(
+            "OpenCode session {} has model={:?} but no providerID — cannot build \
+             a kernel-canonical Assisted-by trailer",
+            session_id,
+            model_id
+        );
+    }
+    Ok(ModelAttribution {
+        harness: Provider::OpenCode,
+        llm_provider,
+        llm_provider_inferred: false,
+        model_id,
+        access_surface: "OpenCode".to_string(),
+        agent: msg.agent.clone(),
+        mode: msg.mode.clone(),
+        variant: None,
+    })
 }
 
 pub fn storage_dir() -> PathBuf {
@@ -520,7 +583,9 @@ fn parse_message_from_value(data: &serde_json::Value, session_id: &str) -> Optio
         .single()
         .unwrap_or_else(Utc::now);
 
-    // Model info: on assistant messages it's flat `modelID`, on user messages it's nested `model.modelID`
+    // Model info: on assistant messages it's flat `modelID`, on user
+    // messages it's nested under `model.modelID`.  Same dual shape for
+    // `providerID`.
     let model = data
         .get("modelID")
         .and_then(|v| v.as_str())
@@ -531,6 +596,25 @@ fn parse_message_from_value(data: &serde_json::Value, session_id: &str) -> Optio
         })
         .map(|s| s.to_string());
 
+    let provider_id = data
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data.get("model")
+                .and_then(|m| m.get("providerID"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string());
+
+    let agent = data
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mode = data
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let tokens = data.get("tokens").map(|t| parse_opencode_tokens(t));
 
     Some(Message {
@@ -539,6 +623,9 @@ fn parse_message_from_value(data: &serde_json::Value, session_id: &str) -> Optio
         provider: Provider::OpenCode,
         role: role.to_string(),
         model,
+        provider_id,
+        agent,
+        mode,
         timestamp,
         tokens,
     })
@@ -1410,5 +1497,109 @@ mod tests {
             "modelID": "claude-3-opus"
         });
         assert!(parse_message_from_value(&data, "ses_test").is_none());
+    }
+
+    // === Attribution-related parsing (acceptance tests for `assisted-by`) ===
+
+    #[test]
+    fn test_parse_message_from_value_captures_provider_id_and_agent() {
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_a",
+            "role": "assistant",
+            "time": {"created": 1705314600000_i64},
+            "modelID": "claude-sonnet-4-5",
+            "providerID": "anthropic",
+            "agent": "build",
+            "mode": "build",
+            "tokens": {"input": 10, "output": 5}
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        assert_eq!(msg.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(msg.provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(msg.agent.as_deref(), Some("build"));
+        assert_eq!(msg.mode.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn test_parse_message_from_value_captures_nested_provider_id() {
+        // OpenCode user-message shape: provider/model live nested under `model.{providerID,modelID}`.
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_u",
+            "role": "user",
+            "time": {"created": 1705314600000_i64},
+            "model": {"providerID": "anthropic", "modelID": "claude-sonnet-4-5"}
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        assert_eq!(msg.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(msg.provider_id.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn test_resolve_attribution_opencode_flat_provider_id() {
+        // Acceptance criterion: OpenCode fixture with `providerID` and
+        // `modelID` resolves a trailer.
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_a",
+            "role": "assistant",
+            "time": {"created": 1705314600000_i64},
+            "modelID": "claude-sonnet-4-5",
+            "providerID": "anthropic",
+            "agent": "build",
+            "mode": "build"
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        let attr = resolve_attribution_from_messages(&[msg], "ses_test").unwrap();
+        assert_eq!(attr.harness, Provider::OpenCode);
+        assert_eq!(attr.llm_provider.as_deref(), Some("anthropic"));
+        assert!(!attr.llm_provider_inferred);
+        assert_eq!(attr.model_id, "claude-sonnet-4-5");
+        assert_eq!(attr.agent.as_deref(), Some("build"));
+        assert_eq!(attr.mode.as_deref(), Some("build"));
+        assert_eq!(
+            attr.trailer().unwrap(),
+            "Assisted-by: Claude:claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn test_resolve_attribution_opencode_nested_provider_id() {
+        // Acceptance criterion: OpenCode fixture with nested
+        // `model.providerID` and `model.modelID` resolves the same
+        // structured fields.  We synthesise the assistant role on a
+        // user-shaped record so we can drive the resolver directly.
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_a",
+            "role": "assistant",
+            "time": {"created": 1705314600000_i64},
+            "model": {"providerID": "anthropic", "modelID": "claude-sonnet-4-5"}
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        let attr = resolve_attribution_from_messages(&[msg], "ses_test").unwrap();
+        assert_eq!(attr.llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(attr.model_id, "claude-sonnet-4-5");
+        assert_eq!(
+            attr.trailer().unwrap(),
+            "Assisted-by: Claude:claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn test_resolve_attribution_opencode_missing_provider_errors() {
+        // OpenCode session with a model id but no providerID anywhere
+        // — must error out, never substitute a generic value.
+        use serde_json::json;
+        let data = json!({
+            "id": "msg_a",
+            "role": "assistant",
+            "time": {"created": 1705314600000_i64},
+            "modelID": "claude-sonnet-4-5"
+        });
+        let msg = parse_message_from_value(&data, "ses_test").unwrap();
+        let err = resolve_attribution_from_messages(&[msg], "ses_test").expect_err("must error");
+        assert!(err.to_string().contains("providerID"));
     }
 }
