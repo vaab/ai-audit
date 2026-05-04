@@ -677,8 +677,14 @@ pub fn parse_claudecode_permissions(
     Ok(events)
 }
 
-/// Get project path from first entry in session file
-fn get_project_path_from_session(session_path: &Path, config: &Config) -> Result<String> {
+/// Get the raw (un-simplified) project working directory from the
+/// first JSONL entry that carries a `cwd` field.
+///
+/// Used by callers that need the real filesystem path (for example
+/// the `token-usage` action, which walks `.git` ancestors).  Most
+/// other callers want the display-simplified form — they should
+/// call [`get_project_path_from_session`] instead.
+pub fn get_project_cwd_raw(session_path: &Path) -> Result<String> {
     let file = fs::File::open(session_path)?;
     let reader = BufReader::new(file);
 
@@ -694,11 +700,17 @@ fn get_project_path_from_session(session_path: &Path, config: &Config) -> Result
         };
 
         if let Some(cwd) = entry.cwd {
-            return Ok(config.simplify_path(&cwd));
+            return Ok(cwd);
         }
     }
 
     anyhow::bail!("No cwd found in session file")
+}
+
+/// Get project path from first entry in session file (display-simplified).
+fn get_project_path_from_session(session_path: &Path, config: &Config) -> Result<String> {
+    let raw = get_project_cwd_raw(session_path)?;
+    Ok(config.simplify_path(&raw))
 }
 
 /// Try to infer project path from debug file path

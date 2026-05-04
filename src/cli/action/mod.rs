@@ -7,6 +7,7 @@ mod list_sessions;
 mod permissions;
 mod rate;
 mod session;
+mod token_usage;
 mod transcript;
 mod usage;
 
@@ -161,6 +162,27 @@ pub fn dispatch(cmd: Commands, quiet: bool, verbose: u8) -> Result<()> {
             &status,
             output.format(),
             quiet,
+        ),
+        Commands::TokenUsage {
+            timespan,
+            sessions,
+            projects,
+            session_type,
+            provider_ids,
+            models,
+            fields,
+            header,
+            output,
+        } => token_usage::run(
+            &timespan,
+            sessions,
+            projects,
+            session_type,
+            provider_ids,
+            models,
+            fields,
+            header,
+            output.format(),
         ),
     }
 }

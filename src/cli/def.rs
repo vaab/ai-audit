@@ -341,6 +341,51 @@ pub enum Commands {
         #[command(flatten)]
         output: OutputOpts,
     },
+    /// Per-message LLM token consumption events over a timespan
+    ///
+    /// Emits one record per assistant message that consumed tokens,
+    /// across all providers (claudecode, opencode, pi).  Filterable
+    /// by session, project (basename of `.git` ancestor), provider
+    /// harness, LLM provider id, and model substring.
+    TokenUsage {
+        /// Timespan to query (e.g., "today", "30m", "2025-01-01..2025-01-02")
+        timespan: String,
+
+        /// Filter by session ID(s) (can be repeated)
+        #[arg(short, long = "session")]
+        sessions: Vec<String>,
+
+        /// Filter by project name (basename of `.git` ancestor; can be repeated).
+        /// Use `--project=""` to match sessions outside any git repo.
+        #[arg(short = 'p', long = "project")]
+        projects: Vec<String>,
+
+        /// Filter by harness type (claudecode, opencode, pi)
+        #[arg(short = 't', long = "type")]
+        session_type: Option<SessionType>,
+
+        /// Filter by LLM provider id (e.g. "anthropic", "openai-codex"; can be repeated)
+        #[arg(long = "provider-id")]
+        provider_ids: Vec<String>,
+
+        /// Filter by model substring (case-insensitive; can be repeated)
+        #[arg(long = "model")]
+        models: Vec<String>,
+
+        /// Comma-separated list of fields to display (also repeatable).
+        /// Available: timestamp, session_id, provider, provider_id, model,
+        /// cwd, project_path, project, subpath,
+        /// input, output, cache_read, cache_write, cache_creation, reasoning, total
+        #[arg(long = "fields", short = 'f', value_delimiter = ',', action = clap::ArgAction::Append)]
+        fields: Option<Vec<String>>,
+
+        /// Print a header row (human mode only)
+        #[arg(long)]
+        header: bool,
+
+        #[command(flatten)]
+        output: OutputOpts,
+    },
     /// Rate agent instructions against test cases
     Rate {
         /// Path to agent instruction file (system prompt)
@@ -382,6 +427,7 @@ impl Commands {
             | Commands::CurrentSession { output, .. }
             | Commands::LastSession { output, .. }
             | Commands::Usage { output, .. }
+            | Commands::TokenUsage { output, .. }
             | Commands::AssistedBy { output, .. } => output.format(),
             Commands::Session { .. } | Commands::Rate { .. } => OutputFormat::Human,
             Commands::Activity { action } => match action {

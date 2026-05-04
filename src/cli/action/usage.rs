@@ -6,6 +6,7 @@ use serde::Serialize;
 use super::super::def::{LiveStatusArg, SessionStatusOpts, SessionType, StaticStatusArg};
 use super::require_opencode_for;
 use crate::config::Config;
+use crate::format::format_tokens;
 use crate::opencode::enrich::{
     extract_live, extract_static, live_status_predicate, make_live_enricher, make_static_enricher,
     static_status_predicate,
@@ -31,18 +32,6 @@ struct SessionUsage {
     static_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_status: Option<&'static str>,
-}
-
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.1}G", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        format!("{}   ", n)
-    }
 }
 
 pub fn run(

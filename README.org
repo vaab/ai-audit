@@ -132,6 +132,87 @@ OpenCode output shows tool calls with permission decisions:
 2026-01-20 01:49:03      ASK      bash         axdfguij
 #+end_example
 
+** Token Usage
+
+Per-message LLM token consumption events over a timespan, across all
+providers (claudecode, opencode, pi).  One record per assistant
+message that consumed tokens.
+
+#+begin_src bash
+# All token-consuming events today, default human columns
+ai-audit token-usage today
+
+# With column header row
+ai-audit token-usage today --header
+
+# JSON Lines (machine-parseable, all 16 fields)
+ai-audit token-usage today -j
+
+# NUL-separated records (xargs -0 friendly, all 16 fields)
+ai-audit token-usage today -0
+
+# Filter by project (basename of nearest .git ancestor)
+ai-audit token-usage today -p ai-audit
+
+# Sessions outside any git repo
+ai-audit token-usage today -p ""
+
+# Filter by harness, LLM provider id, or model substring
+ai-audit token-usage today -t pi --provider-id anthropic
+ai-audit token-usage 30m --model haiku
+
+# Restrict to specific sessions (repeatable)
+ai-audit token-usage today -s ses_abc -s ses_def
+
+# Custom field set (also repeatable)
+ai-audit token-usage today -f timestamp,project,total --header
+#+end_src
+
+*** Available fields
+
+For =--fields=:
+
+| Name             | Description                                                |
+|------------------+------------------------------------------------------------|
+| =timestamp=      | Message creation time (local in human, UTC float in -0/-j) |
+| =session_id=     | Full session id                                            |
+| =provider=       | Harness: =claudecode= / =opencode= / =pi=                  |
+| =provider_id=    | LLM provider id (=anthropic=, =openai-codex=, ...)         |
+| =model=          | Model id (e.g. =claude-sonnet-4-5=)                        |
+| =cwd=            | Full session working directory                             |
+| =project_path=   | Parent of =.git= ancestor (with =$HOME= → =~=); cwd if no .git |
+| =project=        | Basename of =.git= ancestor; empty if no .git              |
+| =subpath=        | cwd relative to =.git= ancestor; empty if cwd == ancestor  |
+| =input=          | Input tokens                                               |
+| =output=         | Output tokens                                              |
+| =cache_read=     | Tokens read from cache                                     |
+| =cache_write=    | Tokens written to cache (OpenCode-specific)                |
+| =cache_creation= | Cache-creation input tokens (Claude Code-specific)         |
+| =reasoning=      | Reasoning/thinking tokens                                  |
+| =total=          | Sum of all token fields                                    |
+
+Default human field set:
+=timestamp, project, session_id, model, input, output, cache_read, total=
+
+NUL/JSON without =--fields= emit all 16 fields per the cli-guidelines
+"complete info" rule for machine-parseable formats.
+
+*** Project derivation
+
+Given a session whose cwd is =/home/vaab/dev/rs/ai-audit/doc=, with a
+=.git= directory at =/home/vaab/dev/rs/ai-audit/=:
+
+| Field          | Value                              |
+|----------------+------------------------------------|
+| =cwd=          | =/home/vaab/dev/rs/ai-audit/doc=   |
+| =project_path= | =~/dev/rs=                         |
+| =project=      | =ai-audit=                         |
+| =subpath=      | =doc=                              |
+
+When no =.git= ancestor exists, =project= and =subpath= are empty,
+=project_path= falls back to =cwd= (with =$HOME= collapse), and =cwd=
+is unchanged.  Use =--project=""= to filter for these.
+
 * Output Formats
 
 ** Human-readable (default)
