@@ -358,10 +358,6 @@ pub enum Commands {
         #[arg(long)]
         judge_models: Option<String>,
 
-        /// Agent name for opencode (uses opencode default if not specified)
-        #[arg(long)]
-        agent_name: Option<String>,
-
         /// Timeout in seconds
         #[arg(long)]
         timeout: Option<u64>,

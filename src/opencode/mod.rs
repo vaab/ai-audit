@@ -1,10 +1,18 @@
+//! OpenCode forensic adapter (read-side only).
+//!
+//! This module reads opencode session state (DB, transcripts,
+//! permissions, etc.) for `ai-audit list-sessions`, `transcript`,
+//! `permissions`, etc.  It used to also expose a `run` submodule
+//! that *invoked* opencode — that has been replaced by
+//! [`crate::pi::run`] (see commit history for the migration
+//! rationale: hermetic LLM context, no AGENTS.md leakage).
+
 pub mod cache;
 pub mod config;
 pub mod db;
 pub mod enrich;
 pub mod nudge;
 pub mod permissions;
-pub mod run;
 pub mod server_client;
 pub mod status;
 pub mod transcript;

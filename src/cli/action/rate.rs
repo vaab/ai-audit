@@ -1,9 +1,21 @@
 //! Rate command handler.
+//!
+//! Runs the agent under test (via `pi`) with each requested model,
+//! captures the output, and judges the output against the test's
+//! checklist (also via `pi`, see [`crate::rate::invoke_judge`]).
+//!
+//! Both the agent and judge invocations go through
+//! [`crate::pi::run`] in hermetic mode — see that module for the
+//! sealing rationale (no AGENTS.md walking, no skills, no
+//! `~/.claude/CLAUDE.md`, etc.).  The harness contract is therefore
+//! independent of the host's `pi` configuration: the same
+//! instruction file + test prompt + model produce the same context.
 
 use anyhow::Result;
 use std::path::Path;
 
-use crate::opencode::run::{get_default_model, run as opencode_run, RunOptions};
+use crate::pi::run::{get_default_model, run as pi_run, RunOptions};
+use crate::pi::sanity::AiTaskSpec;
 use crate::rate;
 
 #[allow(clippy::too_many_arguments)]
@@ -12,16 +24,15 @@ pub fn run(
     test_path: &Path,
     agent_models: Option<&str>,
     judge_models: Option<&str>,
-    agent_name: Option<&str>,
     timeout: Option<u64>,
     no_cache: bool,
     judge_prompt: Option<&Path>,
     quiet: bool,
 ) -> Result<()> {
-    // Get default model from opencode config
+    // Get default model from pi settings
     let default_model = get_default_model()?;
 
-    // Parse models (CLI overrides opencode default)
+    // Parse models (CLI overrides pi default)
     let agent_models: Vec<String> = agent_models
         .map(|s| s.split(',').map(|m| m.trim().to_string()).collect())
         .unwrap_or_else(|| vec![default_model.clone()]);
@@ -69,7 +80,7 @@ pub fn run(
             continue;
         }
 
-        // Invoke agent using new opencode::run interface
+        // Invoke agent under test via pi.
         if !quiet {
             println!(
                 "Running agent {} on test '{}'...",
@@ -77,74 +88,88 @@ pub fn run(
             );
         }
 
-        let options = RunOptions {
-            model: Some(agent_model),
-            agent: agent_name,
-            timeout_secs,
-            session_id: None,
-            verbose: false,
-            cache: !no_cache,
-            server_url: None,
-            password: None,
-            directory: None,
+        // The agent under test is a black box: we don't know what its
+        // output should look like, so the sanity tripwire here is
+        // intentionally permissive (any non-empty output passes).
+        // The judge step (`invoke_judge`) is responsible for the
+        // semantic verification against the test's checklist.
+        let agent_spec = AiTaskSpec {
+            shape: "any non-empty agent response",
+            looks_complete: &|s: &str| {
+                if s.trim().is_empty() {
+                    Err("agent produced no text content".into())
+                } else {
+                    Ok(())
+                }
+            },
         };
 
-        // Streaming callback for live display (when not quiet)
+        let options = RunOptions {
+            model: Some(agent_model),
+            // The instruction file IS the system prompt for rate
+            // (passed via --append-system-prompt below).  We don't
+            // pin a meta system prompt here — the agent under test
+            // gets exactly what the test author wrote.
+            system_prompt: None,
+            timeout_secs,
+            tools: Some("bash"),
+            verbose: !quiet,
+        };
+
+        // Streaming callback for live display (when not quiet).
         let on_event = |json: &serde_json::Value| {
             if quiet {
                 return;
             }
-            let event_type = json.get("type").and_then(|v| v.as_str());
-            match event_type {
-                Some("text") => {
-                    if let Some(text) = json
-                        .get("part")
-                        .and_then(|p| p.get("text"))
-                        .and_then(|t| t.as_str())
-                    {
-                        for line in text.lines() {
-                            if !line.trim().is_empty() {
-                                let display = if line.len() > 120 {
-                                    format!("    {}...", &line[..120])
-                                } else {
-                                    format!("    {}", line)
-                                };
-                                println!("{}", display);
+            let t = json.get("type").and_then(|v| v.as_str());
+            match t {
+                Some("message_update") => {
+                    let ame = match json.get("assistantMessageEvent") {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    if ame.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                        if let Some(delta) = ame.get("delta").and_then(|v| v.as_str()) {
+                            for line in delta.lines() {
+                                if !line.trim().is_empty() {
+                                    let display = if line.len() > 120 {
+                                        format!("    {}...", &line[..120])
+                                    } else {
+                                        format!("    {}", line)
+                                    };
+                                    println!("{}", display);
+                                }
                             }
                         }
                     }
                 }
-                Some("tool_use") => {
-                    if let Some(tool) = json
-                        .get("part")
-                        .and_then(|p| p.get("tool"))
-                        .and_then(|t| t.as_str())
-                    {
-                        let desc = json
-                            .get("part")
-                            .and_then(|p| p.get("state"))
-                            .and_then(|s| s.get("input"))
-                            .and_then(|i| {
-                                i.get("command")
-                                    .or_else(|| i.get("description"))
-                                    .and_then(|v| v.as_str())
-                            })
-                            .map(|s| {
-                                if s.len() > 80 {
-                                    format!("{}...", &s[..80])
-                                } else {
-                                    s.to_string()
-                                }
-                            })
-                            .unwrap_or_default();
-                        println!("    [{}] {}", tool, desc);
-                    }
+                Some("tool_execution_start") => {
+                    let tool = json
+                        .get("toolName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let desc = json
+                        .get("args")
+                        .and_then(|a| {
+                            a.get("command")
+                                .or_else(|| a.get("description"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .map(|s| {
+                            if s.len() > 80 {
+                                format!("{}...", &s[..80])
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .unwrap_or_default();
+                    println!("    [{}] {}", tool, desc);
                 }
                 _ => {}
             }
         };
 
-        let agent_result = opencode_run(&prompt, instruction, &options, Some(on_event))?;
+        let agent_result = pi_run(&prompt, instruction, &options, &agent_spec, Some(on_event))?;
 
         // Judge with each judge model
         for judge_model in &judge_models {

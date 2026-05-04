@@ -2,17 +2,20 @@
 //!
 //! Provides functionality to invoke a judge agent that evaluates
 //! another agent's output against a verification checklist.
+//!
+//! The judge runs through [`crate::pi::run`] in hermetic mode — the
+//! judge sees ONLY the judge prompt + the agent output, never the
+//! host's AGENTS.md / CLAUDE.md / skills.  This keeps ratings
+//! reproducible across machines and over time.
 
-use std::fs;
-use std::io::{ErrorKind, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wait_timeout::ChildExt;
+
+use crate::pi::run::{run as pi_run, RunOptions};
+use crate::pi::sanity::AiTaskSpec;
 
 /// Result of a judge evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,23 +75,29 @@ pub fn invoke_judge(
     judge_model: &str,
     timeout_secs: u64,
 ) -> Result<JudgeRating> {
-    // Read judge prompt
-    let judge_prompt = fs::read_to_string(judge_prompt_path)
-        .with_context(|| format!("Failed to read judge prompt: {:?}", judge_prompt_path))?;
+    // Confirm judge prompt exists (pi will read it via
+    // ``--append-system-prompt``).
+    if !judge_prompt_path.exists() {
+        bail!(
+            "Judge prompt not found: {:?}.  Pass --judge-prompt or \
+             create the default at \
+             ~/.local/share/ai-audit/rate/judge-prompt.md.",
+            judge_prompt_path
+        );
+    }
 
-    // Build combined prompt
+    // The user message contains the per-call dynamic data: test
+    // metadata, checklist, and the agent output to be judged.  The
+    // judge prompt itself (the static framing + YAML schema) is
+    // delivered as the appended system prompt.
     let checklist_text = checklist
         .iter()
         .map(|item| format!("- [ ] {}", item))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let combined_prompt = format!(
-        r#"{judge_prompt}
-
----
-
-## Test Metadata
+    let user_message = format!(
+        r#"## Test Metadata
 
 - Test name: {test_name}
 - Agent model: {agent_model}
@@ -112,103 +121,43 @@ Now provide your rating in the specified YAML format."#
         judge_model,
         timeout_secs
     );
-    log::trace!("Combined prompt length: {} chars", combined_prompt.len());
+    log::trace!("User message length: {} chars", user_message.len());
 
-    // Write combined prompt to temp file
-    let temp_dir = std::env::temp_dir();
-    let prompt_path = temp_dir.join(format!("ai-audit-judge-{}.md", std::process::id()));
-    fs::write(&prompt_path, &combined_prompt)
-        .with_context(|| format!("Failed to write temp prompt file: {:?}", prompt_path))?;
-
-    // Build command args
-    let model_flag = format!("--model={}", judge_model);
-    let prompt_str = prompt_path
-        .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    let args = vec![
-        "run",
-        "--agent",
-        "judge",
-        "--format",
-        "json",
-        &model_flag,
-        prompt_str,
-    ];
-
-    // Spawn the opencode process
-    let mut child = match Command::new("opencode")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            let _ = fs::remove_file(&prompt_path);
-            bail!("opencode not found. Install it or add it to PATH.");
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&prompt_path);
-            bail!("Failed to spawn opencode: {}", e);
-        }
+    // Sanity tripwire: a healthy judge response always opens with
+    // YAML frontmatter (``---`` on the first non-blank line).
+    // Cut-short / preamble-only outputs are rejected at the harness
+    // boundary so they never reach ``parse_judge_output``.
+    let spec = AiTaskSpec {
+        shape: "YAML frontmatter starting with '---'",
+        looks_complete: &|s: &str| {
+            if s.trim_start().starts_with("---") {
+                Ok(())
+            } else {
+                Err("output does not begin with YAML frontmatter '---'".into())
+            }
+        },
     };
 
-    // Wait with timeout
-    let timeout_duration = Duration::from_secs(timeout_secs);
-    let status = match child.wait_timeout(timeout_duration)? {
-        Some(status) => status,
-        None => {
-            log::warn!("Judge timeout after {}s, killing process", timeout_secs);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_file(&prompt_path);
-            bail!(
-                "Timeout: judge did not complete within {}s. \
-                 The model '{}' may be slow or unresponsive.",
-                timeout_secs,
-                judge_model
-            );
-        }
+    let options = RunOptions {
+        model: Some(judge_model),
+        // Judge runs without any extra system prompt: the appended
+        // file IS the judge's full instruction set.  The host's
+        // ``--no-context-files`` etc. ensure no AGENTS.md leakage.
+        system_prompt: None,
+        timeout_secs: Some(timeout_secs),
+        // Judges are pure scoring: no shell/file tools.
+        tools: None,
+        verbose: false,
     };
 
-    // Read stdout
-    let mut stdout_content = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_string(&mut stdout_content)?;
-    }
+    let result =
+        pi_run::<fn(&serde_json::Value)>(&user_message, judge_prompt_path, &options, &spec, None)?;
 
-    // Read stderr
-    let mut stderr_content = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        stderr.read_to_string(&mut stderr_content)?;
-    }
-
-    // Clean up temp file
-    let _ = fs::remove_file(&prompt_path);
-
-    // Check exit status
-    if let Some(127) = status.code() {
-        bail!("opencode not found. Install it or add it to PATH.");
-    }
-
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        let mut error_msg = format!("opencode (judge) exited with code {}", code);
-        if !stderr_content.is_empty() {
-            error_msg.push_str(&format!(": {}", stderr_content.trim()));
-        }
-        bail!(error_msg);
-    }
-
-    // Extract text content from JSON output
-    let text_output = extract_text_from_json(&stdout_content);
-
-    // Parse the judge output
-    parse_judge_output(&text_output)
+    parse_judge_output(&result.output)
 }
 
 /// Extract text content from JSON-formatted opencode output.
+#[allow(dead_code)]
 fn extract_text_from_json(output: &str) -> String {
     let mut text_parts = Vec::new();
     for line in output.lines() {

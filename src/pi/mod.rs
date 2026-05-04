@@ -1,14 +1,15 @@
 //! Pi (badlogic/pi-mono) provider adapter.
 //!
+//! ## Forensic side (read)
+//!
 //! Pi stores sessions as JSONL files under
 //! `~/.pi/agent/sessions/--<encoded-cwd>--/<iso-ts>_<uuid>.jsonl`.
 //! The base directory can be overridden by the `PI_CODING_AGENT_DIR`
-//! environment variable.
-//!
-//! Sub-agent sessions (e.g. those spawned by the `pi-subagents`
-//! extension) are nested under the parent's directory:
-//! `<parent-base>/<parent-uuid-dir>/<entry-id>/run-N/session.jsonl`.
-//! Their parent UUID is the directory name two levels above the file.
+//! environment variable.  Sub-agent sessions (e.g. those spawned by
+//! the `pi-subagents` extension) are nested under the parent's
+//! directory: `<parent-base>/<parent-uuid-dir>/<entry-id>/run-N/session.jsonl`.
+//! Their parent UUID is the directory name two levels above the
+//! file.
 //!
 //! Pi has no permission/approval model, so this module exposes no
 //! `permissions` submodule.
@@ -16,9 +17,21 @@
 //! Project directory is read from the `cwd` field of the JSONL
 //! header line — never from the encoded directory name (the encoding
 //! `/` → `-` is lossy).
+//!
+//! ## Invocation side (write)
+//!
+//! Use [`run::run`] to spawn `pi --print --mode json` with the
+//! hermetic flag set built by [`command::build_hermetic`].  See
+//! the module docs for [`run`] and [`sanity`] for the contract.
 
+pub mod command;
+pub mod run;
+pub mod sanity;
 pub mod session;
 pub mod transcript;
+
+pub use run::{AiTaskResult, RunOptions};
+pub use sanity::{AiTaskSpec, LlmOutputCutShort};
 
 use std::path::PathBuf;
 
