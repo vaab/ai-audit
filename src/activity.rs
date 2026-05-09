@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -76,7 +76,7 @@ struct SessionMeta {
 }
 
 /// Aggregated session index built from all providers.
-struct SessionIndex {
+pub struct SessionIndex {
     sessions: Vec<SessionMeta>,
 }
 
@@ -1047,8 +1047,6 @@ fn merge_activity_events(
     file_events: Vec<ActivityEvent>,
     db_events: Vec<ActivityEvent>,
 ) -> Vec<ActivityEvent> {
-    use std::collections::HashSet;
-
     // Build a set of keys from DB events
     let db_keys: HashSet<(i64, &str, &str)> = db_events
         .iter()
@@ -1075,78 +1073,333 @@ fn merge_activity_events(
     merged
 }
 
-/// List all available activity identifiers
-pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
+fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionIndex {
+    let t = std::time::Instant::now();
+    let mut all_sessions = Vec::new();
+    if filter.include_claude {
+        all_sessions.extend(scan_claudecode_sessions(config));
+    }
+    if filter.include_opencode {
+        let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
+        let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
+        let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
+        all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
+    }
+    if filter.include_pi {
+        all_sessions.extend(scan_pi_sessions(config));
+    }
+    log::debug!(
+        "build_session_index: {} sessions in {:?}",
+        all_sessions.len(),
+        t.elapsed()
+    );
+    SessionIndex {
+        sessions: all_sessions,
+    }
+}
+
+pub fn build_full_session_index(config: &Config) -> SessionIndex {
+    let filter = parse_identifier_filter(&[]);
+    build_session_index(config, &filter)
+}
+
+fn ident_for(provider: Provider, activity_type: ActivityType, project_dir: &str) -> String {
+    format!(
+        "{}-{}@{}",
+        provider.as_str(),
+        activity_type.as_str(),
+        project_dir
+    )
+}
+
+pub fn list_identifiers_with_index(index: &SessionIndex) -> Vec<String> {
     let mut identifiers = Vec::new();
 
-    // Build the combined session index
-    let mut all_sessions = scan_claudecode_sessions(config);
-    let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
-    let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
-    let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
-    all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
-    all_sessions.extend(scan_pi_sessions(config));
-    let index = SessionIndex {
-        sessions: all_sessions,
-    };
-
-    // Collect unique project_dir values per (client_type, project_dir),
-    // skipping child sessions.
     for meta in index.non_child() {
         match meta.provider {
             Provider::ClaudeCode => {
-                // Claude Code produces both msg and perm identifiers
-                let msg_ident = format!(
-                    "{}-{}@{}",
-                    Provider::ClaudeCode.as_str(),
-                    ActivityType::Message.as_str(),
-                    meta.project_dir
-                );
-                let perm_ident = format!(
-                    "{}-{}@{}",
-                    Provider::ClaudeCode.as_str(),
-                    ActivityType::Permission.as_str(),
-                    meta.project_dir
-                );
-
-                if !identifiers.contains(&msg_ident) {
-                    identifiers.push(msg_ident);
-                }
-                if !identifiers.contains(&perm_ident) {
-                    identifiers.push(perm_ident);
-                }
+                identifiers.push(ident_for(
+                    Provider::ClaudeCode,
+                    ActivityType::Message,
+                    &meta.project_dir,
+                ));
+                identifiers.push(ident_for(
+                    Provider::ClaudeCode,
+                    ActivityType::Permission,
+                    &meta.project_dir,
+                ));
             }
-            Provider::OpenCode => {
-                let msg_ident = format!(
-                    "{}-{}@{}",
-                    Provider::OpenCode.as_str(),
-                    ActivityType::Message.as_str(),
-                    meta.project_dir
-                );
-
-                if !identifiers.contains(&msg_ident) {
-                    identifiers.push(msg_ident);
-                }
-            }
-            Provider::Pi => {
-                // Pi has no permission/approval events, so only msg.
-                let msg_ident = format!(
-                    "{}-{}@{}",
-                    Provider::Pi.as_str(),
-                    ActivityType::Message.as_str(),
-                    meta.project_dir
-                );
-
-                if !identifiers.contains(&msg_ident) {
-                    identifiers.push(msg_ident);
-                }
-            }
+            Provider::OpenCode => identifiers.push(ident_for(
+                Provider::OpenCode,
+                ActivityType::Message,
+                &meta.project_dir,
+            )),
+            Provider::Pi => identifiers.push(ident_for(
+                Provider::Pi,
+                ActivityType::Message,
+                &meta.project_dir,
+            )),
         }
     }
 
     identifiers.sort();
     identifiers.dedup();
-    Ok(identifiers)
+    identifiers
+}
+
+fn collect_all_activity_events(
+    config: &Config,
+    filter: &IdentifierFilter,
+    index: &SessionIndex,
+) -> Result<Vec<ActivityEvent>> {
+    let t = std::time::Instant::now();
+    let mut all_events = Vec::new();
+
+    if filter.include_claude && filter.include_messages {
+        for meta in index.non_child() {
+            if meta.provider != Provider::ClaudeCode {
+                continue;
+            }
+            let session_file = match &meta.session_file {
+                Some(path) => path,
+                None => continue,
+            };
+            if let Ok(events) =
+                parse_claudecode_messages(session_file, config, Some(&meta.project_dir))
+            {
+                all_events.extend(
+                    events
+                        .into_iter()
+                        .filter(|event| filter.matches_ident(&event.ident)),
+                );
+            }
+        }
+    }
+
+    if filter.include_claude && filter.include_permissions {
+        let perm_dir_map: HashMap<&str, &str> = index
+            .sessions
+            .iter()
+            .filter(|s| s.provider == Provider::ClaudeCode)
+            .map(|s| (s.id.as_str(), s.project_dir.as_str()))
+            .collect();
+
+        let debug_dir = crate::claudecode::debug_dir();
+        if debug_dir.exists() {
+            for entry in fs::read_dir(&debug_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "txt") {
+                    continue;
+                }
+                let session_id = path.file_stem().map(|s| s.to_string_lossy().to_string());
+                let session_file = session_id
+                    .as_ref()
+                    .and_then(|id| crate::claudecode::session::find_session_file(id));
+                let perm_project_dir = session_id
+                    .as_deref()
+                    .and_then(|id| perm_dir_map.get(id).copied());
+
+                if let Ok(events) = parse_claudecode_permissions(
+                    &path,
+                    session_file.as_deref(),
+                    config,
+                    perm_project_dir,
+                ) {
+                    all_events.extend(
+                        events
+                            .into_iter()
+                            .filter(|event| filter.matches_ident(&event.ident)),
+                    );
+                }
+            }
+        }
+    }
+
+    if filter.include_pi && filter.include_messages {
+        for meta in index.non_child() {
+            if meta.provider != Provider::Pi {
+                continue;
+            }
+            let session_file = match &meta.session_file {
+                Some(path) => path,
+                None => continue,
+            };
+            if let Ok(events) = parse_pi_messages(session_file, config, Some(&meta.project_dir)) {
+                all_events.extend(
+                    events
+                        .into_iter()
+                        .filter(|event| filter.matches_ident(&event.ident)),
+                );
+            }
+        }
+    }
+
+    if filter.include_opencode && filter.include_messages {
+        let storage_dir = crate::opencode_data_dir().join("storage");
+        let file_events =
+            parse_opencode_messages_with_index(&storage_dir, config, index).unwrap_or_default();
+        let db_events = if crate::opencode::db::db_exists() {
+            crate::opencode::db::open_db()
+                .ok()
+                .and_then(|conn| parse_opencode_messages_from_db(&conn, config, index).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let merged_events = merge_activity_events(file_events, db_events);
+        all_events.extend(
+            merged_events
+                .into_iter()
+                .filter(|event| filter.matches_ident(&event.ident)),
+        );
+    }
+
+    strip_preload_permissions(&mut all_events);
+    all_events.sort_by_key(|event| event.timestamp);
+    log::debug!(
+        "collect_all_activity_events: {} events in {:?}",
+        all_events.len(),
+        t.elapsed()
+    );
+    Ok(all_events)
+}
+
+fn parse_exact_ident(ident: &str) -> Option<(Provider, ActivityType, &str)> {
+    let (prefix, project_dir) = ident.split_once('@')?;
+    let (provider_str, activity_str) = prefix.split_once('-')?;
+    let provider = match provider_str {
+        "claudecode" => Provider::ClaudeCode,
+        "opencode" => Provider::OpenCode,
+        "pi" => Provider::Pi,
+        _ => return None,
+    };
+    let activity_type = match activity_str {
+        "msg" => ActivityType::Message,
+        "perm" => ActivityType::Permission,
+        _ => return None,
+    };
+    Some((provider, activity_type, project_dir))
+}
+
+fn list_json_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+pub fn enumerate_files_for_ident_with_index(ident: &str, index: &SessionIndex) -> Vec<PathBuf> {
+    let Some((provider, activity_type, project_dir)) = parse_exact_ident(ident) else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+
+    match (provider, activity_type) {
+        (Provider::ClaudeCode, ActivityType::Message) => {
+            for meta in index.non_child() {
+                if meta.provider == Provider::ClaudeCode && meta.project_dir == project_dir {
+                    if let Some(path) = &meta.session_file {
+                        files.push(path.clone());
+                    }
+                }
+            }
+        }
+        (Provider::ClaudeCode, ActivityType::Permission) => {
+            for meta in index.sessions.iter() {
+                if meta.provider == Provider::ClaudeCode && meta.project_dir == project_dir {
+                    let path = crate::claudecode::debug_dir().join(format!("{}.txt", meta.id));
+                    if path.exists() {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        (Provider::OpenCode, ActivityType::Message) => {
+            for meta in index.non_child() {
+                if meta.provider == Provider::OpenCode && meta.project_dir == project_dir {
+                    let dir = crate::opencode_data_dir()
+                        .join("storage")
+                        .join("message")
+                        .join(&meta.id);
+                    files.extend(list_json_files(&dir));
+                }
+            }
+            let db_path = crate::opencode::db::db_path();
+            if db_path.exists() {
+                files.push(db_path);
+            }
+        }
+        (Provider::Pi, ActivityType::Message) => {
+            for meta in index.non_child() {
+                if meta.provider == Provider::Pi && meta.project_dir == project_dir {
+                    if let Some(path) = &meta.session_file {
+                        files.push(path.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    files.sort();
+    files.dedup();
+    files
+}
+
+pub fn enumerate_files_for_ident(ident: &str, config: &Config) -> Vec<PathBuf> {
+    let filter = parse_identifier_filter(&[ident.to_string()]);
+    let index = build_session_index(config, &filter);
+    enumerate_files_for_ident_with_index(ident, &index)
+}
+
+pub fn fetch_all_event_timestamps_with_index(
+    config: &Config,
+    ident_filters: &[String],
+    index: &SessionIndex,
+) -> Result<HashMap<String, Vec<i64>>> {
+    let t = std::time::Instant::now();
+    let filter = parse_identifier_filter(ident_filters);
+    let events = collect_all_activity_events(config, &filter, index)?;
+    let mut by_ident: HashMap<String, Vec<i64>> = HashMap::new();
+    for event in events {
+        by_ident
+            .entry(event.ident)
+            .or_default()
+            .push(event.timestamp);
+    }
+    let total: usize = by_ident.values().map(|v| v.len()).sum();
+    log::debug!(
+        "fetch_all_event_timestamps: {} idents, {} timestamps in {:?}",
+        by_ident.len(),
+        total,
+        t.elapsed()
+    );
+    Ok(by_ident)
+}
+
+pub fn fetch_all_event_timestamps(
+    config: &Config,
+    ident_filters: &[String],
+) -> Result<HashMap<String, Vec<i64>>> {
+    let filter = parse_identifier_filter(ident_filters);
+    let index = build_session_index(config, &filter);
+    fetch_all_event_timestamps_with_index(config, ident_filters, &index)
+}
+
+/// List all available activity identifiers
+pub fn list_identifiers(config: &Config) -> Result<Vec<String>> {
+    let index = build_full_session_index(config);
+    Ok(list_identifiers_with_index(&index))
 }
 
 /// Decode a Claude Code project directory name to a path
@@ -1176,7 +1429,47 @@ fn decode_project_dir_name(name: &str) -> String {
     path.replace("\x00HIDDEN\x00", "/.")
 }
 
-/// Fetch all activity events within a time range
+/// Fetch all activity events within a time range, reusing a pre-built
+/// session index.
+///
+/// Use this from CLI paths that also need the index for other work
+/// (e.g. empty-segment emission) to avoid scanning all session metadata
+/// twice in one invocation.
+pub fn fetch_activities_with_index(
+    config: &Config,
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    identifiers: &[String],
+    session_ids: &[String],
+    index: &SessionIndex,
+) -> Result<Vec<ActivityEvent>> {
+    let t = std::time::Instant::now();
+    let start_ts = start.timestamp();
+    let end_ts = end.timestamp();
+    let filter = parse_identifier_filter(identifiers);
+    let mut all_events = collect_all_activity_events(config, &filter, index)?;
+
+    let total_collected = all_events.len();
+    all_events.retain(|event| event.timestamp >= start_ts && event.timestamp < end_ts);
+
+    // Apply session ID filter
+    if !session_ids.is_empty() {
+        all_events.retain(|e| session_ids.contains(&e.session_id));
+    }
+
+    log::debug!(
+        "fetch_activities: {} events (filtered from {}) in {:?}",
+        all_events.len(),
+        total_collected,
+        t.elapsed()
+    );
+    Ok(all_events)
+}
+
+/// Fetch all activity events within a time range.
+///
+/// Convenience wrapper that builds its own session index — prefer
+/// [`fetch_activities_with_index`] when you already have one.
 pub fn fetch_activities(
     config: &Config,
     start: DateTime<FixedOffset>,
@@ -1184,167 +1477,9 @@ pub fn fetch_activities(
     identifiers: &[String],
     session_ids: &[String],
 ) -> Result<Vec<ActivityEvent>> {
-    let start_ts = start.timestamp();
-    let end_ts = end.timestamp();
-
-    let mut all_events = Vec::new();
-
-    // Parse which clients and types are requested
     let filter = parse_identifier_filter(identifiers);
-
-    // Build the combined session index
-    let mut all_sessions = Vec::new();
-    if filter.include_claude {
-        all_sessions.extend(scan_claudecode_sessions(config));
-    }
-    if filter.include_opencode {
-        let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
-        let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
-        let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
-        all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
-    }
-    if filter.include_pi {
-        all_sessions.extend(scan_pi_sessions(config));
-    }
-    let index = SessionIndex {
-        sessions: all_sessions,
-    };
-
-    // Claude Code messages — iterate the pre-built index, skip children
-    if filter.include_claude && filter.include_messages {
-        for meta in index.non_child() {
-            if meta.provider != Provider::ClaudeCode {
-                continue;
-            }
-            let session_file = match &meta.session_file {
-                Some(p) => p,
-                None => continue,
-            };
-            if let Ok(events) =
-                parse_claudecode_messages(session_file, config, Some(&meta.project_dir))
-            {
-                for event in events {
-                    if event.timestamp >= start_ts
-                        && event.timestamp < end_ts
-                        && filter.matches_ident(&event.ident)
-                    {
-                        all_events.push(event);
-                    }
-                }
-            }
-        }
-    }
-
-    // Claude Code permissions — still scanned from debug logs
-    if filter.include_claude && filter.include_permissions {
-        // Build session_id → project_dir lookup from the index
-        let perm_dir_map: std::collections::HashMap<&str, &str> = index
-            .sessions
-            .iter()
-            .filter(|s| s.provider == Provider::ClaudeCode)
-            .map(|s| (s.id.as_str(), s.project_dir.as_str()))
-            .collect();
-
-        let debug_dir = crate::claudecode::debug_dir();
-        if debug_dir.exists() {
-            for entry in fs::read_dir(&debug_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "txt") {
-                    let session_id = path.file_stem().map(|s| s.to_string_lossy().to_string());
-                    let session_file = session_id
-                        .as_ref()
-                        .and_then(|id| crate::claudecode::session::find_session_file(id));
-
-                    // Look up canonical project_dir from session index
-                    let perm_project_dir = session_id
-                        .as_deref()
-                        .and_then(|id| perm_dir_map.get(id).copied());
-
-                    if let Ok(events) = parse_claudecode_permissions(
-                        &path,
-                        session_file.as_deref(),
-                        config,
-                        perm_project_dir,
-                    ) {
-                        for event in events {
-                            if event.timestamp >= start_ts
-                                && event.timestamp < end_ts
-                                && filter.matches_ident(&event.ident)
-                            {
-                                all_events.push(event);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Pi messages — iterate the pre-built index, skip children.
-    // Pi has no permission events, so messages-only.
-    if filter.include_pi && filter.include_messages {
-        for meta in index.non_child() {
-            if meta.provider != Provider::Pi {
-                continue;
-            }
-            let session_file = match &meta.session_file {
-                Some(p) => p,
-                None => continue,
-            };
-            if let Ok(events) = parse_pi_messages(session_file, config, Some(&meta.project_dir)) {
-                for event in events {
-                    if event.timestamp >= start_ts
-                        && event.timestamp < end_ts
-                        && filter.matches_ident(&event.ident)
-                    {
-                        all_events.push(event);
-                    }
-                }
-            }
-        }
-    }
-
-    // OpenCode messages — use the pre-built index, merge file + DB
-    if filter.include_opencode && filter.include_messages {
-        let storage_dir = crate::opencode_data_dir().join("storage");
-        let file_events =
-            parse_opencode_messages_with_index(&storage_dir, config, &index).unwrap_or_default();
-
-        let db_events = if crate::opencode::db::db_exists() {
-            crate::opencode::db::open_db()
-                .ok()
-                .and_then(|conn| parse_opencode_messages_from_db(&conn, config, &index).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let merged_events = merge_activity_events(file_events, db_events);
-        for event in merged_events {
-            if event.timestamp >= start_ts
-                && event.timestamp < end_ts
-                && filter.matches_ident(&event.ident)
-            {
-                all_events.push(event);
-            }
-        }
-    }
-
-    // Apply session ID filter
-    if !session_ids.is_empty() {
-        all_events.retain(|e| session_ids.iter().any(|sid| e.session_id == *sid));
-    }
-
-    // Discard auto-loaded permission events: permission events that occur
-    // before the first user message in their session are the initial load
-    // of saved rules, not explicit user grants.
-    strip_preload_permissions(&mut all_events);
-
-    // Sort by timestamp
-    all_events.sort_by_key(|e| e.timestamp);
-
-    Ok(all_events)
+    let index = build_session_index(config, &filter);
+    fetch_activities_with_index(config, start, end, identifiers, session_ids, &index)
 }
 
 /// Remove permission events that precede the first user message in their
@@ -1513,10 +1648,62 @@ pub fn activity_summary(event: &ActivityEvent) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::{tempdir, NamedTempFile};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        home: Option<String>,
+        xdg_cache_home: Option<String>,
+        xdg_config_home: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(value) => unsafe {
+                    std::env::set_var("HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("HOME");
+                },
+            }
+            match &self.xdg_cache_home {
+                Some(value) => unsafe {
+                    std::env::set_var("XDG_CACHE_HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("XDG_CACHE_HOME");
+                },
+            }
+            match &self.xdg_config_home {
+                Some(value) => unsafe {
+                    std::env::set_var("XDG_CONFIG_HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("XDG_CONFIG_HOME");
+                },
+            }
+        }
+    }
 
     fn default_config() -> Config {
         Config::default()
+    }
+
+    fn with_temp_home(home: &Path) -> EnvGuard {
+        let guard = EnvGuard {
+            home: std::env::var("HOME").ok(),
+            xdg_cache_home: std::env::var("XDG_CACHE_HOME").ok(),
+            xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
+        };
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+            std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        guard
     }
 
     /// Helper to create OpenCode storage structure for testing
@@ -2345,6 +2532,31 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].session_id, "session-A");
         assert_eq!(filtered[1].session_id, "session-C");
+    }
+
+    #[test]
+    fn test_enumerate_files_for_ident_with_index_matches_standalone() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let _guard = with_temp_home(temp.path());
+
+        let session_dir = temp.path().join(".claude/projects/fixture");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("session-one.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","timestamp":"1970-01-02T12:00:00Z","message":{"role":"user","content":"alpha"},"cwd":"/proj-one"}"#,
+        )
+        .unwrap();
+
+        let config = default_config();
+        let ident = "claudecode-msg@/proj-one";
+        let expected = enumerate_files_for_ident(ident, &config);
+        let index = build_full_session_index(&config);
+        let actual = enumerate_files_for_ident_with_index(ident, &index);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![session_path]);
     }
 
     // =========================================================================
