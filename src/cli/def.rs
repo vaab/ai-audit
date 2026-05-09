@@ -459,6 +459,13 @@ pub enum ActivityAction {
         #[arg(short, long = "session")]
         sessions: Vec<String>,
 
+        /// Read additional identifiers from a NUL-separated file (or `-` for stdin).
+        ///
+        /// Merged with positional IDENT arguments. Use this when the
+        /// identifier list would exceed the command-line ARG_MAX limit.
+        #[arg(long = "categs-file", value_name = "PATH")]
+        categs_file: Option<PathBuf>,
+
         #[command(flatten)]
         output: OutputOpts,
     },
@@ -497,5 +504,79 @@ mod tests {
             "--force-nudge-already-running",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn activity_get_accepts_categs_file() {
+        let args = Args::try_parse_from([
+            "ai-audit",
+            "activity",
+            "get",
+            "today",
+            "--categs-file",
+            "/tmp/categs.nul",
+        ])
+        .expect("parse");
+        match args.command {
+            Commands::Activity {
+                action:
+                    ActivityAction::Get {
+                        categs_file,
+                        identifiers,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    categs_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/categs.nul"))
+                );
+                assert!(identifiers.is_empty());
+            }
+            _ => panic!("expected activity get"),
+        }
+    }
+
+    #[test]
+    fn activity_get_accepts_stdin_dash() {
+        let args =
+            Args::try_parse_from(["ai-audit", "activity", "get", "today", "--categs-file", "-"])
+                .expect("parse");
+        match args.command {
+            Commands::Activity {
+                action: ActivityAction::Get { categs_file, .. },
+            } => {
+                assert_eq!(categs_file.as_deref(), Some(std::path::Path::new("-")));
+            }
+            _ => panic!("expected activity get"),
+        }
+    }
+
+    #[test]
+    fn activity_get_merges_positional_and_categs_file() {
+        // Both forms can coexist. The action-side merges them.
+        let args = Args::try_parse_from([
+            "ai-audit",
+            "activity",
+            "get",
+            "today",
+            "claude-msg@p",
+            "--categs-file",
+            "/tmp/x",
+        ])
+        .expect("parse");
+        match args.command {
+            Commands::Activity {
+                action:
+                    ActivityAction::Get {
+                        identifiers,
+                        categs_file,
+                        ..
+                    },
+            } => {
+                assert_eq!(identifiers, vec!["claude-msg@p".to_string()]);
+                assert!(categs_file.is_some());
+            }
+            _ => panic!("expected activity get"),
+        }
     }
 }

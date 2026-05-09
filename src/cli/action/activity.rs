@@ -1,9 +1,11 @@
 //! Activity command handler.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 use super::super::def::ActivityAction;
 use crate::empty_segments::Bounds;
@@ -64,6 +66,7 @@ pub fn run(action: ActivityAction) -> Result<()> {
             timespan,
             identifiers,
             sessions,
+            categs_file,
             output,
         } => {
             let t_total = std::time::Instant::now();
@@ -72,6 +75,19 @@ pub fn run(action: ActivityAction) -> Result<()> {
             let (start, end) = kal_time::parse_timespan(&timespan)
                 .map_err(|e| anyhow::anyhow!("Failed to parse timespan '{}': {}", timespan, e))?;
             let now = chrono::Utc::now().timestamp();
+
+            // Merge positional IDENT args with --categs-file contents (if any).
+            // Both forms are additive; either can be empty.
+            let merged_idents: Vec<String> =
+                if let Some(path) = categs_file.as_deref() {
+                    let mut all = identifiers;
+                    all.extend(load_categs_file(path).with_context(|| {
+                        format!("Failed to load --categs-file {}", path.display())
+                    })?);
+                    all
+                } else {
+                    identifiers
+                };
 
             // Build the session index ONCE and share it with both
             // ``fetch_activities`` and the empty-segment path so we
@@ -82,7 +98,7 @@ pub fn run(action: ActivityAction) -> Result<()> {
                 &config,
                 start,
                 end,
-                &identifiers,
+                &merged_idents,
                 &sessions,
                 &session_index,
             )?;
@@ -110,10 +126,10 @@ pub fn run(action: ActivityAction) -> Result<()> {
                     );
                 }
                 OutputFormat::Nul => {
-                    let requested_idents = if identifiers.is_empty() {
+                    let requested_idents = if merged_idents.is_empty() {
                         activity::list_identifiers_with_index(&session_index)
                     } else {
-                        identifiers.clone()
+                        merged_idents.clone()
                     };
                     log::info!("activity get: scanning {} idents", requested_idents.len());
 
@@ -256,6 +272,59 @@ pub fn run(action: ActivityAction) -> Result<()> {
     Ok(())
 }
 
+/// Load NUL-separated identifiers from a file or stdin.
+///
+/// `path == "-"` reads from `io::stdin()`. Any other path is opened as
+/// a regular file. The contents are split on `\0`; trailing empty
+/// fragments (from a file ending in `\0`) are dropped, but
+/// **interior** empty entries are rejected as malformed input rather
+/// than silently swallowed (an empty identifier would match nothing
+/// and is almost certainly a bug in the caller's NUL serialisation).
+///
+/// All bytes must be valid UTF-8.
+fn load_categs_file(path: &Path) -> Result<Vec<String>> {
+    let mut buf = Vec::new();
+    if path == Path::new("-") {
+        io::stdin()
+            .lock()
+            .read_to_end(&mut buf)
+            .context("Failed to read identifiers from stdin")?;
+    } else {
+        let mut f =
+            fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+        f.read_to_end(&mut buf)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+    }
+
+    // Drop a single trailing NUL (common when the producer terminates
+    // every record with NUL, including the last one).
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+
+    if buf.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for (idx, chunk) in buf.split(|&b| b == 0).enumerate() {
+        if chunk.is_empty() {
+            return Err(anyhow!(
+                "empty identifier at NUL-separated position {} (malformed input)",
+                idx
+            ));
+        }
+        let s = std::str::from_utf8(chunk).with_context(|| {
+            format!(
+                "identifier at NUL-separated position {} is not valid UTF-8",
+                idx
+            )
+        })?;
+        out.push(s.to_string());
+    }
+    Ok(out)
+}
+
 /// Truncate a session ID for human-readable display.
 ///
 /// UUIDs are shortened to their first 8 characters; other formats
@@ -294,5 +363,85 @@ mod tests {
     #[test]
     fn test_truncate_empty() {
         assert_eq!(truncate_session_id(""), "");
+    }
+
+    // --- load_categs_file ---
+
+    fn write_tmp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("tmpfile");
+        f.write_all(bytes).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    #[test]
+    fn load_categs_file_three_idents_no_trailing_nul() {
+        let f = write_tmp(b"alpha\0beta\0gamma");
+        let got = load_categs_file(f.path()).expect("load");
+        assert_eq!(
+            got,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_categs_file_three_idents_with_trailing_nul() {
+        // Producer terminates every record with NUL — common pattern.
+        let f = write_tmp(b"alpha\0beta\0gamma\0");
+        let got = load_categs_file(f.path()).expect("load");
+        assert_eq!(
+            got,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_categs_file_empty_file_yields_empty_vec() {
+        let f = write_tmp(b"");
+        let got = load_categs_file(f.path()).expect("load");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn load_categs_file_single_trailing_nul_is_empty() {
+        let f = write_tmp(b"\0");
+        let got = load_categs_file(f.path()).expect("load");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn load_categs_file_interior_empty_field_errors() {
+        // Two NULs in a row → empty field in the middle → reject.
+        let f = write_tmp(b"alpha\0\0beta");
+        let err = load_categs_file(f.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty identifier"),
+            "expected 'empty identifier' error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_categs_file_invalid_utf8_errors() {
+        // 0xFF is invalid UTF-8.
+        let f = write_tmp(b"alpha\0\xFFbeta");
+        let err = load_categs_file(f.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not valid UTF-8") || msg.contains("UTF-8"),
+            "expected UTF-8 error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_categs_file_missing_path_errors() {
+        let path = Path::new("/nonexistent/definitely/not/here.nul");
+        let err = load_categs_file(path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to open") || msg.contains("No such file"),
+            "expected open error, got: {msg}"
+        );
     }
 }
