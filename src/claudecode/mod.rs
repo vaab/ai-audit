@@ -1,5 +1,6 @@
 pub mod permissions;
 pub mod session;
+pub mod session_index;
 pub mod transcript;
 
 use std::path::PathBuf;

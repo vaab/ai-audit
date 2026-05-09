@@ -14,6 +14,7 @@ pub mod enrich;
 pub mod nudge;
 pub mod permissions;
 pub mod server_client;
+pub mod session_index;
 pub mod status;
 pub mod transcript;
 

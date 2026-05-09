@@ -28,6 +28,7 @@ pub mod command;
 pub mod run;
 pub mod sanity;
 pub mod session;
+pub mod session_index;
 pub mod transcript;
 
 pub use run::{AiTaskResult, RunOptions};

@@ -1077,16 +1077,73 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
     let t = std::time::Instant::now();
     let mut all_sessions = Vec::new();
     if filter.include_claude {
-        all_sessions.extend(scan_claudecode_sessions(config));
+        match crate::claudecode::session_index::update_and_load(config) {
+            Ok(idx) => {
+                for s in idx.all() {
+                    all_sessions.push(SessionMeta {
+                        id: s.id.clone(),
+                        project_dir: simplify_or_unknown(config, &s.cwd_raw),
+                        is_child: s.is_child,
+                        provider: Provider::ClaudeCode,
+                        session_file: s.path.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "claudecode session-index cache failed ({}); falling back to full scan",
+                    e
+                );
+                all_sessions.extend(scan_claudecode_sessions(config));
+            }
+        }
     }
     if filter.include_opencode {
-        let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
-        let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
-        let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
-        all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
+        match crate::opencode::session_index::update_and_load(config) {
+            Ok(idx) => {
+                for s in idx.all() {
+                    all_sessions.push(SessionMeta {
+                        id: s.id.clone(),
+                        project_dir: simplify_or_unknown(config, &s.cwd_raw),
+                        is_child: s.is_child,
+                        provider: Provider::OpenCode,
+                        session_file: None,
+                    });
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "opencode session-index cache failed ({}); falling back to full scan",
+                    e
+                );
+                let oc_session_dir = crate::opencode_data_dir().join("storage").join("session");
+                let file_oc_metas = scan_opencode_sessions_to_meta(&oc_session_dir, config);
+                let db_oc_metas = scan_opencode_sessions_to_meta_from_db(config);
+                all_sessions.extend(merge_session_metas(file_oc_metas, db_oc_metas));
+            }
+        }
     }
     if filter.include_pi {
-        all_sessions.extend(scan_pi_sessions(config));
+        match crate::pi::session_index::update_and_load(config) {
+            Ok(idx) => {
+                for s in idx.all() {
+                    all_sessions.push(SessionMeta {
+                        id: s.id.clone(),
+                        project_dir: simplify_or_unknown(config, &s.cwd_raw),
+                        is_child: s.is_child,
+                        provider: Provider::Pi,
+                        session_file: s.path.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "pi session-index cache failed ({}); falling back to full scan",
+                    e
+                );
+                all_sessions.extend(scan_pi_sessions(config));
+            }
+        }
     }
     log::debug!(
         "build_session_index: {} sessions in {:?}",
@@ -1095,6 +1152,18 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
     );
     SessionIndex {
         sessions: all_sessions,
+    }
+}
+
+/// Apply the user's path-simplification rules.  Empty `cwd_raw`
+/// (e.g. an OpenCode session row whose `directory` column was NULL)
+/// becomes the literal string ``"unknown"`` to preserve the existing
+/// behaviour of the pre-cache scanners.
+fn simplify_or_unknown(config: &Config, cwd_raw: &str) -> String {
+    if cwd_raw.is_empty() {
+        "unknown".to_string()
+    } else {
+        config.simplify_path(cwd_raw)
     }
 }
 
