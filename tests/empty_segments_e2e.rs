@@ -236,8 +236,11 @@ fn empty_segment_control_records_precede_events_and_cache_hits() {
     let first = assemble_nul_stream(&config, &requested_idents, now, &mut first_scan_count);
     assert_eq!(first_scan_count, 1);
 
+    // Trailing interval starts at t_last + 1 because empty intervals
+    // are half-open [a, b) and the event at t_last must not lie
+    // inside any empty zone.
     let expected_prefix =
-        "\0claudecode-msg@/proj-one\0{\"kind\":\"empty\",\"intervals\":[[null,129600],[172800,345600],[388800,432000]]}\0";
+        "\0claudecode-msg@/proj-one\0{\"kind\":\"empty\",\"intervals\":[[null,129600],[172800,345600],[388801,432000]]}\0";
     assert!(first.starts_with(expected_prefix));
     assert!(first.contains("\0claudecode-msg@/proj-two\0{\"kind\":\"empty\""));
     assert!(!first.contains("claudecode-msg@/proj-zero\0{\"kind\":\"empty\""));
@@ -286,9 +289,11 @@ fn fetch_all_event_timestamps_and_control_record_are_exact_for_single_ident() {
     let bounds = Bounds::from_timestamps(timestamps.get(&ident).unwrap()).unwrap();
     let record =
         empty_segments::format_record(&ident, &empty_segments::intervals_for(&bounds, 432_000));
+    // Trailing starts at t_last + 1 (events are excluded from
+    // empty zones; intervals are half-open [a, b)).
     assert_output_eq(
         &record,
-        "\0claudecode-msg@/proj-gap\0{\"kind\":\"empty\",\"intervals\":[[null,129600],[172800,345600],[388800,432000]]}\0",
+        "\0claudecode-msg@/proj-gap\0{\"kind\":\"empty\",\"intervals\":[[null,129600],[172800,345600],[388801,432000]]}\0",
     );
 }
 

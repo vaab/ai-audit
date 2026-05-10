@@ -119,8 +119,15 @@ pub fn intervals_for(bounds: &Bounds, now: i64) -> Vec<(Option<i64>, Option<i64>
         previous_day = current_day;
     }
 
-    if bounds.t_last < now {
-        intervals.push((Some(bounds.t_last), Some(now)));
+    // Trailing empty zone starts strictly AFTER the last event.  The
+    // wire spec uses half-open `[start, end)` with start INCLUSIVE, so
+    // emitting `[t_last, now)` would falsely claim the event at t_last
+    // is empty — fyl's safety check would then refuse the merge.  The
+    // tightened guard also drops degenerate intervals when now is one
+    // tick (or less) past t_last.
+    let trailing_start = bounds.t_last + 1;
+    if trailing_start < now {
+        intervals.push((Some(trailing_start), Some(now)));
     }
 
     intervals
@@ -356,11 +363,12 @@ mod tests {
 
     #[test]
     fn intervals_for_single_event_has_leading_and_trailing() {
+        // Trailing empty zone starts at t + 1 (exclusive of the event ts).
         let t = 86_400 + 43_200;
         let now = 2 * DAY_SECS + 32_400;
         assert_eq!(
             intervals_for(&bounds(&[t]), now),
-            vec![(None, Some(t)), (Some(t), Some(now))]
+            vec![(None, Some(t)), (Some(t + 1), Some(now))]
         );
     }
 
@@ -381,7 +389,7 @@ mod tests {
         let bounds = bounds(&[100, 200]);
         assert_eq!(
             intervals_for(&bounds, 300),
-            vec![(None, Some(100)), (Some(200), Some(300))]
+            vec![(None, Some(100)), (Some(201), Some(300))]
         );
     }
 
@@ -392,7 +400,7 @@ mod tests {
             intervals_for(&bounds, 2 * DAY_SECS),
             vec![
                 (None, Some(43_200)),
-                (Some(DAY_SECS + 10), Some(2 * DAY_SECS))
+                (Some(DAY_SECS + 11), Some(2 * DAY_SECS))
             ]
         );
     }
@@ -407,8 +415,59 @@ mod tests {
             vec![
                 (None, Some(first)),
                 (Some(DAY_SECS), Some(3 * DAY_SECS)),
-                (Some(last), Some(4 * DAY_SECS)),
+                (Some(last + 1), Some(4 * DAY_SECS)),
             ]
+        );
+    }
+
+    /// Spec-pin: the trailing empty zone must NOT include the timestamp
+    /// of the last event itself.  fyl's wire spec is half-open
+    /// `[start, end)` with start INCLUSIVE; emitting `[t_last, now)`
+    /// would falsely claim the event at t_last is empty, and fyl's
+    /// safety check rejects the merge with "empty-zone assertion
+    /// contradicts existing event data".
+    ///
+    /// Regression test for the fyl read failure observed on
+    /// `ai-audit:claudecode-msg@/home/vaab` — the category had a single
+    /// event at `2026-03-30T23:18:05Z`; activity-org's emission of
+    /// `[1774912685, now)` collided with the stored event at the same
+    /// timestamp.  After the fix, the emitted lower bound is
+    /// `t_last + 1`, which the safety check accepts.
+    #[test]
+    fn intervals_for_trailing_empty_zone_excludes_last_event_timestamp() {
+        let t_last = 1_774_912_685; // 2026-03-30T23:18:05Z
+        let now = 1_779_157_519; // 2026-05-10T02:25:19Z
+        let bounds = bounds(&[t_last]);
+        let intervals = intervals_for(&bounds, now);
+        // Trailing interval starts at t_last + 1, never at t_last.
+        assert_eq!(
+            intervals,
+            vec![(None, Some(t_last)), (Some(t_last + 1), Some(now))]
+        );
+        // And explicitly: t_last itself is NOT inside any asserted
+        // empty interval.
+        for (start, end) in &intervals {
+            let start = start.unwrap_or(i64::MIN);
+            let end = end.unwrap_or(i64::MAX);
+            assert!(
+                t_last < start || t_last >= end,
+                "t_last ({t_last}) lies inside asserted empty interval [{start}, {end})"
+            );
+        }
+    }
+
+    /// After the fix, the trailing interval is omitted entirely when
+    /// `now == t_last + 1` (would otherwise produce a degenerate
+    /// `[t_last + 1, t_last + 1)` zero-width interval).
+    #[test]
+    fn intervals_for_no_trailing_zone_when_now_is_one_past_last_event() {
+        let t_last = 1000;
+        let now = t_last + 1;
+        let bounds = bounds(&[t_last]);
+        assert_eq!(
+            intervals_for(&bounds, now),
+            vec![(None, Some(t_last))],
+            "no trailing empty zone should be emitted when now == t_last + 1"
         );
     }
 
@@ -421,7 +480,7 @@ mod tests {
                 (None, Some(100)),
                 (Some(DAY_SECS), Some(3 * DAY_SECS)),
                 (Some(4 * DAY_SECS), Some(6 * DAY_SECS)),
-                (Some(6 * DAY_SECS + 2), Some(7 * DAY_SECS)),
+                (Some(6 * DAY_SECS + 3), Some(7 * DAY_SECS)),
             ]
         );
     }
