@@ -6,7 +6,15 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 const DAY_SECS: i64 = 86_400;
-const SCHEMA_VERSION: u32 = 1;
+/// On-disk cache schema version.  Bumped to 2 alongside the
+/// session-index v2 restructure: multi-cwd attribution now spreads
+/// events across all the cwds a session touched, which can change
+/// the computed ``t_first`` / ``t_last`` for a given category even
+/// when the contributing session files are byte-identical.  The
+/// fingerprint mechanism only catches file-content changes, so
+/// algorithm changes must be expressed via this version bump to
+/// invalidate caches written under the previous attribution.
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bounds {
@@ -608,22 +616,43 @@ mod tests {
 
     #[test]
     fn cache_load_treats_missing_has_events_field_as_true() {
-        // Cache files written by older binaries (before ``has_events``
-        // existed) are always for non-empty bounds.  Defaulting the
-        // missing field to ``true`` preserves their semantics.
+        // The serde default on ``has_events`` keeps current-schema
+        // files readable when an early-2 binary wrote them before
+        // the field was added.  Without the default, those files
+        // would silently be rejected as malformed.
         let dir = tempdir().unwrap();
         let cache = Cache::new_at(dir.path().to_path_buf());
-        let path = cache.path_for("legacy");
+        let path = cache.path_for("no-has-events");
+        fs::write(
+            &path,
+            r#"{"schema_version":2,"fingerprint":"x","t_first":100,"t_last":200,"day_ranges":[[0,0]],"last_run_at":300}"#,
+        )
+        .unwrap();
+        let loaded = cache.load("no-has-events").expect("file should load");
+        assert!(loaded.bounds.is_some());
+        let b = loaded.bounds.unwrap();
+        assert_eq!(b.t_first, 100);
+        assert_eq!(b.t_last, 200);
+    }
+
+    #[test]
+    fn cache_load_rejects_schema_v1_caches() {
+        // v1 caches were written under different attribution rules
+        // (single-cwd-per-session) and may hold bounds that no longer
+        // match what the current algorithm computes.  They MUST be
+        // rejected on load so the next run does a fresh recompute.
+        let dir = tempdir().unwrap();
+        let cache = Cache::new_at(dir.path().to_path_buf());
+        let path = cache.path_for("v1-stale");
         fs::write(
             &path,
             r#"{"schema_version":1,"fingerprint":"x","t_first":100,"t_last":200,"day_ranges":[[0,0]],"last_run_at":300}"#,
         )
         .unwrap();
-        let loaded = cache.load("legacy").expect("legacy file should load");
-        assert!(loaded.bounds.is_some());
-        let b = loaded.bounds.unwrap();
-        assert_eq!(b.t_first, 100);
-        assert_eq!(b.t_last, 200);
+        assert!(
+            cache.load("v1-stale").is_none(),
+            "v1 caches must be invalidated"
+        );
     }
 
     #[test]
