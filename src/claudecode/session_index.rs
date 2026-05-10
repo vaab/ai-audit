@@ -1,79 +1,73 @@
-//! On-disk cache of Claude Code session metadata.
+//! On-disk cache of Claude Code session metadata (v2).
 //!
-//! Cold path (first run, missing/corrupt cache): walks
-//! `~/.claude/projects/*/` and reads the first line of every
-//! `.jsonl` to extract cwd + child-session flag.  ~3.5 s on a 15 k+
-//! session corpus.
+//! For each `.jsonl` file under `~/.claude/projects/*/`:
 //!
-//! Warm path (cache present): for each `.jsonl`, stat its mtime.
-//! Files older than `last_run_at` AND already in the cache are
-//! skipped.  Only newly-created or modified-but-unknown sessions
-//! are opened.  Typical warm-run cost is dominated by stat calls
-//! (~150 ms for 15 k files).
+//! - **Cold path** (cache absent or schema mismatch): walk every
+//!   entry, collect every distinct `cwd` value, determine `is_child`
+//!   from the first parseable line.
+//! - **Warm path**: stat each file's mtime.  If the recorded
+//!   `mtime_ns` matches, skip.  Otherwise re-read the file fully
+//!   and **rebuild** the session's `cwds` set from scratch (we do
+//!   not trust "events past timestamp T are strictly new" — Claude
+//!   may rewrite or drop entries).
 //!
-//! Cwd and child-status are immutable post-creation, so we never
-//! re-read a known session.
+//! Claude is the only currently-supported harness where a session
+//! can record multiple distinct cwds across its lifetime — events
+//! after a `cd` carry the new cwd in their JSONL row.
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::config::Config;
-use crate::session_index::{self as idx, CachedHarnessIndex, CachedSession, SCHEMA_VERSION};
+use crate::session_index::{
+    self as idx, mtime_ns_of, CachedHarnessIndex, CachedSession, SCHEMA_VERSION,
+};
 
-/// Cache file name within the session-index directory.
 const CACHE_FILE: &str = "claudecode.json";
 
 /// Live runtime view backed by the persisted cache.
 #[derive(Debug, Default, Clone)]
 pub struct ClaudeIndex {
-    sessions: Vec<CachedSession>,
-    by_simplified: HashMap<String, Vec<usize>>, // index into ``sessions``
+    inner: CachedHarnessIndex,
 }
 
 impl ClaudeIndex {
-    /// Sessions whose simplified project_dir equals the lookup key.
-    /// Empty slice if no match.
-    pub fn for_project(&self, simplified_project_dir: &str) -> Vec<&CachedSession> {
-        match self.by_simplified.get(simplified_project_dir) {
-            Some(indexes) => indexes.iter().map(|&i| &self.sessions[i]).collect(),
-            None => Vec::new(),
-        }
+    /// All cached sessions, regardless of project.
+    pub fn all(&self) -> impl Iterator<Item = &CachedSession> {
+        self.inner.sessions_by_id.values()
     }
 
-    /// All cached sessions, regardless of project.
-    pub fn all(&self) -> &[CachedSession] {
-        &self.sessions
+    /// Sessions whose simplified cwd matches `categ_id`.
+    pub fn for_categ_id(&self, categ_id: &str, config: &Config) -> Vec<&CachedSession> {
+        self.inner
+            .lookup_by_categ_id(categ_id, |raw| config.simplify_path(raw))
     }
 }
 
-/// First parseable JSONL line carries both the parent-session probe
-/// (`sessionId` → child) and the cwd.  Reading the file once gives us
-/// both signals; falling through to subsequent lines for cwd handles
-/// the rare case where the first line is malformed.
 #[derive(Debug, Deserialize)]
-struct HeaderProbe {
+struct EntryProbe {
     #[serde(rename = "sessionId")]
     parent_session_id: Option<String>,
     cwd: Option<String>,
 }
 
-/// Returns `(cwd_raw, is_child)` from the first parseable line.
-/// Falls back to scanning subsequent lines for a `cwd` if the first
-/// line lacks one.  Returns `(None, false)` on read error.
-fn parse_session_header(path: &Path) -> (Option<String>, bool) {
+/// Walk a Claude JSONL file fully, collecting every distinct `cwd`
+/// value and determining `is_child` from the first parseable line.
+/// Returns the cwds set and the child flag.
+fn scan_session_file(path: &Path) -> (HashSet<String>, bool) {
     let file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return (None, false),
+        Err(_) => return (HashSet::new(), false),
     };
     let reader = BufReader::new(file);
 
-    let mut cwd: Option<String> = None;
+    let mut cwds = HashSet::new();
     let mut is_child = false;
-    let mut first_line_seen = false;
+    let mut first_parsed = false;
 
     for line in reader.lines() {
         let line = match line {
@@ -83,334 +77,393 @@ fn parse_session_header(path: &Path) -> (Option<String>, bool) {
         if line.trim().is_empty() {
             continue;
         }
-        let probe: HeaderProbe = match serde_json::from_str(&line) {
+        let probe: EntryProbe = match serde_json::from_str(&line) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if !first_line_seen {
+        if !first_parsed {
             is_child = probe.parent_session_id.is_some();
-            first_line_seen = true;
+            first_parsed = true;
         }
-        if cwd.is_none() && probe.cwd.is_some() {
-            cwd = probe.cwd;
-        }
-        if cwd.is_some() {
-            break;
+        if let Some(cwd) = probe.cwd {
+            if !cwd.is_empty() {
+                cwds.insert(cwd);
+            }
         }
     }
-    (cwd, is_child)
+    (cwds, is_child)
 }
 
 /// Build or refresh the Claude session-index cache, then return the
-/// runtime view.  Sessions whose ID is already in the cache are
-/// skipped (cwd and `is_child` are immutable post-creation).  Files
-/// whose backing file disappeared are dropped as a lazy cleanup.
-pub fn update_and_load(config: &Config) -> Result<ClaudeIndex> {
+/// runtime view.  Sessions whose `mtime_ns` is unchanged are skipped;
+/// changed files trigger a full re-scan that rebuilds the session's
+/// `cwds` set from scratch.
+pub fn update_and_load(_config: &Config) -> Result<ClaudeIndex> {
     let mut existing =
         idx::load_harness_index(CACHE_FILE).unwrap_or_else(CachedHarnessIndex::empty);
     existing.schema_version = SCHEMA_VERSION;
 
     let projects_dir = crate::claudecode::projects_dir();
     if !projects_dir.exists() {
-        return Ok(build_runtime(config, &existing));
+        return Ok(ClaudeIndex { inner: existing });
     }
-    let known_ids: HashSet<String> = existing.sessions.iter().map(|s| s.id.clone()).collect();
 
-    let new_sessions = scan_for_new_sessions(&projects_dir, &known_ids);
+    let mut scanned_ids = HashSet::new();
+    let (added, refreshed) = walk_and_update(&projects_dir, &mut existing, &mut scanned_ids);
 
-    if !new_sessions.is_empty() {
-        existing.sessions.extend(new_sessions);
+    if added > 0 || refreshed > 0 {
         log::debug!(
-            "claudecode session-index: cache size now {}",
-            existing.sessions.len()
+            "claudecode session-index: +{} new, {} re-read; cache size {}",
+            added,
+            refreshed,
+            existing.sessions_by_id.len()
         );
     }
 
-    // Lazy cleanup: drop entries whose backing file disappeared.
-    let before_cleanup = existing.sessions.len();
-    existing.sessions.retain(|s| match &s.path {
-        Some(p) => p.exists(),
-        None => true,
-    });
-    let dropped = before_cleanup - existing.sessions.len();
-    if dropped > 0 {
+    // Lazy cleanup: drop entries whose backing file disappeared
+    // (or wasn't visited this run because its directory is gone).
+    let stale_ids: Vec<String> = existing
+        .sessions_by_id
+        .iter()
+        .filter(|(_, s)| match &s.path {
+            Some(p) => !p.exists(),
+            None => false,
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &stale_ids {
+        existing.remove_session(id);
+    }
+    if !stale_ids.is_empty() {
         log::debug!(
             "claudecode session-index: dropped {} stale entries",
-            dropped
+            stale_ids.len()
         );
     }
 
+    existing.rebuild_by_path();
     idx::save_harness_index(CACHE_FILE, &existing)?;
-    Ok(build_runtime(config, &existing))
+    Ok(ClaudeIndex { inner: existing })
 }
 
-fn scan_for_new_sessions(projects_dir: &Path, known_ids: &HashSet<String>) -> Vec<CachedSession> {
+/// Walk every project dir under `projects_dir`, populating
+/// `existing` in place.  Returns `(added, refreshed)` counts.
+fn walk_and_update(
+    projects_dir: &Path,
+    existing: &mut CachedHarnessIndex,
+    scanned_ids: &mut HashSet<String>,
+) -> (usize, usize) {
     let project_entries = match fs::read_dir(projects_dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(_) => return (0, 0),
     };
 
-    let mut out = Vec::new();
+    let mut added = 0usize;
+    let mut refreshed = 0usize;
 
     for project_entry in project_entries.flatten() {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
             continue;
         }
-
         let file_entries = match fs::read_dir(&project_path) {
             Ok(e) => e,
             Err(_) => continue,
         };
-
         for file_entry in file_entries.flatten() {
             let file_path = file_entry.path();
             if file_path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
-
             let session_id = match file_path.file_stem() {
                 Some(s) => s.to_string_lossy().to_string(),
                 None => continue,
             };
+            scanned_ids.insert(session_id.clone());
 
-            // Skip known sessions: cwd and is_child are immutable
-            // post-creation, so even an active session getting events
-            // appended doesn't need re-indexing.
-            if known_ids.contains(&session_id) {
+            let metadata = match file_entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let current_mtime = mtime_ns_of(&metadata);
+
+            let needs_scan = match existing.sessions_by_id.get(&session_id) {
+                Some(s) => s.mtime_ns != current_mtime,
+                None => true,
+            };
+            if !needs_scan {
                 continue;
             }
 
-            let (cwd, is_child) = parse_session_header(&file_path);
-            let cwd_raw = match cwd {
-                Some(c) => c,
-                None => {
-                    log::trace!(
-                        "claudecode session-index: no cwd in {}",
-                        file_path.display()
-                    );
-                    continue;
-                }
-            };
+            let was_known = existing.sessions_by_id.contains_key(&session_id);
+            let (cwds_set, is_child) = scan_session_file(&file_path);
+            if cwds_set.is_empty() {
+                // No cwd anywhere in the file — skip.  Nothing to
+                // index (and the file likely isn't a real session).
+                continue;
+            }
+            let mut cwds: Vec<String> = cwds_set.into_iter().collect();
+            cwds.sort();
 
-            out.push(CachedSession {
-                id: session_id,
-                path: Some(file_path),
-                cwd_raw,
-                is_child,
-            });
+            existing.sessions_by_id.insert(
+                session_id.clone(),
+                CachedSession {
+                    id: session_id,
+                    path: Some(file_path),
+                    is_child,
+                    mtime_ns: current_mtime,
+                    cwds,
+                },
+            );
+            if was_known {
+                refreshed += 1;
+            } else {
+                added += 1;
+            }
         }
     }
-
-    if !out.is_empty() {
-        log::debug!(
-            "claudecode session-index: indexed {} new sessions",
-            out.len()
-        );
-    }
-    out
-}
-
-fn build_runtime(config: &Config, existing: &CachedHarnessIndex) -> ClaudeIndex {
-    let sessions = existing.sessions.clone();
-    let mut by_simplified: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, s) in sessions.iter().enumerate() {
-        let key = config.simplify_path(&s.cwd_raw);
-        by_simplified.entry(key).or_default().push(i);
-    }
-    ClaudeIndex {
-        sessions,
-        by_simplified,
-    }
-}
-
-/// Convert cached entries to `activity::SessionMeta` shape, using the
-/// supplied closure to construct each `SessionMeta`.  Decoupled so
-/// `activity.rs` keeps owning that type.
-pub fn to_session_metas<T, F>(index: &ClaudeIndex, mut make: F) -> Vec<T>
-where
-    F: FnMut(&CachedSession, String) -> T,
-{
-    index
-        .sessions
-        .iter()
-        .map(|s| {
-            // Find the simplified key this session was grouped under.
-            // We look it up to avoid recomputing ``simplify_path``.
-            let key = index
-                .by_simplified
-                .iter()
-                .find(|(_, idxs)| idxs.iter().any(|&i| std::ptr::eq(&index.sessions[i], s)))
-                .map(|(k, _)| k.clone())
-                .unwrap_or_default();
-            make(s, key)
-        })
-        .collect()
+    (added, refreshed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::{set_file_mtime, FileTime};
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    fn write_session(dir: &Path, proj_subdir: &str, session_id: &str, first_line: &str) -> PathBuf {
+    fn write_session(dir: &Path, proj_subdir: &str, session_id: &str, lines: &[&str]) -> PathBuf {
         let pdir = dir.join(proj_subdir);
         fs::create_dir_all(&pdir).unwrap();
         let path = pdir.join(format!("{}.jsonl", session_id));
         let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "{}", first_line).unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
         path
     }
 
     #[test]
-    fn parse_session_header_extracts_cwd_and_child_flag() {
+    fn scan_session_file_collects_all_cwds_from_every_entry() {
         let dir = tempdir().unwrap();
         let path = write_session(
             dir.path(),
             "-foo",
             "abc",
-            r#"{"type":"user","sessionId":"parent-uuid","cwd":"/foo"}"#,
+            &[
+                r#"{"type":"user","cwd":"/proj/A"}"#,
+                r#"{"type":"assistant","cwd":"/proj/A"}"#,
+                r#"{"type":"user","cwd":"/proj/B"}"#,
+                r#"{"type":"assistant","cwd":"/proj/B"}"#,
+                r#"{"type":"user","cwd":"/proj/A"}"#,
+            ],
         );
-        let (cwd, is_child) = parse_session_header(&path);
-        assert_eq!(cwd.as_deref(), Some("/foo"));
+        let (cwds, is_child) = scan_session_file(&path);
+        let mut sorted: Vec<_> = cwds.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["/proj/A", "/proj/B"]);
+        assert!(!is_child);
+    }
+
+    #[test]
+    fn scan_session_file_detects_child_from_first_parseable_line() {
+        let dir = tempdir().unwrap();
+        let path = write_session(
+            dir.path(),
+            "-foo",
+            "abc",
+            &[r#"{"type":"user","sessionId":"parent","cwd":"/x"}"#],
+        );
+        let (_, is_child) = scan_session_file(&path);
         assert!(is_child);
     }
 
     #[test]
-    fn parse_session_header_handles_non_child() {
+    fn scan_session_file_skips_blank_and_unparseable_lines() {
         let dir = tempdir().unwrap();
-        let path = write_session(dir.path(), "-foo", "abc", r#"{"type":"user","cwd":"/foo"}"#);
-        let (cwd, is_child) = parse_session_header(&path);
-        assert_eq!(cwd.as_deref(), Some("/foo"));
+        let path = write_session(
+            dir.path(),
+            "-foo",
+            "abc",
+            &["", r#"not json"#, r#"{"cwd":"/late"}"#],
+        );
+        let (cwds, is_child) = scan_session_file(&path);
+        let sorted: Vec<_> = cwds.iter().cloned().collect();
+        assert_eq!(sorted, vec!["/late".to_string()]);
+        // First parseable is the cwd-only entry → no sessionId → not child.
         assert!(!is_child);
     }
 
     #[test]
-    fn parse_session_header_skips_blank_lines_then_finds_cwd() {
+    fn scan_session_file_returns_empty_for_missing_cwd_lines() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("z.jsonl");
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(f).unwrap();
-        writeln!(f, r#"{{"type":"user"}}"#).unwrap();
-        writeln!(f, r#"{{"cwd":"/late"}}"#).unwrap();
-        let (cwd, is_child) = parse_session_header(&path);
-        assert_eq!(cwd.as_deref(), Some("/late"));
+        let path = write_session(
+            dir.path(),
+            "-foo",
+            "abc",
+            &[r#"{"type":"user"}"#, r#"{"type":"assistant"}"#],
+        );
+        let (cwds, _) = scan_session_file(&path);
+        assert!(cwds.is_empty());
+    }
+
+    #[test]
+    fn scan_session_file_handles_unreadable_path() {
+        let bogus = Path::new("/nonexistent/never/here.jsonl");
+        let (cwds, is_child) = scan_session_file(bogus);
+        assert!(cwds.is_empty());
         assert!(!is_child);
     }
 
     #[test]
-    fn parse_session_header_returns_none_for_unparseable() {
+    fn walk_and_update_indexes_new_files_only_once() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("z.jsonl");
-        fs::write(&path, "not json\n").unwrap();
-        let (cwd, is_child) = parse_session_header(&path);
-        assert!(cwd.is_none());
-        assert!(!is_child);
+        write_session(
+            dir.path(),
+            "-proj",
+            "s1",
+            &[r#"{"type":"user","cwd":"/proj"}"#],
+        );
+        let mut idx = CachedHarnessIndex::empty();
+        let mut scanned = HashSet::new();
+        let (added, refreshed) = walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert_eq!(added, 1);
+        assert_eq!(refreshed, 0);
+        assert_eq!(idx.sessions_by_id.len(), 1);
+        assert_eq!(idx.sessions_by_id["s1"].cwds, vec!["/proj"]);
+
+        // Second pass with same mtime: nothing changes.
+        let (added2, refreshed2) = walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert_eq!(added2, 0);
+        assert_eq!(refreshed2, 0);
     }
 
     #[test]
-    fn build_runtime_groups_by_simplified() {
-        let cfg = Config::default(); // identity simplify on raw paths
-        let cache = CachedHarnessIndex {
-            schema_version: SCHEMA_VERSION,
-            sessions: vec![
-                CachedSession {
-                    id: "a".into(),
-                    path: Some(PathBuf::from("/x/a.jsonl")),
-                    cwd_raw: "/foo".into(),
-                    is_child: false,
-                },
-                CachedSession {
-                    id: "b".into(),
-                    path: Some(PathBuf::from("/x/b.jsonl")),
-                    cwd_raw: "/foo".into(),
-                    is_child: false,
-                },
-                CachedSession {
-                    id: "c".into(),
-                    path: Some(PathBuf::from("/x/c.jsonl")),
-                    cwd_raw: "/bar".into(),
-                    is_child: true,
-                },
+    fn walk_and_update_rescans_when_mtime_changes_and_replaces_cwds() {
+        let dir = tempdir().unwrap();
+        let path = write_session(
+            dir.path(),
+            "-proj",
+            "s1",
+            &[r#"{"type":"user","cwd":"/old"}"#],
+        );
+        let mut idx = CachedHarnessIndex::empty();
+        let mut scanned = HashSet::new();
+        walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert_eq!(idx.sessions_by_id["s1"].cwds, vec!["/old"]);
+
+        // Rewrite with a different cwd; bump mtime explicitly.
+        fs::write(&path, r#"{"type":"user","cwd":"/new"}"#).unwrap();
+        let later = FileTime::from_unix_time(2_000_000_000, 0);
+        set_file_mtime(&path, later).unwrap();
+
+        let (added, refreshed) = walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert_eq!(added, 0);
+        assert_eq!(refreshed, 1);
+        // cwds REPLACED, not appended.
+        assert_eq!(idx.sessions_by_id["s1"].cwds, vec!["/new"]);
+    }
+
+    #[test]
+    fn walk_and_update_skips_files_with_no_cwd() {
+        let dir = tempdir().unwrap();
+        write_session(dir.path(), "-proj", "s1", &[r#"{"type":"user"}"#]);
+        let mut idx = CachedHarnessIndex::empty();
+        let mut scanned = HashSet::new();
+        let (added, _) = walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert_eq!(added, 0);
+        assert!(idx.sessions_by_id.is_empty());
+    }
+
+    #[test]
+    fn walk_and_update_records_multiple_cwds_per_session() {
+        let dir = tempdir().unwrap();
+        write_session(
+            dir.path(),
+            "-proj",
+            "s1",
+            &[
+                r#"{"cwd":"/proj/A"}"#,
+                r#"{"cwd":"/proj/B"}"#,
+                r#"{"cwd":"/proj/A"}"#,
             ],
-        };
-        let idx = build_runtime(&cfg, &cache);
-        assert_eq!(idx.for_project("/foo").len(), 2);
-        assert_eq!(idx.for_project("/bar").len(), 1);
-        assert_eq!(idx.for_project("/missing").len(), 0);
-        assert_eq!(idx.all().len(), 3);
-    }
-
-    #[test]
-    fn scan_for_new_sessions_finds_unseen_files() {
-        let dir = tempdir().unwrap();
-        write_session(
-            dir.path(),
-            "-proj",
-            "s1",
-            r#"{"type":"user","cwd":"/proj"}"#,
         );
-        write_session(
-            dir.path(),
-            "-proj",
-            "s2",
-            r#"{"type":"user","cwd":"/proj"}"#,
-        );
-        let known: HashSet<String> = HashSet::new();
-        let new = scan_for_new_sessions(dir.path(), &known);
-        assert_eq!(new.len(), 2);
-        let ids: HashSet<String> = new.iter().map(|s| s.id.clone()).collect();
-        assert!(ids.contains("s1"));
-        assert!(ids.contains("s2"));
+        let mut idx = CachedHarnessIndex::empty();
+        let mut scanned = HashSet::new();
+        walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert_eq!(idx.sessions_by_id["s1"].cwds, vec!["/proj/A", "/proj/B"]);
     }
 
     #[test]
-    fn scan_for_new_sessions_skips_known_ids() {
-        let dir = tempdir().unwrap();
-        write_session(
-            dir.path(),
-            "-proj",
-            "s1",
-            r#"{"type":"user","cwd":"/proj"}"#,
-        );
-        let mut known = HashSet::new();
-        known.insert("s1".to_string());
-        let new = scan_for_new_sessions(dir.path(), &known);
-        assert!(new.is_empty(), "known session should be skipped");
-    }
-
-    #[test]
-    fn scan_for_new_sessions_skips_files_without_cwd() {
-        let dir = tempdir().unwrap();
-        write_session(dir.path(), "-proj", "s1", r#"{"type":"user"}"#);
-        let known = HashSet::new();
-        let new = scan_for_new_sessions(dir.path(), &known);
-        assert!(new.is_empty(), "session without cwd should be skipped");
-    }
-
-    #[test]
-    fn scan_for_new_sessions_records_child_flag() {
+    fn walk_and_update_records_is_child_flag() {
         let dir = tempdir().unwrap();
         write_session(
             dir.path(),
             "-proj",
             "child",
-            r#"{"sessionId":"parent","cwd":"/proj"}"#,
+            &[r#"{"sessionId":"parent","cwd":"/proj"}"#],
         );
-        let known = HashSet::new();
-        let new = scan_for_new_sessions(dir.path(), &known);
-        assert_eq!(new.len(), 1);
-        assert!(new[0].is_child);
+        let mut idx = CachedHarnessIndex::empty();
+        let mut scanned = HashSet::new();
+        walk_and_update(dir.path(), &mut idx, &mut scanned);
+        assert!(idx.sessions_by_id["child"].is_child);
     }
 
     #[test]
-    fn scan_for_new_sessions_handles_missing_dir() {
+    fn walk_and_update_handles_missing_dir() {
         let dir = tempdir().unwrap();
         let nonexistent = dir.path().join("does-not-exist");
-        let known = HashSet::new();
-        let new = scan_for_new_sessions(&nonexistent, &known);
-        assert!(new.is_empty());
+        let mut idx = CachedHarnessIndex::empty();
+        let mut scanned = HashSet::new();
+        let (added, refreshed) = walk_and_update(&nonexistent, &mut idx, &mut scanned);
+        assert_eq!(added, 0);
+        assert_eq!(refreshed, 0);
+    }
+
+    #[test]
+    fn claude_index_for_categ_id_resolves_via_simplify() {
+        let mut inner = CachedHarnessIndex::empty();
+        inner.sessions_by_id.insert(
+            "s1".to_string(),
+            CachedSession {
+                id: "s1".to_string(),
+                path: None,
+                is_child: false,
+                mtime_ns: 0,
+                cwds: vec!["/foo".to_string()],
+            },
+        );
+        inner.rebuild_by_path();
+        let claude = ClaudeIndex { inner };
+
+        let cfg = Config::default(); // identity simplify on raw paths
+        let found = claude.for_categ_id("/foo", &cfg);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "s1");
+    }
+
+    #[test]
+    fn claude_index_for_categ_id_returns_session_in_multiple_buckets_only_once() {
+        let mut inner = CachedHarnessIndex::empty();
+        inner.sessions_by_id.insert(
+            "s1".to_string(),
+            CachedSession {
+                id: "s1".to_string(),
+                path: None,
+                is_child: false,
+                mtime_ns: 0,
+                cwds: vec!["/a".to_string(), "/b".to_string()],
+            },
+        );
+        inner.rebuild_by_path();
+        // toy simplify: both /a and /b → "X"
+        let claude = ClaudeIndex { inner };
+        // Use Config::default() identity simplify so /a and /b are
+        // distinct keys; assert lookup by /a yields s1 once.
+        let cfg = Config::default();
+        let found = claude.for_categ_id("/a", &cfg);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "s1");
     }
 }

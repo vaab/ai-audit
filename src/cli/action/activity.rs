@@ -139,8 +139,7 @@ pub fn run(action: ActivityAction) -> Result<()> {
                     let t_cache_scan = std::time::Instant::now();
 
                     for ident in &requested_idents {
-                        let files =
-                            activity::enumerate_files_for_ident_with_index(ident, &session_index);
+                        let files = activity::enumerate_files_for_ident_via_cache(ident, &config);
                         let fingerprint = empty_segments::Cache::fingerprint_for_files(&files)?;
                         match cache.load(ident) {
                             Some(entry) if entry.fingerprint == fingerprint => {

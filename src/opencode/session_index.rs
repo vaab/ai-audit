@@ -1,88 +1,94 @@
-//! On-disk cache of OpenCode session metadata.
+//! On-disk cache of OpenCode session metadata (v2 — file storage only).
 //!
 //! OpenCode persists sessions through two backends:
-//! - Per-project file storage at `storage/session/<hash>/<ses_*>.json`.
-//! - A SQLite database at `opencode.db` with a `session` table.
 //!
-//! The DB is queried with `SELECT … WHERE time_created > ?` so warm
-//! runs only fetch genuinely new sessions.  File storage is walked
-//! mtime-aware: paths already in the cache are skipped entirely.
+//! - **SQLite database** at `opencode.db`.  This backend has its own
+//!   indexed `WHERE directory = ?` query path; caching it on top
+//!   would duplicate state without speedup.  We query the DB
+//!   directly each time and merge results into the runtime view.
+//! - **Per-project file storage** under
+//!   `storage/session/<hash>/<ses_*>.json`.  This backend benefits
+//!   from caching: walking the hash-sharded directory tree and
+//!   parsing each session JSON adds up across thousands of
+//!   sessions.
 //!
-//! Sessions appearing in both backends are merged with DB winning on
-//! conflict (matches the existing `scan_opencode_sessions_to_meta`
-//! / `scan_opencode_sessions_to_meta_from_db` semantics).
+//! Only the file-storage portion participates in the persisted
+//! `opencode.json` cache.  DB rows are looked up live and merged at
+//! `update_and_load` time, with DB winning on session-id collision
+//! (matches the legacy `merge_session_metas` precedence).
+//!
+//! OpenCode structurally records cwd only at the session-creation
+//! level (the `directory` column / JSON field).  Each session's
+//! `cwds` set is therefore single-element in practice.
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::session_index::{self as idx, CachedHarnessIndex, CachedSession, SCHEMA_VERSION};
+use crate::session_index::{
+    self as idx, mtime_ns_of, CachedHarnessIndex, CachedSession, SCHEMA_VERSION,
+};
 
 const CACHE_FILE: &str = "opencode.json";
 
-/// Live runtime view backed by the persisted cache.
 #[derive(Debug, Default, Clone)]
 pub struct OpenCodeIndex {
-    sessions: Vec<CachedSession>,
-    by_simplified: HashMap<String, Vec<usize>>,
+    /// Combined view: cached file-storage entries unioned with live
+    /// DB rows.  DB wins on id collision.
+    inner: CachedHarnessIndex,
 }
 
 impl OpenCodeIndex {
-    pub fn for_project(&self, simplified_project_dir: &str) -> Vec<&CachedSession> {
-        match self.by_simplified.get(simplified_project_dir) {
-            Some(idxs) => idxs.iter().map(|&i| &self.sessions[i]).collect(),
-            None => Vec::new(),
-        }
+    pub fn all(&self) -> impl Iterator<Item = &CachedSession> {
+        self.inner.sessions_by_id.values()
     }
 
-    pub fn all(&self) -> &[CachedSession] {
-        &self.sessions
+    pub fn for_categ_id(&self, categ_id: &str, config: &Config) -> Vec<&CachedSession> {
+        self.inner
+            .lookup_by_categ_id(categ_id, |raw| config.simplify_path(raw))
     }
 }
 
-/// Build or refresh the OpenCode session-index cache.
-pub fn update_and_load(config: &Config) -> Result<OpenCodeIndex> {
+pub fn update_and_load(_config: &Config) -> Result<OpenCodeIndex> {
+    // 1. Load the persisted file-storage cache and refresh it from
+    //    on-disk session JSON files.
     let mut existing =
         idx::load_harness_index(CACHE_FILE).unwrap_or_else(CachedHarnessIndex::empty);
     existing.schema_version = SCHEMA_VERSION;
 
-    let known_ids: HashSet<String> = existing.sessions.iter().map(|s| s.id.clone()).collect();
-
     let session_dir = crate::opencode_data_dir().join("storage").join("session");
-    let from_files = scan_files_for_new_sessions(&session_dir, &known_ids);
-    let from_db = scan_db_for_new_sessions(&known_ids);
+    refresh_file_cache(&session_dir, &mut existing);
+    existing.rebuild_by_path();
+    idx::save_harness_index(CACHE_FILE, &existing)?;
 
-    let merged = merge_new(from_files, from_db);
-    if !merged.is_empty() {
-        existing.sessions.extend(merged);
-        log::debug!(
-            "opencode session-index: cache size now {}",
-            existing.sessions.len()
-        );
+    // 2. Query the DB live and merge.  DB wins on id collision.
+    let mut combined = existing.clone();
+    if let Some(db_sessions) = query_db_sessions() {
+        for session in db_sessions {
+            combined.sessions_by_id.insert(session.id.clone(), session);
+        }
+        combined.rebuild_by_path();
     }
 
-    idx::save_harness_index(CACHE_FILE, &existing)?;
-    Ok(build_runtime(config, &existing))
+    Ok(OpenCodeIndex { inner: combined })
 }
 
-/// File-storage scan: walk `storage/session/<hash>/*.json` and parse
-/// any unseen session_id.  OpenCode session JSON files are small —
-/// we read the whole file as that's the existing pattern.
-fn scan_files_for_new_sessions(
-    session_dir: &Path,
-    known_ids: &HashSet<String>,
-) -> Vec<CachedSession> {
+fn refresh_file_cache(session_dir: &Path, existing: &mut CachedHarnessIndex) {
     if !session_dir.exists() {
-        return Vec::new();
+        return;
     }
     let project_entries = match fs::read_dir(session_dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
-    let mut out = Vec::new();
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut added = 0usize;
+    let mut refreshed = 0usize;
+
     for project_entry in project_entries.flatten() {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
@@ -97,18 +103,76 @@ fn scan_files_for_new_sessions(
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            if let Some(session) = parse_session_file(&path, known_ids) {
-                out.push(session);
+            let metadata = match session_file.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let current_mtime = mtime_ns_of(&metadata);
+
+            // Look up by path (we don't yet know the session_id).
+            let existing_id = existing
+                .sessions_by_id
+                .iter()
+                .find(|(_, s)| s.path.as_deref() == Some(path.as_path()))
+                .map(|(id, _)| id.clone());
+
+            if let Some(id) = &existing_id {
+                visited.insert(id.clone());
+                if let Some(s) = existing.sessions_by_id.get(id) {
+                    if s.mtime_ns == current_mtime {
+                        continue;
+                    }
+                }
+            }
+
+            let parsed = match parse_session_file(&path) {
+                Some(p) => p,
+                None => continue,
+            };
+            let was_known = existing.sessions_by_id.contains_key(&parsed.id);
+            visited.insert(parsed.id.clone());
+            existing.sessions_by_id.insert(
+                parsed.id.clone(),
+                CachedSession {
+                    id: parsed.id,
+                    path: Some(path),
+                    is_child: parsed.is_child,
+                    mtime_ns: current_mtime,
+                    cwds: if parsed.directory.is_empty() {
+                        vec![]
+                    } else {
+                        vec![parsed.directory]
+                    },
+                },
+            );
+            if was_known {
+                refreshed += 1;
+            } else {
+                added += 1;
             }
         }
     }
-    if !out.is_empty() {
+
+    // Lazy cleanup: drop file-backed entries we didn't see this run.
+    let stale_ids: Vec<String> = existing
+        .sessions_by_id
+        .iter()
+        .filter(|(id, s)| s.path.is_some() && !visited.contains(id.as_str()))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &stale_ids {
+        existing.remove_session(id);
+    }
+
+    if added > 0 || refreshed > 0 || !stale_ids.is_empty() {
         log::debug!(
-            "opencode session-index: indexed {} new sessions from files",
-            out.len()
+            "opencode session-index (file): +{} new, {} re-read, {} stale dropped; cache size {}",
+            added,
+            refreshed,
+            stale_ids.len(),
+            existing.sessions_by_id.len()
         );
     }
-    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,92 +183,53 @@ struct OpenCodeSessionFile {
     parent_id: Option<String>,
 }
 
-fn parse_session_file(path: &Path, known_ids: &HashSet<String>) -> Option<CachedSession> {
+struct ParsedFileSession {
+    id: String,
+    directory: String,
+    is_child: bool,
+}
+
+fn parse_session_file(path: &Path) -> Option<ParsedFileSession> {
     let content = fs::read_to_string(path).ok()?;
     let session: OpenCodeSessionFile = serde_json::from_str(&content).ok()?;
-    if known_ids.contains(&session.id) {
-        return None;
-    }
-    Some(CachedSession {
+    Some(ParsedFileSession {
         id: session.id,
-        path: None,
-        cwd_raw: session.directory.unwrap_or_default(),
+        directory: session.directory.unwrap_or_default(),
         is_child: session.parent_id.is_some(),
     })
 }
 
-/// DB scan: query all sessions, filter to unseen IDs.  Doing the
-/// filter in-memory is fine because the DB row count is small and
-/// we can't safely query `WHERE id NOT IN (?, ?, …)` for arbitrary-
-/// length parameter lists without batching.
-fn scan_db_for_new_sessions(known_ids: &HashSet<String>) -> Vec<CachedSession> {
+/// Direct DB query — no caching layer.  SQLite already supports
+/// indexed `directory` lookups, and the DB row is the source of
+/// truth.  Returns `None` if the DB is missing or unreadable
+/// (caller falls back to file-cache only).
+fn query_db_sessions() -> Option<Vec<CachedSession>> {
     if !crate::opencode::db::db_exists() {
-        return Vec::new();
+        return None;
     }
-    let conn = match crate::opencode::db::open_db() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let sessions = match crate::opencode::db::list_sessions_from_conn(&conn) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for s in sessions {
-        if known_ids.contains(&s.session_id) {
-            continue;
-        }
-        out.push(CachedSession {
+    let conn = crate::opencode::db::open_db().ok()?;
+    let sessions = crate::opencode::db::list_sessions_from_conn(&conn).ok()?;
+    let out = sessions
+        .into_iter()
+        .map(|s| CachedSession {
             id: s.session_id,
             path: None,
-            cwd_raw: s.project_dir,
             is_child: s.parent_id.is_some(),
-        });
-    }
-    if !out.is_empty() {
-        log::debug!(
-            "opencode session-index: indexed {} new sessions from db",
-            out.len()
-        );
-    }
-    out
-}
-
-/// Merge file-source and DB-source new-session lists.  DB wins on
-/// id collision (matches existing `merge_session_metas` semantics).
-fn merge_new(from_files: Vec<CachedSession>, from_db: Vec<CachedSession>) -> Vec<CachedSession> {
-    let mut by_id: HashMap<String, CachedSession> = HashMap::new();
-    for s in from_files {
-        by_id.insert(s.id.clone(), s);
-    }
-    for s in from_db {
-        by_id.insert(s.id.clone(), s);
-    }
-    by_id.into_values().collect()
-}
-
-fn build_runtime(config: &Config, existing: &CachedHarnessIndex) -> OpenCodeIndex {
-    let sessions = existing.sessions.clone();
-    let mut by_simplified: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, s) in sessions.iter().enumerate() {
-        let key = if s.cwd_raw.is_empty() {
-            "unknown".to_string()
-        } else {
-            config.simplify_path(&s.cwd_raw)
-        };
-        by_simplified.entry(key).or_default().push(i);
-    }
-    OpenCodeIndex {
-        sessions,
-        by_simplified,
-    }
+            mtime_ns: 0,
+            cwds: if s.project_dir.is_empty() {
+                vec![]
+            } else {
+                vec![s.project_dir]
+            },
+        })
+        .collect();
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use std::path::PathBuf;
+    use filetime::{set_file_mtime, FileTime};
     use tempfile::tempdir;
 
     fn make_session_json(id: &str, directory: &str, parent: Option<&str>) -> String {
@@ -221,17 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_file_skips_known() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("ses_known.json");
-        fs::write(&path, make_session_json("ses_known", "/foo", None)).unwrap();
-        let mut known = HashSet::new();
-        known.insert("ses_known".to_string());
-        assert!(parse_session_file(&path, &known).is_none());
-    }
-
-    #[test]
-    fn parse_session_file_extracts_directory_and_parent() {
+    fn parse_session_file_extracts_id_directory_and_parent() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ses_a.json");
         fs::write(
@@ -239,11 +254,10 @@ mod tests {
             make_session_json("ses_a", "/proj-a", Some("ses_parent")),
         )
         .unwrap();
-        let known = HashSet::new();
-        let s = parse_session_file(&path, &known).unwrap();
-        assert_eq!(s.id, "ses_a");
-        assert_eq!(s.cwd_raw, "/proj-a");
-        assert!(s.is_child);
+        let parsed = parse_session_file(&path).unwrap();
+        assert_eq!(parsed.id, "ses_a");
+        assert_eq!(parsed.directory, "/proj-a");
+        assert!(parsed.is_child);
     }
 
     #[test]
@@ -251,25 +265,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ses_bad.json");
         fs::write(&path, "not json").unwrap();
-        let known = HashSet::new();
-        assert!(parse_session_file(&path, &known).is_none());
+        assert!(parse_session_file(&path).is_none());
     }
 
     #[test]
-    fn parse_session_file_handles_missing_directory() {
+    fn parse_session_file_handles_missing_directory_as_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ses_a.json");
         fs::write(&path, r#"{"id":"ses_a","time":{"created":0}}"#).unwrap();
-        let known = HashSet::new();
-        let s = parse_session_file(&path, &known).unwrap();
-        assert_eq!(s.cwd_raw, "");
-        assert!(!s.is_child);
+        let parsed = parse_session_file(&path).unwrap();
+        assert_eq!(parsed.directory, "");
+        assert!(!parsed.is_child);
     }
 
     #[test]
-    fn scan_files_skips_known_ids() {
+    fn refresh_file_cache_indexes_new_sessions() {
         let dir = tempdir().unwrap();
-        let proj = dir.path().join("project_hash");
+        let proj = dir.path().join("proj_hash");
         fs::create_dir_all(&proj).unwrap();
         fs::write(
             proj.join("ses_a.json"),
@@ -281,82 +293,93 @@ mod tests {
             make_session_json("ses_b", "/y", None),
         )
         .unwrap();
-        let mut known = HashSet::new();
-        known.insert("ses_a".to_string());
-        let new = scan_files_for_new_sessions(dir.path(), &known);
-        assert_eq!(new.len(), 1);
-        assert_eq!(new[0].id, "ses_b");
+
+        let mut idx = CachedHarnessIndex::empty();
+        refresh_file_cache(dir.path(), &mut idx);
+        assert_eq!(idx.sessions_by_id.len(), 2);
+        assert_eq!(idx.sessions_by_id["ses_a"].cwds, vec!["/x"]);
+        assert_eq!(idx.sessions_by_id["ses_b"].cwds, vec!["/y"]);
     }
 
     #[test]
-    fn scan_files_handles_missing_dir() {
+    fn refresh_file_cache_skips_unchanged_files() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("proj_hash");
+        fs::create_dir_all(&proj).unwrap();
+        let session_path = proj.join("ses_a.json");
+        fs::write(&session_path, make_session_json("ses_a", "/x", None)).unwrap();
+
+        let mut idx = CachedHarnessIndex::empty();
+        refresh_file_cache(dir.path(), &mut idx);
+        let initial_mtime = idx.sessions_by_id["ses_a"].mtime_ns;
+
+        // Second pass with no file change → mtime unchanged.
+        refresh_file_cache(dir.path(), &mut idx);
+        assert_eq!(idx.sessions_by_id["ses_a"].mtime_ns, initial_mtime);
+    }
+
+    #[test]
+    fn refresh_file_cache_rescans_when_mtime_changes_replacing_cwds() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("proj_hash");
+        fs::create_dir_all(&proj).unwrap();
+        let session_path = proj.join("ses_a.json");
+        fs::write(&session_path, make_session_json("ses_a", "/old", None)).unwrap();
+
+        let mut idx = CachedHarnessIndex::empty();
+        refresh_file_cache(dir.path(), &mut idx);
+        assert_eq!(idx.sessions_by_id["ses_a"].cwds, vec!["/old"]);
+
+        fs::write(&session_path, make_session_json("ses_a", "/new", None)).unwrap();
+        set_file_mtime(&session_path, FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+        refresh_file_cache(dir.path(), &mut idx);
+        assert_eq!(idx.sessions_by_id["ses_a"].cwds, vec!["/new"]);
+    }
+
+    #[test]
+    fn refresh_file_cache_drops_disappeared_sessions() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("proj_hash");
+        fs::create_dir_all(&proj).unwrap();
+        let session_path = proj.join("ses_a.json");
+        fs::write(&session_path, make_session_json("ses_a", "/x", None)).unwrap();
+
+        let mut idx = CachedHarnessIndex::empty();
+        refresh_file_cache(dir.path(), &mut idx);
+        assert!(idx.sessions_by_id.contains_key("ses_a"));
+
+        fs::remove_file(&session_path).unwrap();
+        refresh_file_cache(dir.path(), &mut idx);
+        assert!(!idx.sessions_by_id.contains_key("ses_a"));
+    }
+
+    #[test]
+    fn refresh_file_cache_handles_missing_dir() {
         let dir = tempdir().unwrap();
         let nonexistent = dir.path().join("does-not-exist");
-        let known = HashSet::new();
-        let new = scan_files_for_new_sessions(&nonexistent, &known);
-        assert!(new.is_empty());
+        let mut idx = CachedHarnessIndex::empty();
+        refresh_file_cache(&nonexistent, &mut idx);
+        assert!(idx.sessions_by_id.is_empty());
     }
 
     #[test]
-    fn merge_new_db_wins_on_conflict() {
-        let from_file = vec![CachedSession {
-            id: "shared".into(),
-            path: None,
-            cwd_raw: "FROM_FILE".into(),
-            is_child: false,
-        }];
-        let from_db = vec![CachedSession {
-            id: "shared".into(),
-            path: None,
-            cwd_raw: "FROM_DB".into(),
-            is_child: true,
-        }];
-        let merged = merge_new(from_file, from_db);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].cwd_raw, "FROM_DB");
-        assert!(merged[0].is_child);
-    }
-
-    #[test]
-    fn merge_new_keeps_disjoint_entries() {
-        let from_file = vec![CachedSession {
-            id: "a".into(),
-            path: None,
-            cwd_raw: "/x".into(),
-            is_child: false,
-        }];
-        let from_db = vec![CachedSession {
-            id: "b".into(),
-            path: None,
-            cwd_raw: "/y".into(),
-            is_child: false,
-        }];
-        let merged = merge_new(from_file, from_db);
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn build_runtime_groups_by_simplified() {
+    fn opencode_index_for_categ_id_resolves_via_simplify() {
+        let mut inner = CachedHarnessIndex::empty();
+        inner.sessions_by_id.insert(
+            "ses_x".to_string(),
+            CachedSession {
+                id: "ses_x".to_string(),
+                path: None,
+                is_child: false,
+                mtime_ns: 0,
+                cwds: vec!["/foo".to_string()],
+            },
+        );
+        inner.rebuild_by_path();
+        let oc = OpenCodeIndex { inner };
         let cfg = Config::default();
-        let cache = CachedHarnessIndex {
-            schema_version: SCHEMA_VERSION,
-            sessions: vec![
-                CachedSession {
-                    id: "ses_a".into(),
-                    path: None,
-                    cwd_raw: "/foo".into(),
-                    is_child: false,
-                },
-                CachedSession {
-                    id: "ses_b".into(),
-                    path: None,
-                    cwd_raw: "".into(),
-                    is_child: false,
-                },
-            ],
-        };
-        let idx = build_runtime(&cfg, &cache);
-        assert_eq!(idx.for_project("/foo").len(), 1);
-        assert_eq!(idx.for_project("unknown").len(), 1);
+        let found = oc.for_categ_id("/foo", &cfg);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "ses_x");
     }
 }

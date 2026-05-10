@@ -1080,13 +1080,13 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
         match crate::claudecode::session_index::update_and_load(config) {
             Ok(idx) => {
                 for s in idx.all() {
-                    all_sessions.push(SessionMeta {
-                        id: s.id.clone(),
-                        project_dir: simplify_or_unknown(config, &s.cwd_raw),
-                        is_child: s.is_child,
-                        provider: Provider::ClaudeCode,
-                        session_file: s.path.clone(),
-                    });
+                    push_session_metas(
+                        &mut all_sessions,
+                        config,
+                        s,
+                        Provider::ClaudeCode,
+                        s.path.clone(),
+                    );
                 }
             }
             Err(e) => {
@@ -1102,13 +1102,7 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
         match crate::opencode::session_index::update_and_load(config) {
             Ok(idx) => {
                 for s in idx.all() {
-                    all_sessions.push(SessionMeta {
-                        id: s.id.clone(),
-                        project_dir: simplify_or_unknown(config, &s.cwd_raw),
-                        is_child: s.is_child,
-                        provider: Provider::OpenCode,
-                        session_file: None,
-                    });
+                    push_session_metas(&mut all_sessions, config, s, Provider::OpenCode, None);
                 }
             }
             Err(e) => {
@@ -1127,13 +1121,7 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
         match crate::pi::session_index::update_and_load(config) {
             Ok(idx) => {
                 for s in idx.all() {
-                    all_sessions.push(SessionMeta {
-                        id: s.id.clone(),
-                        project_dir: simplify_or_unknown(config, &s.cwd_raw),
-                        is_child: s.is_child,
-                        provider: Provider::Pi,
-                        session_file: s.path.clone(),
-                    });
+                    push_session_metas(&mut all_sessions, config, s, Provider::Pi, s.path.clone());
                 }
             }
             Err(e) => {
@@ -1146,7 +1134,7 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
         }
     }
     log::debug!(
-        "build_session_index: {} sessions in {:?}",
+        "build_session_index: {} sessions ({:?})",
         all_sessions.len(),
         t.elapsed()
     );
@@ -1155,15 +1143,51 @@ fn build_session_index(config: &Config, filter: &IdentifierFilter) -> SessionInd
     }
 }
 
-/// Apply the user's path-simplification rules.  Empty `cwd_raw`
-/// (e.g. an OpenCode session row whose `directory` column was NULL)
-/// becomes the literal string ``"unknown"`` to preserve the existing
-/// behaviour of the pre-cache scanners.
-fn simplify_or_unknown(config: &Config, cwd_raw: &str) -> String {
-    if cwd_raw.is_empty() {
-        "unknown".to_string()
-    } else {
-        config.simplify_path(cwd_raw)
+/// Emit one `SessionMeta` per cwd recorded for this cached session.
+///
+/// Multi-cwd sessions (a session that recorded different cwds across
+/// its lifetime — common in Claude after a `cd`) appear once per
+/// distinct cwd in the resulting index.  Iteration in
+/// ``collect_all_activity_events`` deduplicates by session id before
+/// parsing the underlying file.  Lookup paths
+/// (``enumerate_files_for_ident_with_index``,
+/// ``list_identifiers_with_index``) naturally surface each
+/// (session, cwd) pair as a distinct entry, with the existing
+/// dedup-on-output handling collisions.
+///
+/// Sessions whose ``cwds`` set is empty (no cwd ever recorded —
+/// e.g. an OpenCode row with NULL directory) emit a single entry
+/// under the ``"unknown"`` project_dir, matching legacy behaviour.
+fn push_session_metas(
+    out: &mut Vec<SessionMeta>,
+    config: &Config,
+    cached: &crate::session_index::CachedSession,
+    provider: Provider,
+    path: Option<std::path::PathBuf>,
+) {
+    if cached.cwds.is_empty() {
+        out.push(SessionMeta {
+            id: cached.id.clone(),
+            project_dir: "unknown".to_string(),
+            is_child: cached.is_child,
+            provider,
+            session_file: path,
+        });
+        return;
+    }
+    for cwd_raw in &cached.cwds {
+        let project_dir = if cwd_raw.is_empty() {
+            "unknown".to_string()
+        } else {
+            config.simplify_path(cwd_raw)
+        };
+        out.push(SessionMeta {
+            id: cached.id.clone(),
+            project_dir,
+            is_child: cached.is_child,
+            provider,
+            session_file: path.clone(),
+        });
     }
 }
 
@@ -1225,17 +1249,24 @@ fn collect_all_activity_events(
     let mut all_events = Vec::new();
 
     if filter.include_claude && filter.include_messages {
+        // Multi-cwd sessions appear once per cwd in the index;
+        // dedup by id so we parse the file only once.  Per-event
+        // cwd in the JSONL drives ident assignment downstream.
+        let mut parsed_ids: HashSet<String> = HashSet::new();
         for meta in index.non_child() {
             if meta.provider != Provider::ClaudeCode {
+                continue;
+            }
+            if !parsed_ids.insert(meta.id.clone()) {
                 continue;
             }
             let session_file = match &meta.session_file {
                 Some(path) => path,
                 None => continue,
             };
-            if let Ok(events) =
-                parse_claudecode_messages(session_file, config, Some(&meta.project_dir))
-            {
+            // Pass `None` so each event's own ``cwd`` field decides
+            // its ident — required for multi-cwd correctness.
+            if let Ok(events) = parse_claudecode_messages(session_file, config, None) {
                 all_events.extend(
                     events
                         .into_iter()
@@ -1286,8 +1317,12 @@ fn collect_all_activity_events(
     }
 
     if filter.include_pi && filter.include_messages {
+        let mut parsed_ids: HashSet<String> = HashSet::new();
         for meta in index.non_child() {
             if meta.provider != Provider::Pi {
+                continue;
+            }
+            if !parsed_ids.insert(meta.id.clone()) {
                 continue;
             }
             let session_file = match &meta.session_file {
@@ -1429,6 +1464,79 @@ pub fn enumerate_files_for_ident(ident: &str, config: &Config) -> Vec<PathBuf> {
     let filter = parse_identifier_filter(&[ident.to_string()]);
     let index = build_session_index(config, &filter);
     enumerate_files_for_ident_with_index(ident, &index)
+}
+
+/// Fast-path file enumeration: bypass `SessionIndex` and hit the
+/// per-harness session-index cache directly via its path-keyed map.
+///
+/// Used by the empty-segs hot path where we only need the files for
+/// a single ident.  Cost is O(N_paths_in_harness × simplify_cost),
+/// not O(N_total_sessions).  Returns paths in sorted order, deduped.
+pub fn enumerate_files_for_ident_via_cache(ident: &str, config: &Config) -> Vec<PathBuf> {
+    let Some((provider, activity_type, categ_id)) = parse_exact_ident(ident) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+
+    match (provider, activity_type) {
+        (Provider::ClaudeCode, ActivityType::Message) => {
+            if let Ok(idx) = crate::claudecode::session_index::update_and_load(config) {
+                for s in idx.for_categ_id(categ_id, config) {
+                    if s.is_child {
+                        continue;
+                    }
+                    if let Some(p) = &s.path {
+                        files.push(p.clone());
+                    }
+                }
+            }
+        }
+        (Provider::ClaudeCode, ActivityType::Permission) => {
+            if let Ok(idx) = crate::claudecode::session_index::update_and_load(config) {
+                for s in idx.for_categ_id(categ_id, config) {
+                    let p = crate::claudecode::debug_dir().join(format!("{}.txt", s.id));
+                    if p.exists() {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        (Provider::OpenCode, ActivityType::Message) => {
+            if let Ok(idx) = crate::opencode::session_index::update_and_load(config) {
+                for s in idx.for_categ_id(categ_id, config) {
+                    if s.is_child {
+                        continue;
+                    }
+                    let dir = crate::opencode_data_dir()
+                        .join("storage")
+                        .join("message")
+                        .join(&s.id);
+                    files.extend(list_json_files(&dir));
+                }
+            }
+            let db_path = crate::opencode::db::db_path();
+            if db_path.exists() {
+                files.push(db_path);
+            }
+        }
+        (Provider::Pi, ActivityType::Message) => {
+            if let Ok(idx) = crate::pi::session_index::update_and_load(config) {
+                for s in idx.for_categ_id(categ_id, config) {
+                    if s.is_child {
+                        continue;
+                    }
+                    if let Some(p) = &s.path {
+                        files.push(p.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    files.sort();
+    files.dedup();
+    files
 }
 
 pub fn fetch_all_event_timestamps_with_index(
