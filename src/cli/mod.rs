@@ -63,8 +63,13 @@ pub fn run() -> Result<()> {
 
     let args = Args::parse();
     setup_logging(args.verbose, args.quiet);
+
+    if args.color && args.no_color {
+        anyhow::bail!("Cannot use both --color and --no-color");
+    }
+
     // Detect TTY before pager fork (pager turns stdout into a pipe).
-    color::init();
+    color::init(args.color, args.no_color);
     setup_pager(args.command.output_format());
     action::dispatch(args.command, args.quiet, args.verbose)
 }

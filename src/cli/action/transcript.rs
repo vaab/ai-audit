@@ -1,4 +1,5 @@
 use anyhow::Result;
+use colored::{ColoredString, Colorize};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -59,9 +60,13 @@ pub fn run(
         OutputFormat::Human => {
             for entry in &entries {
                 let ts = format_timestamp_display(entry.timestamp.timestamp());
-                let label = format_human_label(entry);
+                let label = format_human_label_colored(entry);
                 let content = format_human_content(entry);
-                writeln!(handle, "{} {} {}", ts, label, content)?;
+                // The `colored` crate gates ANSI emission via a global override
+                // set by `cli::color::init()`. When colors are off, `ts.cyan()`
+                // and the `ColoredString` from `format_human_label_colored`
+                // both render as plain text.
+                writeln!(handle, "{} {} {}", ts.cyan(), label, content)?;
             }
         }
         OutputFormat::Json => {
@@ -97,6 +102,38 @@ fn format_human_label(entry: &TranscriptEntry) -> String {
         (_, EntryType::ToolError) => "[tool_result/error]".to_string(),
         (_, EntryType::Error) => "[error]".to_string(),
         (role, entry_type) => format!("[{}/{}]", role.as_str(), entry_type.as_str()),
+    }
+}
+
+/// Color-aware label for human output.
+///
+/// Returns a `ColoredString`; when the `colored` global override is off
+/// (set by `cli::color::init()`), the styling is a no-op and the output
+/// renders as plain ASCII identical to [`format_human_label`].
+///
+/// Palette (ANSI-16, consistent with `list_sessions.rs`):
+///
+/// | Label                  | Style                  |
+/// |------------------------|------------------------|
+/// | `[user]`               | green, bold            |
+/// | `[assistant]`          | blue, bold             |
+/// | `[assistant/tool_use]` | magenta, bold          |
+/// | `[assistant/thinking]` | bright_black (dim)     |
+/// | `[tool_result]`        | yellow                 |
+/// | `[tool_result/error]`  | red, bold              |
+/// | `[error]`              | red, bold              |
+/// | catch-all              | white (neutral)        |
+fn format_human_label_colored(entry: &TranscriptEntry) -> ColoredString {
+    let plain = format_human_label(entry);
+    match (&entry.role, &entry.entry_type) {
+        (Role::User, EntryType::Text) => plain.green().bold(),
+        (Role::Assistant, EntryType::Text) => plain.blue().bold(),
+        (Role::Assistant, EntryType::ToolUse) => plain.magenta().bold(),
+        (Role::Assistant, EntryType::Thinking) => plain.bright_black(),
+        (_, EntryType::ToolResult) => plain.yellow(),
+        (_, EntryType::ToolError) => plain.red().bold(),
+        (_, EntryType::Error) => plain.red().bold(),
+        (_, _) => plain.white(),
     }
 }
 
@@ -362,5 +399,97 @@ mod tests {
             format_human_content(&entry),
             "No Chrome extension connected."
         );
+    }
+
+    // ---- Color tests ---------------------------------------------------
+    //
+    // These tests inspect the `ColoredString` styling attributes
+    // directly (foreground color + bold-style bit) rather than rendering
+    // through `Display`.  Rendering depends on the GLOBAL `colored`
+    // override, which other tests in this process may toggle in
+    // parallel — checking the attributes avoids that race entirely.
+
+    fn entry_of(role: Role, entry_type: EntryType) -> TranscriptEntry {
+        TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role,
+            entry_type,
+            content: String::new(),
+            tool_name: None,
+            tool_input: None,
+        }
+    }
+
+    #[test]
+    fn test_format_human_label_colored_preserves_plain_text() {
+        // The colored label MUST match the plain label byte-for-byte
+        // when ANSI escapes are stripped — i.e. the user-visible text
+        // is the same; only styling is added.
+        for (role, entry_type) in [
+            (Role::User, EntryType::Text),
+            (Role::Assistant, EntryType::Text),
+            (Role::Assistant, EntryType::ToolUse),
+            (Role::Assistant, EntryType::Thinking),
+            (Role::User, EntryType::ToolResult),
+            (Role::User, EntryType::ToolError),
+            (Role::User, EntryType::Error),
+        ] {
+            let e = entry_of(role, entry_type);
+            let plain = format_human_label(&e);
+            let cs = format_human_label_colored(&e);
+            let colored_input: &str = cs.as_ref();
+            assert_eq!(
+                colored_input, plain,
+                "colored input text must equal plain label for {:?}/{:?}",
+                e.role, e.entry_type,
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_human_label_colored_user_is_green_bold() {
+        let cs = format_human_label_colored(&entry_of(Role::User, EntryType::Text));
+        assert_eq!(cs.fgcolor, Some(colored::Color::Green));
+        assert!(cs.style.contains(colored::Styles::Bold));
+    }
+
+    #[test]
+    fn test_format_human_label_colored_assistant_is_blue_bold() {
+        let cs = format_human_label_colored(&entry_of(Role::Assistant, EntryType::Text));
+        assert_eq!(cs.fgcolor, Some(colored::Color::Blue));
+        assert!(cs.style.contains(colored::Styles::Bold));
+    }
+
+    #[test]
+    fn test_format_human_label_colored_tool_use_is_magenta_bold() {
+        let cs = format_human_label_colored(&entry_of(Role::Assistant, EntryType::ToolUse));
+        assert_eq!(cs.fgcolor, Some(colored::Color::Magenta));
+        assert!(cs.style.contains(colored::Styles::Bold));
+    }
+
+    #[test]
+    fn test_format_human_label_colored_thinking_is_dim() {
+        let cs = format_human_label_colored(&entry_of(Role::Assistant, EntryType::Thinking));
+        assert_eq!(cs.fgcolor, Some(colored::Color::BrightBlack));
+    }
+
+    #[test]
+    fn test_format_human_label_colored_tool_result_is_yellow() {
+        let cs = format_human_label_colored(&entry_of(Role::User, EntryType::ToolResult));
+        assert_eq!(cs.fgcolor, Some(colored::Color::Yellow));
+    }
+
+    #[test]
+    fn test_format_human_label_colored_tool_error_is_red_bold() {
+        let cs = format_human_label_colored(&entry_of(Role::User, EntryType::ToolError));
+        assert_eq!(cs.fgcolor, Some(colored::Color::Red));
+        assert!(cs.style.contains(colored::Styles::Bold));
+    }
+
+    #[test]
+    fn test_format_human_label_colored_error_is_red_bold() {
+        let cs = format_human_label_colored(&entry_of(Role::User, EntryType::Error));
+        assert_eq!(cs.fgcolor, Some(colored::Color::Red));
+        assert!(cs.style.contains(colored::Styles::Bold));
     }
 }

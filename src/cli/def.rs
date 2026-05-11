@@ -17,6 +17,14 @@ pub struct Args {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
+    /// Force color output (defaults to TTY auto-detection, honoring NO_COLOR).
+    #[arg(long, global = true)]
+    pub color: bool,
+
+    /// Force no-color output (defaults to TTY auto-detection).
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -549,6 +557,32 @@ mod tests {
             }
             _ => panic!("expected activity get"),
         }
+    }
+
+    #[test]
+    fn color_flag_parses_globally_before_subcommand() {
+        let args = Args::try_parse_from(["ai-audit", "--color", "list-sessions"]).expect("parse");
+        assert!(args.color);
+        assert!(!args.no_color);
+    }
+
+    #[test]
+    fn color_flag_parses_globally_after_subcommand() {
+        // `global = true` makes the flag available after the subcommand too.
+        let args =
+            Args::try_parse_from(["ai-audit", "list-sessions", "--no-color"]).expect("parse");
+        assert!(!args.color);
+        assert!(args.no_color);
+    }
+
+    #[test]
+    fn color_and_no_color_both_present_parse_ok() {
+        // Clap accepts both flags together; the runtime conflict check
+        // in `cli::run()` is what rejects the combination.
+        let args = Args::try_parse_from(["ai-audit", "--color", "--no-color", "list-sessions"])
+            .expect("parse");
+        assert!(args.color);
+        assert!(args.no_color);
     }
 
     #[test]
