@@ -117,10 +117,25 @@ fn parse_transcript_from_file(path: &std::path::Path) -> Result<Vec<TranscriptEn
                         }
                         "tool_result" => {
                             let result_content = extract_tool_result_content(block);
+                            // `is_error: true` is set by Claude Code on both
+                            // tool-side failures (e.g. MCP server error, exit
+                            // code != 0) and user-initiated refusals (the
+                            // canned "User doesn't want to proceed" string).
+                            // Both collapse to ToolError — the content string
+                            // differentiates the specific cause.
+                            let is_error = block
+                                .get("is_error")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let entry_type = if is_error {
+                                EntryType::ToolError
+                            } else {
+                                EntryType::ToolResult
+                            };
                             entries.push(TranscriptEntry {
                                 timestamp,
                                 role: role.clone(),
-                                entry_type: EntryType::ToolResult,
+                                entry_type,
                                 content: result_content,
                                 tool_name: None,
                                 tool_input: None,
@@ -244,6 +259,43 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0].entry_type, EntryType::ToolResult));
         assert_eq!(entries[0].content, "result text");
+    }
+
+    #[test]
+    fn test_parse_tool_result_is_error_true_emits_tool_error() {
+        // Real Claude Code shape: MCP tool failure with is_error:true.
+        let file = write_jsonl(&[
+            r#"{"type":"user","timestamp":"2024-01-15T10:30:15.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"No Chrome extension connected.","is_error":true}]}}"#,
+        ]);
+        let entries = parse_transcript_from_file(file.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::ToolError));
+        assert_eq!(entries[0].content, "No Chrome extension connected.");
+    }
+
+    #[test]
+    fn test_parse_tool_result_user_refused_emits_tool_error() {
+        // Real Claude Code shape: user pressed "deny" on a tool prompt.
+        let refusal = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file).";
+        let line = format!(
+            r#"{{"type":"user","timestamp":"2024-01-15T10:30:15.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_123","content":"{}","is_error":true}}]}}}}"#,
+            refusal
+        );
+        let file = write_jsonl(&[line.as_str()]);
+        let entries = parse_transcript_from_file(file.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::ToolError));
+        assert_eq!(entries[0].content, refusal);
+    }
+
+    #[test]
+    fn test_parse_tool_result_is_error_false_stays_tool_result() {
+        let file = write_jsonl(&[
+            r#"{"type":"user","timestamp":"2024-01-15T10:30:15.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"ok","is_error":false}]}}"#,
+        ]);
+        let entries = parse_transcript_from_file(file.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::ToolResult));
     }
 
     #[test]

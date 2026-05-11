@@ -94,6 +94,7 @@ fn format_human_label(entry: &TranscriptEntry) -> String {
         (Role::Assistant, EntryType::ToolUse) => "[assistant/tool_use]".to_string(),
         (Role::Assistant, EntryType::Thinking) => "[assistant/thinking]".to_string(),
         (_, EntryType::ToolResult) => "[tool_result]".to_string(),
+        (_, EntryType::ToolError) => "[tool_result/error]".to_string(),
         (_, EntryType::Error) => "[error]".to_string(),
         (role, entry_type) => format!("[{}/{}]", role.as_str(), entry_type.as_str()),
     }
@@ -331,5 +332,35 @@ mod tests {
             tool_input: None,
         };
         assert_eq!(format_human_label(&entry), "[tool_result]");
+    }
+
+    #[test]
+    fn test_format_human_label_tool_error() {
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::User,
+            entry_type: EntryType::ToolError,
+            content: "Error: The user dismissed this question".to_string(),
+            tool_name: None,
+            tool_input: None,
+        };
+        assert_eq!(format_human_label(&entry), "[tool_result/error]");
+    }
+
+    #[test]
+    fn test_format_human_content_tool_error_uses_content_string() {
+        // ToolError content is the error/refusal message, NOT a tool name+input.
+        let entry = TranscriptEntry {
+            timestamp: chrono::Utc::now(),
+            role: Role::User,
+            entry_type: EntryType::ToolError,
+            content: "No Chrome extension connected.".to_string(),
+            tool_name: None,
+            tool_input: None,
+        };
+        assert_eq!(
+            format_human_content(&entry),
+            "No Chrome extension connected."
+        );
     }
 }

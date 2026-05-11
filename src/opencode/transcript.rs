@@ -154,8 +154,17 @@ fn entries_from_part(
 
             let state = part.get("state");
             let input = state.and_then(|s| s.get("input")).cloned();
+            let status = state
+                .and_then(|s| s.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let output = state
                 .and_then(|s| s.get("output"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let error = state
+                .and_then(|s| s.get("error"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -170,7 +179,11 @@ fn entries_from_part(
                 tool_input: input,
             });
 
-            // ToolResult entry (use end time if available)
+            // ToolResult / ToolError entry (use end time if available).
+            // `state.status == "error"` covers user-dismissed `question`
+            // tool calls, aborted tool executions, and tool-side failures.
+            // We surface `state.error` (the actual failure message) instead
+            // of `state.output` (typically empty for errored parts).
             let result_timestamp = part
                 .get("time")
                 .and_then(|t| t.get("end"))
@@ -178,11 +191,19 @@ fn entries_from_part(
                 .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
                 .unwrap_or(part_timestamp);
 
+            let (entry_type, content) = if status == "error" {
+                // Prefer state.error; fall back to state.output if error is empty.
+                let msg = if !error.is_empty() { error } else { output };
+                (EntryType::ToolError, msg)
+            } else {
+                (EntryType::ToolResult, output)
+            };
+
             entries.push(TranscriptEntry {
                 timestamp: result_timestamp,
                 role: role.clone(),
-                entry_type: EntryType::ToolResult,
-                content: output,
+                entry_type,
+                content,
                 tool_name: None,
                 tool_input: None,
             });
@@ -453,6 +474,90 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tool_part_error_status_emits_tool_error() {
+        // Real OpenCode shape: user dismissed a `question` MCP tool call.
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let tool_json = r#"{
+            "id": "prt_err",
+            "sessionID": "ses_test_err",
+            "messageID": "msg_err",
+            "type": "tool",
+            "tool": "question",
+            "state": {
+                "status": "error",
+                "input": {"questions": [{"header": "Test", "question": "?"}]},
+                "error": "Error: The user dismissed this question",
+                "time": {"start": 1705314601000, "end": 1705314602000}
+            },
+            "time": {"start": 1705314601000, "end": 1705314602000}
+        }"#;
+
+        create_test_storage(
+            storage,
+            "ses_test_err",
+            &[(
+                "msg_err",
+                "assistant",
+                1705314601000,
+                &[("prt_err", tool_json)],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test_err").unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // ToolUse still emitted for the question call
+        assert!(matches!(entries[0].entry_type, EntryType::ToolUse));
+        assert_eq!(entries[0].tool_name.as_deref(), Some("question"));
+
+        // ToolError carries the state.error string, NOT empty state.output
+        assert!(matches!(entries[1].entry_type, EntryType::ToolError));
+        assert_eq!(
+            entries[1].content,
+            "Error: The user dismissed this question"
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_part_error_falls_back_to_output_when_error_empty() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let tool_json = r#"{
+            "id": "prt_fb",
+            "sessionID": "ses_fb",
+            "messageID": "msg_fb",
+            "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "error",
+                "input": {"command": "false"},
+                "output": "exit code 1",
+                "time": {"start": 1705314601000, "end": 1705314602000}
+            },
+            "time": {"start": 1705314601000, "end": 1705314602000}
+        }"#;
+
+        create_test_storage(
+            storage,
+            "ses_fb",
+            &[(
+                "msg_fb",
+                "assistant",
+                1705314601000,
+                &[("prt_fb", tool_json)],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_fb").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[1].entry_type, EntryType::ToolError));
+        assert_eq!(entries[1].content, "exit code 1");
+    }
+
+    #[test]
     fn test_parse_reasoning_part() {
         let temp = tempdir().unwrap();
         let storage = temp.path();
@@ -623,6 +728,30 @@ mod tests {
         assert_eq!(entries[0].tool_name.as_deref(), Some("Bash"));
         assert!(matches!(entries[1].entry_type, EntryType::ToolResult));
         assert_eq!(entries[1].content, "file.txt");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_tool_error_status() {
+        // DB-based equivalent of the file-based dismissed-question test.
+        let conn = setup_transcript_db();
+        insert_msg(&conn, "msg_001", "ses_db_err", "assistant", 1705314601000);
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db_err",
+            1705314601000,
+            r#"{"type":"tool","tool":"question","state":{"status":"error","input":{"questions":[]},"error":"Error: The user dismissed this question"},"time":{"start":1705314601000,"end":1705314602000}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db_err").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].entry_type, EntryType::ToolUse));
+        assert!(matches!(entries[1].entry_type, EntryType::ToolError));
+        assert_eq!(
+            entries[1].content,
+            "Error: The user dismissed this question"
+        );
     }
 
     #[test]

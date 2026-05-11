@@ -26,6 +26,10 @@ pub enum EntryType {
     Text,
     ToolUse,
     ToolResult,
+    /// Failed tool-call response: user refusal, dismissed prompt, tool error,
+    /// or any other non-success outcome. Sibling of `ToolResult` (success).
+    /// Distinct from `Error`, which is a message-level / API-level failure.
+    ToolError,
     Thinking,
     Error,
 }
@@ -36,6 +40,7 @@ impl EntryType {
             EntryType::Text => "text",
             EntryType::ToolUse => "tool_use",
             EntryType::ToolResult => "tool_result",
+            EntryType::ToolError => "tool_error",
             EntryType::Thinking => "thinking",
             EntryType::Error => "error",
         }
