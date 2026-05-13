@@ -149,44 +149,89 @@ pub fn classify_static(meta: &LastMessageMeta) -> StaticStatus {
     StaticStatus::AssistantPartial
 }
 
-/// Resume payload for a clean-resume nudge: the existing user message
-/// ID (revert cutoff) and the concatenated text of all its text parts
-/// (replayed verbatim via `prompt_async`).
+/// Provider+model pair stored on an opencode user message.
+///
+/// We forward this verbatim in the nudge `prompt_async` body so the
+/// resumed turn uses the same model that originally produced the
+/// session.  Omitting it would let opencode fall back to the agent's
+/// configured model (or the daemon default), which is wrong when the
+/// user explicitly chose a model for the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeModel {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// (user_msg_id, agent, provider_id, model_id) returned by the SQL
+/// query that fetches a user message's identity fields.  Aliased
+/// here because the bare 4-tuple of Options triggers
+/// clippy::type_complexity twice (once per call site).
+type UserMessageRow = (String, Option<String>, Option<String>, Option<String>);
+
+/// Resume payload for a nudge.
+///
+/// Used by both `CleanResume` and `ContinuePrompt`:
+///
+/// * `user_msg_id` — the revert cutoff for `CleanResume`.  Not used
+///   by `ContinuePrompt` (no revert there), but the field is still
+///   carried as the identity of the user-message-we-derived-from for
+///   diagnostics.
+/// * `text` — the verbatim user text to replay for `CleanResume`.
+///   Empty/unused for `ContinuePrompt`.
+/// * `agent` — the `agent` field stamped on that user message.  This
+///   is the agent the session was originally driven by.  Forwarded
+///   to opencode in `prompt_async` so the resumed turn doesn't fall
+///   back to the daemon's default agent.
+/// * `model` — the `model` (provider/id) stamped on that user
+///   message.  Forwarded for the same reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumePayload {
     pub user_msg_id: String,
     pub text: String,
+    pub agent: Option<String>,
+    pub model: Option<ResumeModel>,
 }
 
-/// Look up the last user message of a session and concatenate its
-/// text-part contents.
+/// Look up the last user message of a session and extract everything
+/// the nudge needs to faithfully replay (or continue from) it.
 ///
 /// Returns `Ok(None)` if the session has no user messages.
 ///
 /// Used by the nudge command for `user-pending` and `assistant-empty`
-/// shapes: we revert at the user message ID, then re-fire it with the
-/// same text. This is the same workflow the TUI's "revert + edit"
-/// performs.
+/// shapes — the `user_msg_id` and `text` drive the `revert + replay`
+/// pair, while `agent` + `model` are forwarded in the new
+/// `prompt_async` body so the resumed turn keeps the original
+/// session's identity.
 pub fn fetch_last_user_message(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<ResumePayload>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id
+        "SELECT m.id,
+                json_extract(m.data,'$.agent') AS agent,
+                json_extract(m.data,'$.model.providerID') AS provider_id,
+                json_extract(m.data,'$.model.modelID') AS model_id
          FROM message m
          WHERE m.session_id = ?
            AND json_extract(m.data,'$.role') = 'user'
          ORDER BY m.time_created DESC, m.id DESC
          LIMIT 1",
     )?;
-    let user_msg_id: Option<String> = stmt
-        .query_row([session_id], |row| row.get::<_, String>(0))
+    let row: Option<UserMessageRow> = stmt
+        .query_row([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
         .map(Some)
         .or_else(|err| match err {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(other),
         })?;
-    let Some(user_msg_id) = user_msg_id else {
+    let Some((user_msg_id, agent, provider_id, model_id)) = row else {
         return Ok(None);
     };
 
@@ -203,7 +248,126 @@ pub fn fetch_last_user_message(
         .collect::<Vec<_>>()
         .join("\n");
 
-    Ok(Some(ResumePayload { user_msg_id, text }))
+    let model = match (provider_id, model_id) {
+        (Some(provider_id), Some(model_id)) => Some(ResumeModel {
+            provider_id,
+            model_id,
+        }),
+        _ => None,
+    };
+
+    Ok(Some(ResumePayload {
+        user_msg_id,
+        text,
+        agent,
+        model,
+    }))
+}
+
+/// Like `fetch_last_user_message`, but for sessions in
+/// `AssistantPartial`/`AssistantToolStuck` shapes: the most recent
+/// message is the (broken) assistant turn, so the "user message we
+/// want context from" is the one immediately PRECEDING that assistant
+/// turn.
+///
+/// Returns `Ok(None)` if no preceding user message exists (which
+/// would be an exotic shape — an assistant message with no prior
+/// user message — but we guard for it).
+///
+/// Used by the nudge command for `assistant-partial` and
+/// `assistant-tool-stuck` shapes: the nudge does NOT revert in those
+/// cases (we keep the partial work) but DOES need the original
+/// agent/model so the `continue` prompt runs under the same context.
+pub fn fetch_user_message_before_last_assistant(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<ResumePayload>> {
+    // Find the time_created of the most recent assistant message in
+    // this session — that's the broken turn the nudge will continue.
+    let mut stmt = conn.prepare(
+        "SELECT m.time_created, m.id
+         FROM message m
+         WHERE m.session_id = ?
+           AND json_extract(m.data,'$.role') = 'assistant'
+         ORDER BY m.time_created DESC, m.id DESC
+         LIMIT 1",
+    )?;
+    let assistant: Option<(i64, String)> = stmt
+        .query_row([session_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    let Some((assistant_ts, _assistant_id)) = assistant else {
+        return Ok(None);
+    };
+
+    // The user message we want is the most recent one STRICTLY before
+    // the assistant message in time order.  (Equality on time_created
+    // would be ambiguous, but in practice user messages are always
+    // strictly older than the assistant message they triggered.)
+    let mut stmt = conn.prepare(
+        "SELECT m.id,
+                json_extract(m.data,'$.agent') AS agent,
+                json_extract(m.data,'$.model.providerID') AS provider_id,
+                json_extract(m.data,'$.model.modelID') AS model_id
+         FROM message m
+         WHERE m.session_id = ?
+           AND json_extract(m.data,'$.role') = 'user'
+           AND m.time_created < ?
+         ORDER BY m.time_created DESC, m.id DESC
+         LIMIT 1",
+    )?;
+    let row: Option<UserMessageRow> = stmt
+        .query_row(rusqlite::params![session_id, assistant_ts], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    let Some((user_msg_id, agent, provider_id, model_id)) = row else {
+        return Ok(None);
+    };
+
+    // Text is unused for ContinuePrompt but we still populate it for
+    // diagnostics.
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(p.data,'$.text')
+         FROM part p
+         WHERE p.message_id = ?
+           AND json_extract(p.data,'$.type') = 'text'
+         ORDER BY p.time_created ASC, p.id ASC",
+    )?;
+    let text: String = stmt
+        .query_map([&user_msg_id], |row| row.get::<_, Option<String>>(0))?
+        .filter_map(|row| row.ok().flatten())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let model = match (provider_id, model_id) {
+        (Some(provider_id), Some(model_id)) => Some(ResumeModel {
+            provider_id,
+            model_id,
+        }),
+        _ => None,
+    };
+
+    Ok(Some(ResumePayload {
+        user_msg_id,
+        text,
+        agent,
+        model,
+    }))
 }
 
 #[cfg(test)]
@@ -383,14 +547,37 @@ mod tests {
         role: &str,
         time_created: i64,
     ) {
+        insert_message_full(conn, msg_id, session_id, role, time_created, None, None);
+    }
+
+    /// Insert a message with optional `agent` and `model` fields in
+    /// the JSON `data` blob, mirroring opencode's MessageV2.User shape.
+    fn insert_message_full(
+        conn: &Connection,
+        msg_id: &str,
+        session_id: &str,
+        role: &str,
+        time_created: i64,
+        agent: Option<&str>,
+        model: Option<(&str, &str)>,
+    ) {
+        // Build the JSON payload by hand to mirror opencode's storage.
+        let mut data = serde_json::json!({
+            "role": role,
+            "time": { "completed": serde_json::Value::Null },
+        });
+        if let Some(agent) = agent {
+            data["agent"] = serde_json::Value::String(agent.to_string());
+        }
+        if let Some((provider_id, model_id)) = model {
+            data["model"] = serde_json::json!({
+                "providerID": provider_id,
+                "modelID": model_id,
+            });
+        }
         conn.execute(
             "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
-            rusqlite::params![
-                msg_id,
-                session_id,
-                time_created,
-                format!(r#"{{"role":"{role}","time":{{"completed":null}}}}"#),
-            ],
+            rusqlite::params![msg_id, session_id, time_created, data.to_string()],
         )
         .unwrap();
     }
@@ -529,5 +716,216 @@ mod tests {
         let payload = fetch_last_user_message(&conn, "ses_1").unwrap().unwrap();
         assert_eq!(payload.user_msg_id, "msg_user");
         assert_eq!(payload.text, "");
+        assert_eq!(payload.agent, None);
+        assert_eq!(payload.model, None);
+    }
+
+    /// Phase A2 — the new payload extracts `agent` and `model` from
+    /// the user message's JSON.  This is what `nudge` forwards to
+    /// opencode's `prompt_async` so the resumed turn keeps the
+    /// session's original identity rather than falling back to the
+    /// daemon's `default_agent`.
+    #[test]
+    fn fetch_last_user_message_extracts_agent_and_model() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        ).unwrap();
+        insert_message_full(
+            &conn,
+            "msg_user",
+            "ses_1",
+            "user",
+            1500,
+            Some("Conductor"),
+            Some(("anthropic", "claude-opus-4-5")),
+        );
+        insert_part_at(
+            &conn,
+            "prt_text",
+            "msg_user",
+            r#"{"type":"text","text":"hello"}"#,
+            1600,
+        );
+
+        let payload = fetch_last_user_message(&conn, "ses_1").unwrap().unwrap();
+        assert_eq!(payload.user_msg_id, "msg_user");
+        assert_eq!(payload.text, "hello");
+        assert_eq!(payload.agent.as_deref(), Some("Conductor"));
+        assert_eq!(
+            payload.model,
+            Some(ResumeModel {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-5".to_string(),
+            })
+        );
+    }
+
+    /// Phase A2 — when `model` is missing or partial (e.g. only
+    /// `providerID` recorded), we return `None` rather than fabricate
+    /// a partial value.  Opencode will then fall back to the agent's
+    /// configured model, which is the right behavior.
+    #[test]
+    fn fetch_last_user_message_missing_model_returns_none() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        ).unwrap();
+        // Insert with agent but no model.
+        insert_message_full(&conn, "msg_user", "ses_1", "user", 1500, Some("ag"), None);
+
+        let payload = fetch_last_user_message(&conn, "ses_1").unwrap().unwrap();
+        assert_eq!(payload.agent.as_deref(), Some("ag"));
+        assert_eq!(payload.model, None);
+    }
+
+    /// Phase A2b — for AssistantPartial / AssistantToolStuck shapes,
+    /// the nudge's ContinuePrompt path needs the agent/model from the
+    /// user message that PRECEDES the broken assistant turn (not the
+    /// most recent user message in absolute terms, which may not
+    /// exist or may be unrelated).
+    #[test]
+    fn fetch_user_message_before_last_assistant_picks_correct_user() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        ).unwrap();
+        // Realistic timeline:
+        //   t=1000  user msg with agent=A   (driving turn 1)
+        //   t=1100  assistant (completed, turn 1)
+        //   t=2000  user msg with agent=B   (driving turn 2 — the broken one)
+        //   t=2100  assistant (partial, turn 2 — never completed)
+        insert_message_full(
+            &conn,
+            "msg_u1",
+            "ses_1",
+            "user",
+            1000,
+            Some("A"),
+            Some(("anthropic", "claude-sonnet-4")),
+        );
+        insert_message_full(&conn, "msg_a1", "ses_1", "assistant", 1100, None, None);
+        insert_message_full(
+            &conn,
+            "msg_u2",
+            "ses_1",
+            "user",
+            2000,
+            Some("B"),
+            Some(("openai", "gpt-5")),
+        );
+        insert_message_full(&conn, "msg_a2", "ses_1", "assistant", 2100, None, None);
+        insert_part_at(
+            &conn,
+            "prt_u2",
+            "msg_u2",
+            r#"{"type":"text","text":"do thing B"}"#,
+            2050,
+        );
+
+        let payload = fetch_user_message_before_last_assistant(&conn, "ses_1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payload.user_msg_id, "msg_u2",
+            "must pick the user message that drove the last assistant"
+        );
+        assert_eq!(payload.agent.as_deref(), Some("B"));
+        assert_eq!(payload.text, "do thing B");
+    }
+
+    /// Phase A2b — defensive: if no assistant message exists, return
+    /// None.  (In practice this shouldn't happen for AssistantPartial
+    /// shapes — the classifier would have produced UserPending —
+    /// but the function should still behave safely.)
+    #[test]
+    fn fetch_user_message_before_last_assistant_no_assistant() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        ).unwrap();
+        insert_message_full(&conn, "msg_u", "ses_1", "user", 1000, Some("A"), None);
+
+        let payload = fetch_user_message_before_last_assistant(&conn, "ses_1").unwrap();
+        assert!(payload.is_none());
+    }
+
+    /// Phase D.1 — SAFETY BOUNDARY: a session with (user_msg,
+    /// assistant_msg-with-parts) must NEVER classify as UserPending
+    /// or AssistantEmpty, because CleanResume on either of those would
+    /// delete real assistant work.  It must classify as
+    /// AssistantPartial (or AssistantToolStuck if there's a stuck
+    /// tool), which routes to ContinuePrompt (preserves the work).
+    ///
+    /// This guards against a hypothetical regression where the
+    /// classifier's ordering invariant breaks.
+    #[test]
+    fn user_then_assistant_with_parts_never_classifies_as_user_pending_or_empty() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        ).unwrap();
+        // User message FIRST, then assistant message AFTER with a part.
+        insert_message_at(&conn, "msg_u", "ses_1", "user", 1000);
+        insert_message_at(&conn, "msg_a", "ses_1", "assistant", 2000);
+        insert_part_at(
+            &conn,
+            "prt_a",
+            "msg_a",
+            r#"{"type":"text","text":"partial reply"}"#,
+            2100,
+        );
+
+        let meta = fetch_last_message_meta(&conn, &[]).unwrap();
+        let entry = meta.get("ses_1").unwrap();
+        let status = classify_static(entry);
+        assert_ne!(
+            status,
+            StaticStatus::UserPending,
+            "classifier MUST NOT return UserPending while a partial assistant exists \
+             (would cause CleanResume to delete the partial work). entry={:?}",
+            entry
+        );
+        assert_ne!(
+            status,
+            StaticStatus::AssistantEmpty,
+            "classifier MUST NOT return AssistantEmpty when assistant has parts \
+             (would cause CleanResume to delete the partial work). entry={:?}",
+            entry
+        );
+        assert_eq!(
+            status,
+            StaticStatus::AssistantPartial,
+            "expected AssistantPartial for (user, assistant-with-parts) shape"
+        );
+    }
+
+    /// Phase D.1 — the same boundary, with a stuck tool: must be
+    /// classified as AssistantToolStuck, never UserPending/Empty.
+    #[test]
+    fn user_then_assistant_with_stuck_tool_classifies_as_tool_stuck() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        ).unwrap();
+        insert_message_at(&conn, "msg_u", "ses_1", "user", 1000);
+        insert_message_at(&conn, "msg_a", "ses_1", "assistant", 2000);
+        insert_part_at(
+            &conn,
+            "prt_tool",
+            "msg_a",
+            r#"{"type":"tool","state":{"status":"running"}}"#,
+            2100,
+        );
+
+        let meta = fetch_last_message_meta(&conn, &[]).unwrap();
+        let status = classify_static(meta.get("ses_1").unwrap());
+        assert_eq!(status, StaticStatus::AssistantToolStuck);
     }
 }

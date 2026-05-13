@@ -2,11 +2,19 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use std::collections::HashMap;
 
 use super::config::OpencodeConfig;
+use super::status::ResumeModel;
+
+/// Header name opencode uses to resolve the per-request "working
+/// directory" for a session.  Sending this on EVERY request that
+/// touches a session is mandatory — without it, opencode falls back
+/// to `process.cwd()` of the daemon, which corrupts the
+/// `path.cwd` field stamped onto resumed assistant messages.
+const X_OPENCODE_DIRECTORY: HeaderName = HeaderName::from_static("x-opencode-directory");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCredentials {
@@ -81,6 +89,10 @@ impl ServerClient {
     pub fn session_status(&self) -> Result<Option<HashMap<String, ServerBusyKind>>> {
         let url = format!("{}/session/status", self.base_url);
         log::trace!("GET {}", url);
+        // /session/status is project-agnostic and is consumed by the
+        // bulk nudge command which acts across many directories.  We
+        // do not need (and cannot meaningfully provide) a single
+        // x-opencode-directory header here.
         let request = self.with_auth(self.client.get(&url));
         let response = match request.send() {
             Ok(response) => response,
@@ -120,17 +132,54 @@ impl ServerClient {
         ))
     }
 
-    pub fn nudge(&self, session_id: &str, prompt: &str) -> Result<()> {
+    /// Post a user message to `/session/<id>/prompt_async`, optionally
+    /// forwarding the session's original `agent` and `model` so the
+    /// resumed turn keeps the session's identity.
+    ///
+    /// **`directory` is mandatory** — opencode resolves the
+    /// per-request working directory from this header.  Pass the
+    /// session's stored project directory.
+    ///
+    /// **`agent` is strongly recommended** — without it, opencode
+    /// falls back to its `default_agent` config, which is the wrong
+    /// agent for any session that was driven by a different agent.
+    pub fn nudge(
+        &self,
+        session_id: &str,
+        directory: &str,
+        prompt: &str,
+        agent: Option<&str>,
+        model: Option<&ResumeModel>,
+    ) -> Result<()> {
         let url = format!("{}/session/{}/prompt_async", self.base_url, session_id);
-        log::trace!("POST {}", url);
+        log::trace!(
+            "POST {} (directory={:?} agent={:?} model={:?})",
+            url,
+            directory,
+            agent,
+            model
+        );
+
+        let mut body = serde_json::json!({
+            "parts": [{ "type": "text", "text": prompt }],
+        });
+        if let Some(agent) = agent {
+            body["agent"] = serde_json::Value::String(agent.to_string());
+        }
+        if let Some(model) = model {
+            body["model"] = serde_json::json!({
+                "providerID": model.provider_id,
+                "modelID": model.model_id,
+            });
+        }
+
         let response = self
             .with_auth(
                 self.client
                     .post(&url)
                     .header(CONTENT_TYPE, "application/json")
-                    .json(&serde_json::json!({
-                        "parts": [{ "type": "text", "text": prompt }],
-                    })),
+                    .header(X_OPENCODE_DIRECTORY, directory)
+                    .json(&body),
             )
             .send()
             .with_context(|| format!("POST {} failed", url))?;
@@ -155,17 +204,117 @@ impl ServerClient {
     ///
     /// Expected response: HTTP 200 with the updated session JSON
     /// (which we discard).
-    pub fn revert(&self, session_id: &str, message_id: &str) -> Result<()> {
+    ///
+    /// **`directory` is mandatory** — see `nudge()` above.
+    pub fn revert(&self, session_id: &str, directory: &str, message_id: &str) -> Result<()> {
         let url = format!("{}/session/{}/revert", self.base_url, session_id);
-        log::trace!("POST {} (messageID={})", url, message_id);
+        log::trace!(
+            "POST {} (directory={:?} messageID={})",
+            url,
+            directory,
+            message_id
+        );
         let response = self
             .with_auth(
                 self.client
                     .post(&url)
                     .header(CONTENT_TYPE, "application/json")
+                    .header(X_OPENCODE_DIRECTORY, directory)
                     .json(&serde_json::json!({
                         "messageID": message_id,
                     })),
+            )
+            .send()
+            .with_context(|| format!("POST {} failed", url))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body = response.text().unwrap_or_default();
+        Err(anyhow!("POST {} failed: {} {}", url, status, body.trim()))
+    }
+
+    /// Fork a session at (optionally) a specific message id.
+    ///
+    /// Opencode's `POST /session/<id>/fork` creates a brand-new
+    /// session (new id) populated with a deep copy of all messages
+    /// strictly before `message_id` (or the full history if
+    /// `message_id` is None).  Message and part IDs are remapped to
+    /// fresh IDs inside the fork — it is a true clone, not a parent
+    /// reference.
+    ///
+    /// **`directory` is mandatory** — fork inherits its `directory`
+    /// from `InstanceState.directory` resolved from the request, NOT
+    /// from the original session.  Always pass the session's project
+    /// directory.
+    ///
+    /// Returns the new session id on success.
+    pub fn fork(
+        &self,
+        session_id: &str,
+        directory: &str,
+        message_id: Option<&str>,
+    ) -> Result<String> {
+        let url = format!("{}/session/{}/fork", self.base_url, session_id);
+        log::trace!(
+            "POST {} (directory={:?} messageID={:?})",
+            url,
+            directory,
+            message_id
+        );
+        let mut body = serde_json::Map::new();
+        if let Some(message_id) = message_id {
+            body.insert(
+                "messageID".to_string(),
+                serde_json::Value::String(message_id.to_string()),
+            );
+        }
+        let response = self
+            .with_auth(
+                self.client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(X_OPENCODE_DIRECTORY, directory)
+                    .json(&serde_json::Value::Object(body)),
+            )
+            .send()
+            .with_context(|| format!("POST {} failed", url))?;
+
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("POST {} failed: {} {}", url, status, text.trim()));
+        }
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parsing /fork response: {text}"))?;
+        let fork_id = value["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("/fork response missing `id`: {value}"))?;
+        Ok(fork_id.to_string())
+    }
+
+    /// Cancel any in-flight LLM call on `session_id`.
+    ///
+    /// Idempotent: if the session is already idle, this returns
+    /// successfully without effect.  If it is busy, opencode
+    /// interrupts the running fiber via `Fiber.interrupt` and waits
+    /// for it to finish (so when this call returns, the session is
+    /// guaranteed to be idle).
+    ///
+    /// ai-audit's `nudge` always calls `abort` before
+    /// `revert`/`prompt_async` so that no stale in-flight call can
+    /// collide with the resumed turn.
+    pub fn abort(&self, session_id: &str, directory: &str) -> Result<()> {
+        let url = format!("{}/session/{}/abort", self.base_url, session_id);
+        log::trace!("POST {} (directory={:?})", url, directory);
+        let response = self
+            .with_auth(
+                self.client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(X_OPENCODE_DIRECTORY, directory),
             )
             .send()
             .with_context(|| format!("POST {} failed", url))?;
@@ -315,11 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn nudge_204_is_ok() {
+    fn nudge_204_is_ok_and_sends_directory_header() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/session/ses_1/prompt_async")
+                .header("x-opencode-directory", "/tmp/proj-a")
                 .json_body(serde_json::json!({
                     "parts": [{ "type": "text", "text": "continue" }],
                 }));
@@ -330,7 +480,67 @@ mod tests {
             url: server.url(""),
             password: None,
         });
-        client.nudge("ses_1", "continue").unwrap();
+        client
+            .nudge("ses_1", "/tmp/proj-a", "continue", None, None)
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn nudge_includes_agent_when_provided() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/session/ses_1/prompt_async")
+                .header("x-opencode-directory", "/p")
+                .json_body(serde_json::json!({
+                    "parts": [{ "type": "text", "text": "continue" }],
+                    "agent": "conductor",
+                }));
+            then.status(204);
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        client
+            .nudge("ses_1", "/p", "continue", Some("conductor"), None)
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn nudge_includes_agent_and_model_when_provided() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/session/ses_1/prompt_async")
+                .header("x-opencode-directory", "/p")
+                .json_body(serde_json::json!({
+                    "parts": [{ "type": "text", "text": "go" }],
+                    "agent": "conductor",
+                    "model": { "providerID": "anthropic", "modelID": "claude-opus-4-5" },
+                }));
+            then.status(204);
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        client
+            .nudge(
+                "ses_1",
+                "/p",
+                "go",
+                Some("conductor"),
+                Some(&ResumeModel {
+                    provider_id: "anthropic".to_string(),
+                    model_id: "claude-opus-4-5".to_string(),
+                }),
+            )
+            .unwrap();
         mock.assert();
     }
 
@@ -346,7 +556,10 @@ mod tests {
             url: server.url(""),
             password: None,
         });
-        let error = client.nudge("ses_1", "continue").unwrap_err().to_string();
+        let error = client
+            .nudge("ses_1", "/p", "continue", None, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("boom"));
     }
 
@@ -365,16 +578,17 @@ mod tests {
             url: server.url(""),
             password: Some("testpw".to_string()),
         });
-        client.nudge("ses_1", "continue").unwrap();
+        client.nudge("ses_1", "/p", "continue", None, None).unwrap();
         mock.assert();
     }
 
     #[test]
-    fn revert_200_is_ok() {
+    fn revert_200_is_ok_and_sends_directory_header() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/session/ses_1/revert")
+                .header("x-opencode-directory", "/tmp/proj-a")
                 .json_body(serde_json::json!({ "messageID": "msg_42" }));
             then.status(200).body("{}");
         });
@@ -383,7 +597,7 @@ mod tests {
             url: server.url(""),
             password: None,
         });
-        client.revert("ses_1", "msg_42").unwrap();
+        client.revert("ses_1", "/tmp/proj-a", "msg_42").unwrap();
         mock.assert();
     }
 
@@ -399,7 +613,10 @@ mod tests {
             url: server.url(""),
             password: None,
         });
-        let error = client.revert("ses_1", "msg_42").unwrap_err().to_string();
+        let error = client
+            .revert("ses_1", "/p", "msg_42")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not found"), "got: {error}");
         assert!(error.contains("404"), "got: {error}");
     }
@@ -419,8 +636,98 @@ mod tests {
             url: server.url(""),
             password: Some("secret".to_string()),
         });
-        client.revert("ses_1", "msg_42").unwrap();
+        client.revert("ses_1", "/p", "msg_42").unwrap();
         mock.assert();
+    }
+
+    #[test]
+    fn fork_returns_new_session_id_and_sends_directory_header() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/session/ses_orig/fork")
+                .header("x-opencode-directory", "/p")
+                .json_body(serde_json::json!({ "messageID": "msg_42" }));
+            then.status(200)
+                .body(r#"{"id":"ses_fork","directory":"/p","title":"orig (fork #1)"}"#);
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        let fork_id = client.fork("ses_orig", "/p", Some("msg_42")).unwrap();
+        assert_eq!(fork_id, "ses_fork");
+        mock.assert();
+    }
+
+    #[test]
+    fn fork_without_message_id_sends_empty_body() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/session/ses_orig/fork")
+                .header("x-opencode-directory", "/p")
+                .json_body(serde_json::json!({}));
+            then.status(200).body(r#"{"id":"ses_fork"}"#);
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        client.fork("ses_orig", "/p", None).unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn fork_error_includes_body() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/session/ses_orig/fork");
+            then.status(500).body("forked sideways");
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        let error = client.fork("ses_orig", "/p", None).unwrap_err().to_string();
+        assert!(error.contains("forked sideways"), "got: {error}");
+    }
+
+    #[test]
+    fn abort_200_is_ok_and_sends_directory_header() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/session/ses_1/abort")
+                .header("x-opencode-directory", "/p");
+            then.status(200).body("true");
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        client.abort("ses_1", "/p").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn abort_error_includes_body() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/session/ses_1/abort");
+            then.status(500).body("boom");
+        });
+
+        let client = ServerClient::new(ServerCredentials {
+            url: server.url(""),
+            password: None,
+        });
+        let error = client.abort("ses_1", "/p").unwrap_err().to_string();
+        assert!(error.contains("boom"));
     }
 
     #[test]

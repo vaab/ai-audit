@@ -187,6 +187,20 @@ pub struct SessionNudgeArgs {
     /// Maximum concurrent prompt_async requests
     #[arg(long, default_value_t = 10)]
     pub concurrency: usize,
+
+    /// Fork the session and apply the resume strategy to the fork,
+    /// leaving the original session untouched.
+    ///
+    /// The fork is created at the same revert cutoff that CleanResume
+    /// would use (i.e. just before the user message being replayed),
+    /// or at the head for ContinuePrompt shapes.  The new fork's
+    /// session id is printed.
+    ///
+    /// Useful as an escape hatch when you want to experiment with a
+    /// nudge without risking the real session.  Note: each fork
+    /// duplicates the entire message history on disk.
+    #[arg(long = "fork")]
+    pub fork: bool,
 }
 
 #[derive(Subcommand)]

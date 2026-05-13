@@ -10,7 +10,9 @@ use crate::opencode::nudge::{execute_plan, NudgePlan, NudgeStrategy};
 use crate::opencode::server_client::{
     compute_live, resolve_server_credentials, LiveStatus, ServerClient,
 };
-use crate::opencode::status::{fetch_last_user_message, StaticStatus};
+use crate::opencode::status::{
+    fetch_last_user_message, fetch_user_message_before_last_assistant, StaticStatus,
+};
 use crate::provider::detect_provider;
 use crate::session_filter::{canonicalize_filter_path, list_filtered, SessionFilter};
 
@@ -142,9 +144,11 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
             let strategy = strategy_map
                 .get(&session.session_id)
                 .expect("strategy resolved above");
+            let fork_suffix = if args.fork { " (via fork)" } else { "" };
             println!(
-                "would {}",
-                dry_run_message(session, strategy, args.force_nudge_already_running)
+                "would {}{}",
+                dry_run_message(session, strategy, args.force_nudge_already_running),
+                fork_suffix
             );
         }
         println!(
@@ -182,6 +186,7 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
             orphan: !Path::new(&session.project_dir).exists(),
             forced: is_forced,
             strategy,
+            fork_first: args.fork,
         });
     }
 
@@ -197,9 +202,24 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("missing nudge outcome for {}", plan.session_id))?;
         match &outcome.result {
             Ok(()) if plan.forced => {
-                println!("nudged {} (forced; was already running)", plan.session_id)
+                let suffix = outcome
+                    .fork_id
+                    .as_deref()
+                    .map(|fork| format!(" -> fork {}", fork))
+                    .unwrap_or_default();
+                println!(
+                    "nudged {} (forced; was already running){}",
+                    plan.session_id, suffix
+                )
             }
-            Ok(()) => println!("{}", success_message(plan)),
+            Ok(()) => {
+                let suffix = outcome
+                    .fork_id
+                    .as_deref()
+                    .map(|fork| format!(" -> fork {}", fork))
+                    .unwrap_or_default();
+                println!("{}{}", success_message(plan), suffix)
+            }
             Err(error) => {
                 failed += 1;
                 println!("failed {}: {}", plan.session_id, error);
@@ -230,6 +250,16 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
 ///
 /// `Completed` is a guard: it should have been filtered out, but we
 /// fall back to `ContinuePrompt` for safety.
+///
+/// Both strategies extract the original session's `agent` and `model`
+/// from the relevant user message:
+///   * For `CleanResume`: the most recent user message (the same one
+///     we're about to revert+replay).
+///   * For `ContinuePrompt`: the user message PRECEDING the broken
+///     assistant turn (the one that drove that turn).
+///
+/// These are forwarded in the `prompt_async` body so opencode does
+/// not fall back to its `default_agent`.
 fn resolve_strategy(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -248,13 +278,27 @@ fn resolve_strategy(
             Ok(NudgeStrategy::CleanResume {
                 user_msg_id: payload.user_msg_id,
                 text: payload.text,
+                agent: payload.agent,
+                model: payload.model,
             })
         }
         StaticStatus::AssistantPartial
         | StaticStatus::AssistantToolStuck
-        | StaticStatus::Completed => Ok(NudgeStrategy::ContinuePrompt {
-            prompt: continue_prompt.to_string(),
-        }),
+        | StaticStatus::Completed => {
+            // For ContinuePrompt, the agent/model we want is from
+            // the user message that drove the broken assistant turn
+            // — not the most recent user message in absolute terms.
+            // If lookup fails (no preceding user message), proceed
+            // without — opencode will fall back to defaults, which
+            // is the pre-fix behavior (still a correct ContinuePrompt
+            // dispatch, just without the identity preservation).
+            let payload = fetch_user_message_before_last_assistant(conn, session_id)?;
+            Ok(NudgeStrategy::ContinuePrompt {
+                prompt: continue_prompt.to_string(),
+                agent: payload.as_ref().and_then(|p| p.agent.clone()),
+                model: payload.and_then(|p| p.model),
+            })
+        }
     }
 }
 
@@ -350,7 +394,7 @@ fn strategy_description(strategy: &NudgeStrategy) -> String {
                 truncate(text, 60)
             )
         }
-        NudgeStrategy::ContinuePrompt { prompt } => format!("posted {:?}", prompt),
+        NudgeStrategy::ContinuePrompt { prompt, .. } => format!("posted {:?}", prompt),
     }
 }
 
@@ -374,15 +418,15 @@ fn success_message(plan: &NudgePlan) -> String {
             plan.session_id,
             truncate(text, 60)
         ),
-        (NudgeStrategy::ContinuePrompt { prompt }, StaticStatus::AssistantPartial) => format!(
+        (NudgeStrategy::ContinuePrompt { prompt, .. }, StaticStatus::AssistantPartial) => format!(
             "nudged {} (assistant-partial: posted {:?} to continue from truncated response)",
             plan.session_id, prompt
         ),
-        (NudgeStrategy::ContinuePrompt { prompt }, StaticStatus::AssistantToolStuck) => format!(
+        (NudgeStrategy::ContinuePrompt { prompt, .. }, StaticStatus::AssistantToolStuck) => format!(
             "nudged {} (assistant-tool-stuck: posted {:?}; opencode synthesizes interrupted tools as errors in LLM context)",
             plan.session_id, prompt
         ),
-        (NudgeStrategy::ContinuePrompt { prompt }, StaticStatus::Completed) => format!(
+        (NudgeStrategy::ContinuePrompt { prompt, .. }, StaticStatus::Completed) => format!(
             "nudged {} (completed [forced]: posted {:?})",
             plan.session_id, prompt
         ),
@@ -393,7 +437,7 @@ fn success_message(plan: &NudgePlan) -> String {
             plan.session_id,
             status.as_str()
         ),
-        (NudgeStrategy::ContinuePrompt { prompt }, status) => format!(
+        (NudgeStrategy::ContinuePrompt { prompt, .. }, status) => format!(
             "nudged {} ({}: posted {:?})",
             plan.session_id,
             status.as_str(),
@@ -453,6 +497,7 @@ mod tests {
             orphan: false,
             forced: false,
             strategy,
+            fork_first: false,
         }
     }
 
@@ -460,12 +505,16 @@ mod tests {
         NudgeStrategy::CleanResume {
             user_msg_id: "msg_1".to_string(),
             text: text.to_string(),
+            agent: None,
+            model: None,
         }
     }
 
     fn continue_prompt(prompt: &str) -> NudgeStrategy {
         NudgeStrategy::ContinuePrompt {
             prompt: prompt.to_string(),
+            agent: None,
+            model: None,
         }
     }
 
@@ -576,7 +625,9 @@ mod tests {
         let strategy =
             resolve_strategy(&conn, "ses_1", StaticStatus::UserPending, "continue").unwrap();
         match strategy {
-            NudgeStrategy::CleanResume { user_msg_id, text } => {
+            NudgeStrategy::CleanResume {
+                user_msg_id, text, ..
+            } => {
                 assert_eq!(user_msg_id, "msg_user");
                 assert_eq!(text, "do X");
             }
@@ -590,7 +641,9 @@ mod tests {
         let strategy =
             resolve_strategy(&conn, "ses_1", StaticStatus::AssistantEmpty, "continue").unwrap();
         match strategy {
-            NudgeStrategy::CleanResume { user_msg_id, text } => {
+            NudgeStrategy::CleanResume {
+                user_msg_id, text, ..
+            } => {
                 assert_eq!(user_msg_id, "msg_user");
                 assert_eq!(text, "build it");
             }
@@ -604,7 +657,7 @@ mod tests {
         let strategy =
             resolve_strategy(&conn, "ses_1", StaticStatus::AssistantPartial, "keep going").unwrap();
         match strategy {
-            NudgeStrategy::ContinuePrompt { prompt } => {
+            NudgeStrategy::ContinuePrompt { prompt, .. } => {
                 assert_eq!(prompt, "keep going");
             }
             other => panic!("expected ContinuePrompt, got {other:?}"),
@@ -617,6 +670,118 @@ mod tests {
         let strategy =
             resolve_strategy(&conn, "ses_1", StaticStatus::AssistantToolStuck, "continue").unwrap();
         assert!(matches!(strategy, NudgeStrategy::ContinuePrompt { .. }));
+    }
+
+    /// Phase A2c — resolve_strategy must extract agent + model from
+    /// the user message into the CleanResume strategy.
+    #[test]
+    fn resolve_strategy_user_pending_carries_agent_and_model() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        let data = serde_json::json!({
+            "role": "user",
+            "time": { "completed": null },
+            "agent": "conductor",
+            "model": { "providerID": "anthropic", "modelID": "claude-opus-4-5" },
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_user', 'ses_1', 1500, ?)",
+            [data],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, time_created, data) \
+             VALUES ('prt_text', 'msg_user', 1600, ?)",
+            [r#"{"type":"text","text":"do X"}"#],
+        )
+        .unwrap();
+
+        let strategy =
+            resolve_strategy(&conn, "ses_1", StaticStatus::UserPending, "continue").unwrap();
+        match strategy {
+            NudgeStrategy::CleanResume {
+                user_msg_id,
+                text,
+                agent,
+                model,
+            } => {
+                assert_eq!(user_msg_id, "msg_user");
+                assert_eq!(text, "do X");
+                assert_eq!(agent.as_deref(), Some("conductor"));
+                let model = model.expect("model should be present");
+                assert_eq!(model.provider_id, "anthropic");
+                assert_eq!(model.model_id, "claude-opus-4-5");
+            }
+            other => panic!("expected CleanResume, got {other:?}"),
+        }
+    }
+
+    /// Phase A2c — for AssistantPartial, the strategy must extract
+    /// agent + model from the user message PRECEDING the broken
+    /// assistant turn.
+    #[test]
+    fn resolve_strategy_assistant_partial_carries_agent_from_preceding_user() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        let user_data = serde_json::json!({
+            "role": "user",
+            "time": { "completed": null },
+            "agent": "drafter",
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_user', 'ses_1', 1000, ?)",
+            [user_data],
+        )
+        .unwrap();
+        let assistant_data = r#"{"role":"assistant","time":{"completed":null}}"#;
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_asst', 'ses_1', 2000, ?)",
+            [assistant_data],
+        )
+        .unwrap();
+
+        let strategy =
+            resolve_strategy(&conn, "ses_1", StaticStatus::AssistantPartial, "continue").unwrap();
+        match strategy {
+            NudgeStrategy::ContinuePrompt { prompt, agent, .. } => {
+                assert_eq!(prompt, "continue");
+                assert_eq!(agent.as_deref(), Some("drafter"));
+            }
+            other => panic!("expected ContinuePrompt, got {other:?}"),
+        }
     }
 
     #[test]
