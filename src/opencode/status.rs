@@ -74,7 +74,27 @@ pub struct LastMessageMeta {
     pub last_role: String,
     pub last_completed: bool,
     pub parts_total: i64,
+    /// Count of tool parts on the last message that are *not* in a
+    /// healthy terminal state.  Two shapes are counted:
+    ///
+    /// 1. `state.status` is `running` or `pending` — the canonical
+    ///    "in-flight when opencode died" shape.
+    /// 2. `state.status='error'` with `state.metadata.interrupted=true`
+    ///    — opencode's recorded shape for tools that were aborted
+    ///    mid-execution (e.g. the host process tore down the tool
+    ///    invocation while waiting on the model).  These look like
+    ///    completed errors on disk but are functionally the same
+    ///    "stuck tool" as (1) from the LLM's perspective.
     pub stuck_tools: i64,
+    /// `$.error IS NOT NULL` on the last message's JSON `data` blob.
+    /// Opencode writes a non-null `error` (e.g. `APIError` with
+    /// `STREAM_IDLE_TIMEOUT`) when the assistant turn died mid-stream
+    /// — even though it ALSO stamps `time.completed`.  Without this
+    /// flag, `classify_static` would label such sessions `Completed`
+    /// and `is_resumable()` would refuse to surface them, which is
+    /// the wrong answer: the turn is genuinely incomplete and needs
+    /// a `continue` nudge.
+    pub assistant_errored: bool,
 }
 
 pub fn fetch_last_message_meta(
@@ -91,6 +111,15 @@ pub fn fetch_last_message_meta(
                 .join(",")
         )
     };
+    // `stuck_tools` counts BOTH genuinely in-flight tool parts and
+    // tool parts that opencode marked as errored+interrupted (its
+    // recorded shape for aborted tool calls — see `LastMessageMeta`
+    // docs for the rationale).
+    //
+    // `assistant_errored` reflects `$.error IS NOT NULL` on the last
+    // message's JSON.  Used by `classify_static` to override the
+    // `time.completed` happy path when the turn actually died with
+    // an error (e.g. `STREAM_IDLE_TIMEOUT`).
     let sql = format!(
         "WITH last_msg AS (
             SELECT m.session_id, m.id AS msg_id, m.time_created, m.data,
@@ -105,16 +134,28 @@ pub fn fetch_last_message_meta(
                 last_msg.msg_id, last_msg.time_created AS last_msg_ts,
                 json_extract(last_msg.data,'$.role') AS last_role,
                 json_extract(last_msg.data,'$.time.completed') AS last_completed,
+                json_extract(last_msg.data,'$.error') AS last_error,
                 (SELECT COUNT(*) FROM part p WHERE p.message_id = last_msg.msg_id) AS parts_total,
                 (SELECT COUNT(*) FROM part p WHERE p.message_id = last_msg.msg_id
                    AND json_extract(p.data,'$.type')='tool'
-                   AND json_extract(p.data,'$.state.status') IN ('running','pending')) AS stuck_tools
+                   AND (
+                     json_extract(p.data,'$.state.status') IN ('running','pending')
+                     OR (
+                       json_extract(p.data,'$.state.status')='error'
+                       AND json_extract(p.data,'$.state.metadata.interrupted')=1
+                     )
+                   )) AS stuck_tools
          FROM session s
          JOIN last_msg ON last_msg.session_id = s.id AND last_msg.rn = 1"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(session_ids.iter()), |row| {
         let last_completed = row.get::<_, Option<i64>>(5)?.is_some();
+        // `$.error` is JSON-typed (object).  We don't need its
+        // contents — only its presence.  rusqlite surfaces this as
+        // a `Value` we read by column index; any non-NULL value means
+        // opencode recorded an error on this assistant turn.
+        let assistant_errored = !matches!(row.get_ref(6)?, rusqlite::types::ValueRef::Null);
         Ok(LastMessageMeta {
             session_id: row.get(0)?,
             session_updated_ts: row.get::<_, i64>(1)? / 1000,
@@ -122,8 +163,9 @@ pub fn fetch_last_message_meta(
             last_msg_ts: row.get::<_, i64>(3)? / 1000,
             last_role: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
             last_completed,
-            parts_total: row.get(6)?,
-            stuck_tools: row.get(7)?,
+            parts_total: row.get(7)?,
+            stuck_tools: row.get(8)?,
+            assistant_errored,
         })
     })?;
 
@@ -134,7 +176,22 @@ pub fn fetch_last_message_meta(
 }
 
 pub fn classify_static(meta: &LastMessageMeta) -> StaticStatus {
-    if meta.last_role == "assistant" && meta.last_completed {
+    // A turn is `Completed` only when opencode stamped
+    // `time.completed` AND did NOT record an error AND has no
+    // stuck/interrupted tool parts.  The latter two are the
+    // smoking-gun signals that a "completed" turn actually died
+    // mid-stream (e.g. `STREAM_IDLE_TIMEOUT` while a tool was
+    // executing — opencode then marks the tool as
+    // `state.status='error'` with `metadata.interrupted=true`, and
+    // ALSO stamps `time.completed` on the assistant message).  Without
+    // these guards the session would slip into `Completed` and be
+    // excluded from the resumable set, despite being a textbook
+    // candidate for a `continue` nudge.
+    if meta.last_role == "assistant"
+        && meta.last_completed
+        && !meta.assistant_errored
+        && meta.stuck_tools == 0
+    {
         return StaticStatus::Completed;
     }
     if meta.last_role == "user" {
@@ -440,7 +497,11 @@ mod tests {
 
     #[test]
     fn classify_static_shapes() {
-        let meta = |last_role: &str, last_completed: bool, parts_total: i64, stuck_tools: i64| {
+        let meta = |last_role: &str,
+                    last_completed: bool,
+                    parts_total: i64,
+                    stuck_tools: i64,
+                    assistant_errored: bool| {
             LastMessageMeta {
                 session_id: "ses_1".to_string(),
                 msg_id: "msg_1".to_string(),
@@ -450,29 +511,108 @@ mod tests {
                 last_completed,
                 parts_total,
                 stuck_tools,
+                assistant_errored,
             }
         };
 
+        // Healthy completion: time.completed set, no error, no stuck tools.
         assert_eq!(
-            classify_static(&meta("assistant", true, 1, 0)),
+            classify_static(&meta("assistant", true, 1, 0, false)),
             StaticStatus::Completed
         );
         assert_eq!(
-            classify_static(&meta("user", false, 0, 0)),
+            classify_static(&meta("user", false, 0, 0, false)),
             StaticStatus::UserPending
         );
         assert_eq!(
-            classify_static(&meta("assistant", false, 0, 0)),
+            classify_static(&meta("assistant", false, 0, 0, false)),
             StaticStatus::AssistantEmpty
         );
         assert_eq!(
-            classify_static(&meta("assistant", false, 1, 0)),
+            classify_static(&meta("assistant", false, 1, 0, false)),
             StaticStatus::AssistantPartial
         );
         assert_eq!(
-            classify_static(&meta("assistant", false, 1, 1)),
+            classify_static(&meta("assistant", false, 1, 1, false)),
             StaticStatus::AssistantToolStuck
         );
+    }
+
+    /// Regression for the real-world `ses_1df528d3effeeHt8GvXcpgeeZo`
+    /// shape: opencode died mid-tool with `STREAM_IDLE_TIMEOUT`, so it
+    /// recorded:
+    ///
+    /// * `time.completed`: set (truthy) — looks "done" naively
+    /// * `$.error`: `{APIError, STREAM_IDLE_TIMEOUT}` — turn actually
+    ///    died
+    /// * one tool part with `state.status='error'` and
+    ///   `state.metadata.interrupted=true` — tool was aborted
+    ///
+    /// Before the fix this landed in `Completed` (excluded from
+    /// `is_resumable`).  With the assistant-errored + interrupted-tool
+    /// guards the turn correctly classifies as `AssistantToolStuck`,
+    /// which `nudge` resolves to a `ContinuePrompt` strategy.
+    #[test]
+    fn classify_static_errored_completed_with_interrupted_tool_is_tool_stuck() {
+        let meta = LastMessageMeta {
+            session_id: "ses_x".to_string(),
+            msg_id: "msg_x".to_string(),
+            last_msg_ts: 1,
+            session_updated_ts: 2,
+            last_role: "assistant".to_string(),
+            last_completed: true,
+            parts_total: 3,
+            stuck_tools: 1,
+            assistant_errored: true,
+        };
+        let status = classify_static(&meta);
+        assert_eq!(status, StaticStatus::AssistantToolStuck);
+        assert!(status.is_resumable());
+    }
+
+    /// Sibling regression: assistant turn died with an error but had
+    /// no in-flight or interrupted tool parts (e.g. error fired during
+    /// text streaming before any tool was invoked).  Must land in
+    /// `AssistantPartial` (still resumable), NOT `Completed`.
+    #[test]
+    fn classify_static_errored_completed_without_tool_is_partial() {
+        let meta = LastMessageMeta {
+            session_id: "ses_x".to_string(),
+            msg_id: "msg_x".to_string(),
+            last_msg_ts: 1,
+            session_updated_ts: 2,
+            last_role: "assistant".to_string(),
+            last_completed: true,
+            parts_total: 2, // step-start + partial text
+            stuck_tools: 0,
+            assistant_errored: true,
+        };
+        let status = classify_static(&meta);
+        assert_eq!(status, StaticStatus::AssistantPartial);
+        assert!(status.is_resumable());
+    }
+
+    /// Guard against the reverse regression: an assistant turn that
+    /// genuinely completed (time.completed set, no error, no stuck
+    /// tools) must still classify as `Completed`.  This pins the
+    /// happy path so a future change to the resumability heuristic
+    /// can't silently turn every completed session into a nudge target.
+    #[test]
+    fn classify_static_genuine_completion_stays_completed() {
+        let meta = LastMessageMeta {
+            session_id: "ses_x".to_string(),
+            msg_id: "msg_x".to_string(),
+            last_msg_ts: 1,
+            session_updated_ts: 2,
+            last_role: "assistant".to_string(),
+            last_completed: true,
+            parts_total: 5,
+            stuck_tools: 0,
+            assistant_errored: false,
+        };
+        let status = classify_static(&meta);
+        assert_eq!(status, StaticStatus::Completed);
+        assert!(!status.is_resumable());
     }
 
     #[test]
@@ -537,6 +677,157 @@ mod tests {
             classify_static(meta.get("ses_tool").unwrap()),
             StaticStatus::AssistantToolStuck
         );
+    }
+
+    /// End-to-end regression for the SQL → mapper → `classify_static`
+    /// pipeline against the real-world `ses_1df528d3effeeHt8GvXcpgeeZo`
+    /// shape (see `classify_static_errored_completed_with_interrupted_tool_is_tool_stuck`
+    /// for the standalone classifier check).
+    ///
+    /// This test pins the on-disk byte shape:
+    ///   * `$.time.completed` is set (truthy timestamp)
+    ///   * `$.error` is a populated object
+    ///   * one tool part has `state.status='error'` AND
+    ///     `state.metadata.interrupted=true`
+    /// and confirms `fetch_last_message_meta` extracts both
+    /// `assistant_errored=true` and `stuck_tools>=1`, so
+    /// `classify_static` yields `AssistantToolStuck` and the session
+    /// surfaces in the resumable set.
+    #[test]
+    fn fetch_last_message_meta_detects_errored_completed_with_interrupted_tool() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_err', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        // Last assistant message: time.completed set AND $.error populated.
+        // Mirrors opencode's recorded shape on STREAM_IDLE_TIMEOUT.
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES ('msg_err', 'ses_err', 1500, ?)",
+            [r#"{
+                "role": "assistant",
+                "time": {"created": 1000, "completed": 1800},
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "Stream idle timeout: no LLM events for 30s",
+                        "isRetryable": true,
+                        "metadata": {"code": "STREAM_IDLE_TIMEOUT"}
+                    }
+                }
+            }"#],
+        )
+        .unwrap();
+        // Three parts mirroring the on-disk shape: step-start, text, then
+        // an interrupted tool (`state.status='error'` + `metadata.interrupted=true`).
+        insert_part(&conn, "prt_step", "msg_err", r#"{"type":"step-start"}"#);
+        insert_part(
+            &conn,
+            "prt_text",
+            "msg_err",
+            r#"{"type":"text","text":"Now log the duplicate-fire incident..."}"#,
+        );
+        insert_part(
+            &conn,
+            "prt_tool",
+            "msg_err",
+            r#"{"type":"tool","tool":"edit","callID":"toolu_x","state":{"status":"error","input":{},"raw":"","error":"Tool execution aborted","metadata":{"interrupted":true}}}"#,
+        );
+
+        let meta = fetch_last_message_meta(&conn, &[]).unwrap();
+        let entry = meta
+            .get("ses_err")
+            .expect("session row should have been mapped");
+
+        // Both signals must be picked up by the SQL/mapper.
+        assert!(
+            entry.assistant_errored,
+            "assistant_errored must be true when $.error is populated: {entry:?}"
+        );
+        assert!(
+            entry.last_completed,
+            "last_completed reflects $.time.completed being set: {entry:?}"
+        );
+        assert_eq!(
+            entry.stuck_tools, 1,
+            "interrupted tool part should count toward stuck_tools: {entry:?}"
+        );
+        // And the classifier puts it into the resumable bucket.
+        let status = classify_static(entry);
+        assert_eq!(status, StaticStatus::AssistantToolStuck);
+        assert!(status.is_resumable());
+    }
+
+    /// Sibling end-to-end: assistant turn errored but had no tool parts
+    /// (e.g. died during text streaming).  Must extract
+    /// `assistant_errored=true`, `stuck_tools=0`, and land in
+    /// `AssistantPartial` — still resumable.
+    #[test]
+    fn fetch_last_message_meta_detects_errored_completed_without_tool() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_err', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES ('msg_err', 'ses_err', 1500, ?)",
+            [r#"{
+                "role": "assistant",
+                "time": {"created": 1000, "completed": 1800},
+                "error": {"name": "APIError", "data": {"message": "boom"}}
+            }"#],
+        )
+        .unwrap();
+        insert_part(&conn, "prt_step", "msg_err", r#"{"type":"step-start"}"#);
+        insert_part(
+            &conn,
+            "prt_text",
+            "msg_err",
+            r#"{"type":"text","text":"partial"}"#,
+        );
+
+        let meta = fetch_last_message_meta(&conn, &[]).unwrap();
+        let entry = meta.get("ses_err").unwrap();
+        assert!(entry.assistant_errored);
+        assert_eq!(entry.stuck_tools, 0);
+        let status = classify_static(entry);
+        assert_eq!(status, StaticStatus::AssistantPartial);
+        assert!(status.is_resumable());
+    }
+
+    /// Guard against the reverse regression at the SQL layer: a
+    /// completed assistant message with no `$.error` and no
+    /// interrupted/in-flight tool parts must still classify as
+    /// `Completed`.  Pins the happy path so SQL widening can't
+    /// accidentally turn every session into a nudge candidate.
+    #[test]
+    fn fetch_last_message_meta_keeps_genuine_completion_completed() {
+        let conn = setup_db();
+        insert_session(&conn, "ses_done", "msg_done", "assistant", true);
+        insert_part(
+            &conn,
+            "prt_done_text",
+            "msg_done",
+            r#"{"type":"text","text":"all done"}"#,
+        );
+        // A finished tool part (status='completed', no interrupted flag)
+        // must NOT count toward stuck_tools.
+        insert_part(
+            &conn,
+            "prt_done_tool",
+            "msg_done",
+            r#"{"type":"tool","state":{"status":"completed"}}"#,
+        );
+
+        let meta = fetch_last_message_meta(&conn, &[]).unwrap();
+        let entry = meta.get("ses_done").unwrap();
+        assert!(!entry.assistant_errored);
+        assert_eq!(entry.stuck_tools, 0);
+        let status = classify_static(entry);
+        assert_eq!(status, StaticStatus::Completed);
+        assert!(!status.is_resumable());
     }
 
     /// Insert a message with a custom timestamp (the helper above hardcodes 1500).

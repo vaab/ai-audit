@@ -473,6 +473,7 @@ mod tests {
                     last_completed: false,
                     parts_total: 1,
                     stuck_tools: 0,
+                    assistant_errored: false,
                 },
             },
             live_status,
