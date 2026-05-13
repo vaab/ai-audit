@@ -143,6 +143,10 @@ pub struct SessionNudgeArgs {
     #[arg(short, long)]
     pub search: Option<String>,
 
+    /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
+    #[arg(long)]
+    pub timespan: Option<String>,
+
     /// Filter by last message timestamp timespan
     #[arg(long = "last-message-in")]
     pub last_message_in: Option<String>,

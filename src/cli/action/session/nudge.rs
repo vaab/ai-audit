@@ -23,10 +23,14 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
     if args.session.is_some()
         && (args.project.is_some()
             || args.search.is_some()
+            || args.timespan.is_some()
             || args.last_message_in.is_some()
             || args.status.is_some())
     {
-        bail!("SESSION_ID cannot be combined with --project, --search, --last-message-in, or --status")
+        bail!(
+            "SESSION_ID cannot be combined with --project, --search, --timespan, \
+             --last-message-in, or --status"
+        )
     }
     if let Some(session_id) = args.session.as_deref() {
         match detect_provider(session_id)? {
@@ -48,7 +52,7 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
         project: args.project.as_deref().map(canonicalize_filter_path),
         search: args.search.clone(),
         file: None,
-        timespan: None,
+        timespan: parse_timespan(args.timespan.as_deref())?,
         last_message_in: parse_timespan(args.last_message_in.as_deref())?,
         all: args.all || args.session.is_some(),
         children_of: None,
