@@ -197,11 +197,26 @@ pub fn classify_static(meta: &LastMessageMeta) -> StaticStatus {
     if meta.last_role == "user" {
         return StaticStatus::UserPending;
     }
-    if meta.parts_total == 0 {
-        return StaticStatus::AssistantEmpty;
-    }
+    // `stuck_tools > 0` is checked BEFORE the errored/empty branches
+    // so a turn that died mid-tool is still classified as
+    // `AssistantToolStuck` (the narrowest, most actionable shape)
+    // rather than the broader `AssistantPartial`.
     if meta.stuck_tools > 0 {
         return StaticStatus::AssistantToolStuck;
+    }
+    // `assistant_errored` overrides `parts_total == 0`.  An assistant
+    // turn that recorded `$.error` (e.g. `STREAM_IDLE_TIMEOUT`) is
+    // semantically "interrupted mid-stream", NOT "never started" — even
+    // if the model crashed before emitting its first part.  Conflating
+    // the two shapes (the pre-fix behavior) hid the diagnostic signal
+    // and made `ses_1dc9500afffe3ChzA3rE9JxPom` indistinguishable from
+    // a user-just-pressed-enter-and-walked-away session.  Both are
+    // resumable, but only the errored one is genuinely "interrupted".
+    if meta.assistant_errored {
+        return StaticStatus::AssistantPartial;
+    }
+    if meta.parts_total == 0 {
+        return StaticStatus::AssistantEmpty;
     }
     StaticStatus::AssistantPartial
 }
@@ -592,6 +607,54 @@ mod tests {
         assert!(status.is_resumable());
     }
 
+    /// Regression for the real-world `ses_1dc9500afffe3ChzA3rE9JxPom`
+    /// shape: assistant turn died with `STREAM_IDLE_TIMEOUT` *before*
+    /// producing any parts, so opencode recorded:
+    ///
+    /// * `$.role`            : "assistant"
+    /// * `$.time.completed`  : set (truthy timestamp — looks "done")
+    /// * `$.error`           : `{APIError, STREAM_IDLE_TIMEOUT}`
+    /// * zero parts on this message
+    /// * zero stuck tools (no tools were ever invoked)
+    ///
+    /// Before the fix this landed in `AssistantEmpty`, which is the
+    /// same bucket as "user message sent, assistant never replied at
+    /// all".  Conflating those two shapes hides the diagnostic signal
+    /// (`$.error`) that says *the turn started and crashed*.  It also
+    /// routes the nudge down `CleanResume` (revert + replay), which is
+    /// the right behavior here but loses the "this was interrupted"
+    /// telemetry.
+    ///
+    /// After the fix, an errored assistant turn — regardless of
+    /// `parts_total` — classifies as `AssistantPartial` so the
+    /// diagnostic signal survives.  Resumability is unchanged
+    /// (`AssistantEmpty` and `AssistantPartial` are both resumable);
+    /// the nudge layer is responsible for picking the right strategy
+    /// from the shape.
+    #[test]
+    fn classify_static_errored_completed_with_zero_parts_is_partial() {
+        let meta = LastMessageMeta {
+            session_id: "ses_1dc9500afffe3ChzA3rE9JxPom".to_string(),
+            msg_id: "msg_e2379f816001UiuNaDH6r4wtm0".to_string(),
+            last_msg_ts: 1778711656470,
+            session_updated_ts: 1778711656605,
+            last_role: "assistant".to_string(),
+            last_completed: true,
+            parts_total: 0, // turn died before producing any part
+            stuck_tools: 0,
+            assistant_errored: true, // $.error = APIError/STREAM_IDLE_TIMEOUT
+        };
+        let status = classify_static(&meta);
+        assert_eq!(
+            status,
+            StaticStatus::AssistantPartial,
+            "errored turn with zero parts MUST classify as AssistantPartial \
+             (not AssistantEmpty); the `$.error` signal overrides `parts_total==0` \
+             so the 'interrupted' shape is distinguishable from 'never started'"
+        );
+        assert!(status.is_resumable());
+    }
+
     /// Guard against the reverse regression: an assistant turn that
     /// genuinely completed (time.completed set, no error, no stuck
     /// tools) must still classify as `Completed`.  This pins the
@@ -794,6 +857,79 @@ mod tests {
         assert_eq!(entry.stuck_tools, 0);
         let status = classify_static(entry);
         assert_eq!(status, StaticStatus::AssistantPartial);
+        assert!(status.is_resumable());
+    }
+
+    /// End-to-end regression for the SQL → mapper → `classify_static`
+    /// pipeline against the real-world `ses_1dc9500afffe3ChzA3rE9JxPom`
+    /// shape: the assistant turn died with `STREAM_IDLE_TIMEOUT` BEFORE
+    /// producing a single part.
+    ///
+    /// Pins the on-disk byte shape:
+    ///   * `$.time.completed` is set (truthy timestamp)
+    ///   * `$.error` is a populated object (`APIError` /
+    ///     `STREAM_IDLE_TIMEOUT`)
+    ///   * `parts_total = 0` — no parts attached to this message
+    ///   * `stuck_tools = 0` — no tools were ever invoked
+    ///
+    /// Pre-fix, `assistant_errored=true` was dropped on the floor by
+    /// `classify_static` once `parts_total==0` short-circuited to
+    /// `AssistantEmpty`.  This test confirms the SQL still extracts
+    /// `assistant_errored=true` AND the classifier honors it,
+    /// producing `AssistantPartial` (errored mid-stream, distinguishable
+    /// from "never started").
+    #[test]
+    fn fetch_last_message_meta_detects_errored_completed_with_zero_parts() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES ('ses_err', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        // Last assistant message: time.completed set AND $.error populated,
+        // but NO parts.  This is the exact shape recorded by opencode when
+        // STREAM_IDLE_TIMEOUT fires before the model emits its first token.
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES ('msg_err', 'ses_err', 1500, ?)",
+            [r#"{
+                "role": "assistant",
+                "time": {"created": 1000, "completed": 1800},
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "Stream idle timeout: no LLM events for 30s",
+                        "isRetryable": true,
+                        "metadata": {"code": "STREAM_IDLE_TIMEOUT"}
+                    }
+                }
+            }"#],
+        )
+        .unwrap();
+        // Deliberately NO `insert_part` calls — this message has zero parts.
+
+        let meta = fetch_last_message_meta(&conn, &[]).unwrap();
+        let entry = meta
+            .get("ses_err")
+            .expect("session row should have been mapped");
+
+        assert!(
+            entry.assistant_errored,
+            "assistant_errored must be true when $.error is populated: {entry:?}"
+        );
+        assert!(
+            entry.last_completed,
+            "last_completed reflects $.time.completed being set: {entry:?}"
+        );
+        assert_eq!(entry.parts_total, 0, "no parts attached: {entry:?}");
+        assert_eq!(entry.stuck_tools, 0, "no tools invoked: {entry:?}");
+
+        let status = classify_static(entry);
+        assert_eq!(
+            status,
+            StaticStatus::AssistantPartial,
+            "errored zero-parts turn MUST classify as AssistantPartial, \
+             not AssistantEmpty (which would conflate it with 'never started')"
+        );
         assert!(status.is_resumable());
     }
 
