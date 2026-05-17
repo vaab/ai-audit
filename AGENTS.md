@@ -74,10 +74,61 @@ ai-audit rate <instruction> --test <path>
 - Settings: `~/.claude/settings.json`
 
 ### OpenCode
-- Sessions: `~/.local/share/opencode/storage/session/<hash>/ses_*.json`
-- Messages: `~/.local/share/opencode/storage/message/<session-id>/msg_*.json`
-- Parts: `~/.local/share/opencode/storage/part/<msg-id>/prt_*.json`
-- Logs: `~/.local/share/opencode/log/*.log`
+- **Primary store**: `~/.local/share/opencode/opencode.db` — SQLite (WAL,
+  Drizzle migrations). Owned by the upstream opencode binary
+  (`~/dev/ts/opencode/packages/opencode/src/storage/db.ts`). Channel
+  suffix may apply: non-`latest`/`beta`/`prod` channels use
+  `opencode-<channel>.db` instead, and the `OPENCODE_DB` flag can
+  redirect to a custom file. ai-audit currently hard-codes
+  `opencode.db` (see `src/opencode/db.rs::db_path()` — does NOT honor
+  channel suffix or `OPENCODE_DB`).
+- **Tables** (see `migration/*/migration.sql` upstream):
+  - `session` — id, project_id, parent_id, slug, directory, title,
+    version, share_url, summary_*, `revert` (JSON, set when the
+    session was reverted to a prior cutoff), `permission`, `time_*`.
+  - `message` — id, session_id, time_created, time_updated, `data`
+    (JSON; opencode's full MessageV2 blob including `$.role`,
+    `$.time.completed`, `$.error`, `$.agent`, `$.model`).
+  - `part` — id, message_id, session_id, time_created, time_updated,
+    `data` (JSON; per-part shape: text / tool / step-start / file /
+    etc., with tool parts carrying `$.state.status` ∈
+    {pending, running, completed, error} and
+    `$.state.metadata.interrupted` when aborted).
+  - `permission` — per-project (PK is `project_id`), NOT per-session.
+  - `todo` — session todos.
+  - `session_share`, `session_entry`, `project`.
+- **Status detection contract** (documented by upstream at
+  `src/session/session.ts:155-175` for `Info`): the *static* status of
+  a session is derived from the LAST message + ALL its parts:
+  - `lastMessageRole`, `lastMessageTimeCreated`,
+    `lastMessageTimeCompleted`, `lastMessageErrored` (`$.error IS NOT
+    NULL`), `partsTotal`, `stuckTools` (count of tool parts with
+    `state.status IN ('running','pending')` OR `state.status='error'
+    AND state.metadata.interrupted=1`).
+  - ai-audit's mirror lives in `src/opencode/status.rs` (`StaticStatus`
+    enum, `fetch_last_message_meta`, `classify_static`).
+- **Legacy file-tree** (still referenced by older code paths —
+  `src/opencode/transcript.rs`, `src/activity.rs`,
+  `src/opencode/session_index.rs`, `src/opencode/mod.rs`):
+  `~/.local/share/opencode/storage/{session,message,part}/...`.
+  Upstream opencode now writes EXCLUSIVELY to the SQLite DB; these
+  directories are leftovers from a pre-migration deployment and
+  should NOT be treated as the source of truth. Any new feature MUST
+  read from `opencode.db` via `src/opencode/db.rs`. The legacy
+  read-paths are kept only to surface historical data on machines
+  that still have those files; they will be removed once the
+  migration is universally rolled out.
+- **Logs**: `~/.local/share/opencode/log/*.log`.
+- **Live status**: queried from the running opencode HTTP server via
+  `GET /session/status` (see `src/opencode/server_client.rs`).
+  Returns Running/Idle/ServerUnreachable. "Idle" only means *this
+  session is not currently being processed by the live server* — it
+  is orthogonal to the static status. A session can be
+  `static=assistant-empty` (the assistant turn died with no parts
+  produced) AND `live=idle` (no live work in flight). That combo is
+  the "interrupted with nothing to show for it" shape; the static
+  status alone tells you whether the turn was completed cleanly or
+  errored mid-stream (`$.error IS NOT NULL` on the last message).
 
 ### Pi (badlogic/pi-mono)
 - Sessions: `~/.pi/agent/sessions/--<encoded-cwd>--/<iso-ts>_<uuidv7>.jsonl`
