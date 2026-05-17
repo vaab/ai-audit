@@ -25,6 +25,7 @@
 //! the module docs for [`run`] and [`sanity`] for the contract.
 
 pub mod command;
+pub mod info;
 pub mod run;
 pub mod sanity;
 pub mod session;

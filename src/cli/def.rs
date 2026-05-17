@@ -68,7 +68,7 @@ pub enum LiveStatusArg {
 }
 
 /// Output format options (mutually exclusive)
-#[derive(ClapArgs)]
+#[derive(ClapArgs, Debug, Clone)]
 #[command(group = ArgGroup::new("output-format").multiple(false))]
 pub struct OutputOpts {
     /// Output NUL-separated records for piping
@@ -207,10 +207,34 @@ pub struct SessionNudgeArgs {
     pub fork: bool,
 }
 
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionInfoArgs {
+    /// Session ID. If omitted, auto-detects the current session.
+    pub session: Option<String>,
+
+    /// Skip the live-status HTTP probe (OpenCode only).
+    /// Useful in offline contexts (e.g. commit hooks).
+    #[arg(long = "no-live")]
+    pub no_live: bool,
+
+    /// OpenCode server URL (only consulted when probing live status).
+    #[arg(long = "server-url")]
+    pub server_url: Option<String>,
+
+    /// OpenCode server password (only consulted when probing live status).
+    #[arg(long = "server-password", hide = true)]
+    pub server_password: Option<String>,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
 #[derive(Subcommand)]
 pub enum SessionAction {
     /// Nudge resumable OpenCode sessions
     Nudge(SessionNudgeArgs),
+    /// Show metadata for a single session
+    Info(SessionInfoArgs),
 }
 
 #[derive(Subcommand)]
@@ -455,7 +479,11 @@ impl Commands {
             | Commands::Usage { output, .. }
             | Commands::TokenUsage { output, .. }
             | Commands::AssistedBy { output, .. } => output.format(),
-            Commands::Session { .. } | Commands::Rate { .. } => OutputFormat::Human,
+            Commands::Session { action } => match action {
+                SessionAction::Info(args) => args.output.format(),
+                SessionAction::Nudge(_) => OutputFormat::Human,
+            },
+            Commands::Rate { .. } => OutputFormat::Human,
             Commands::Activity { action } => match action {
                 ActivityAction::List { output, .. } | ActivityAction::Get { output, .. } => {
                     output.format()

@@ -11,6 +11,7 @@ pub mod cache;
 pub mod config;
 pub mod db;
 pub mod enrich;
+pub mod info;
 pub mod nudge;
 pub mod permissions;
 pub mod server_client;

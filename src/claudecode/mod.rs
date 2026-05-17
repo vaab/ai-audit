@@ -1,3 +1,4 @@
+pub mod info;
 pub mod permissions;
 pub mod session;
 pub mod session_index;
