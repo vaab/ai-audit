@@ -37,7 +37,7 @@ struct SessionRecord {
 pub fn run(
     session_type: Option<SessionType>,
     session_id: Option<&str>,
-    search: Option<&str>,
+    search: &[String],
     timespan: Option<&str>,
     project: Option<&str>,
     file: Option<&str>,
@@ -61,7 +61,7 @@ pub fn run(
         session_type: resolved_type,
         session_id: session_id.map(str::to_string),
         project: project.map(canonicalize_filter_path),
-        search: search.map(str::to_string),
+        search: search.to_vec(),
         file: file.map(canonicalize_filter_path),
         timespan: parse_timespan(timespan)?,
         last_message_in: parse_timespan(status.last_message_in.as_deref())?,

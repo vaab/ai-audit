@@ -13,7 +13,10 @@ pub struct SessionFilter {
     pub session_type: Option<SessionType>,
     pub session_id: Option<String>,
     pub project: Option<String>,
-    pub search: Option<String>,
+    /// Substrings the session transcript must contain.  Multiple
+    /// entries are combined with AND semantics — every needle must be
+    /// found independently.  Empty vector disables the filter.
+    pub search: Vec<String>,
     pub file: Option<String>,
     pub timespan: Option<(i64, i64)>,
     pub last_message_in: Option<(i64, i64)>,
@@ -166,7 +169,7 @@ fn matches_medium_filters(
             return false;
         }
     }
-    if let Some(needle) = filter.search.as_deref() {
+    for needle in &filter.search {
         if !provider.session_contains_text(&session.base.session_id, needle) {
             return false;
         }
@@ -217,7 +220,10 @@ mod tests {
         provider: Provider,
         sessions: Vec<Session>,
         file_hits: Vec<String>,
-        search_hits: Vec<String>,
+        /// `(session_id, needle)` pairs the fake should report as hits.
+        /// Lookup is exact-match on both fields, so tests can model
+        /// per-needle differences (needed for AND-semantics coverage).
+        search_hits: Vec<(String, String)>,
     }
 
     impl SessionProvider for FakeProvider {
@@ -229,8 +235,10 @@ mod tests {
             Ok(self.sessions.clone())
         }
 
-        fn session_contains_text(&self, session_id: &str, _needle: &str) -> bool {
-            self.search_hits.iter().any(|hit| hit == session_id)
+        fn session_contains_text(&self, session_id: &str, needle: &str) -> bool {
+            self.search_hits
+                .iter()
+                .any(|(hit_id, hit_needle)| hit_id == session_id && hit_needle == needle)
         }
 
         fn session_edited_file(&self, session_id: &str, _file_path: &str) -> bool {
@@ -324,7 +332,7 @@ mod tests {
             session_type: Some(SessionType::OpenCode),
             session_id: None,
             project: Some("/tmp/project".to_string()),
-            search: Some("needle".to_string()),
+            search: vec!["needle".to_string()],
             file: Some("/tmp/project/file.rs".to_string()),
             timespan: Some((0, 30)),
             last_message_in: None,
@@ -342,7 +350,7 @@ mod tests {
                 provider: Provider::OpenCode,
                 sessions: vec![session("ses_hit", None), session("ses_miss", None)],
                 file_hits: vec!["ses_hit".to_string()],
-                search_hits: vec!["ses_hit".to_string()],
+                search_hits: vec![("ses_hit".to_string(), "needle".to_string())],
             })],
         )
         .unwrap();
@@ -359,7 +367,7 @@ mod tests {
             session_type: Some(SessionType::OpenCode),
             session_id: None,
             project: None,
-            search: None,
+            search: Vec::new(),
             file: Some("/tmp/project/file.rs".to_string()),
             timespan: None,
             last_message_in: None,
@@ -387,6 +395,8 @@ mod tests {
                 ],
                 file_hits: vec!["ses_a".to_string(), "ses_b".to_string()],
                 search_hits: Vec::new(),
+                // ^ no --search flag in this test, so needle list is empty
+                //   and the search predicate is a no-op.
             })],
         )
         .unwrap();
@@ -403,7 +413,7 @@ mod tests {
             session_type: Some(SessionType::OpenCode),
             session_id: None,
             project: None,
-            search: None,
+            search: Vec::new(),
             file: None,
             timespan: None,
             last_message_in: None,
@@ -427,5 +437,91 @@ mod tests {
         .unwrap();
 
         assert_eq!(sessions.len(), 1);
+    }
+
+    /// Multiple `--search` needles AND together: a session is kept
+    /// only if `session_contains_text` returns true for EVERY needle.
+    /// A session matching one needle but not the other is dropped.
+    #[test]
+    fn combined_filters_intersect_multi_search() {
+        let filter = SessionFilter {
+            session_type: Some(SessionType::OpenCode),
+            session_id: None,
+            project: None,
+            search: vec!["jwt".to_string(), "middleware".to_string()],
+            file: None,
+            timespan: None,
+            last_message_in: None,
+            all: false,
+            children_of: None,
+            static_enrich: None,
+            static_predicate: None,
+            live_enrich: None,
+            live_predicate: None,
+        };
+
+        let sessions = list_filtered_from_providers(
+            &filter,
+            vec![Box::new(FakeProvider {
+                provider: Provider::OpenCode,
+                sessions: vec![
+                    // ses_both — matches both needles → kept
+                    session("ses_both", None),
+                    // ses_jwt_only — matches only "jwt" → dropped
+                    session("ses_jwt_only", None),
+                    // ses_mw_only — matches only "middleware" → dropped
+                    session("ses_mw_only", None),
+                    // ses_none — matches neither → dropped
+                    session("ses_none", None),
+                ],
+                file_hits: Vec::new(),
+                search_hits: vec![
+                    ("ses_both".to_string(), "jwt".to_string()),
+                    ("ses_both".to_string(), "middleware".to_string()),
+                    ("ses_jwt_only".to_string(), "jwt".to_string()),
+                    ("ses_mw_only".to_string(), "middleware".to_string()),
+                ],
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].base.session_id, "ses_both");
+    }
+
+    /// A single `--search` needle behaves the same as before the
+    /// `Option<String> → Vec<String>` migration: only sessions whose
+    /// transcript contains that needle survive.
+    #[test]
+    fn single_search_needle_still_works() {
+        let filter = SessionFilter {
+            session_type: Some(SessionType::OpenCode),
+            session_id: None,
+            project: None,
+            search: vec!["needle".to_string()],
+            file: None,
+            timespan: None,
+            last_message_in: None,
+            all: false,
+            children_of: None,
+            static_enrich: None,
+            static_predicate: None,
+            live_enrich: None,
+            live_predicate: None,
+        };
+
+        let sessions = list_filtered_from_providers(
+            &filter,
+            vec![Box::new(FakeProvider {
+                provider: Provider::OpenCode,
+                sessions: vec![session("ses_hit", None), session("ses_miss", None)],
+                file_hits: Vec::new(),
+                search_hits: vec![("ses_hit".to_string(), "needle".to_string())],
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].base.session_id, "ses_hit");
     }
 }
