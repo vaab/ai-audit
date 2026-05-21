@@ -387,7 +387,7 @@ mod tests {
         ])
         .unwrap();
         match args.command {
-            Commands::Usage { status, .. } => assert_eq!(status.live_status.unwrap().len(), 2),
+            Commands::Usage(a) => assert_eq!(a.status.live_status.unwrap().len(), 2),
             _ => panic!("expected usage"),
         }
     }
@@ -396,7 +396,7 @@ mod tests {
     fn cli_usage_resumable_flag() {
         let args = Args::try_parse_from(["ai-audit", "usage", "--resumable"]).unwrap();
         match args.command {
-            Commands::Usage { status, .. } => assert!(status.resumable),
+            Commands::Usage(a) => assert!(a.status.resumable),
             _ => panic!("expected usage"),
         }
     }

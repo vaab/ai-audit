@@ -964,7 +964,7 @@ pub fn detect_current_session() -> Result<DetectedSession> {
                 "Multiple AI sessions detected in this environment:\n{}\n\n\
                  This command needs exactly one. Pass --session <ID> to pick \
                  the right one, or unset the unwanted *_SESSION_ID env \
-                 vars. (For Assisted-by trailers, `ai-audit assisted-by` \
+                 vars. (For Assisted-by trailers, `ai-audit session assisted-by` \
                  handles multiple sessions natively.)",
                 listing
             );
@@ -1115,11 +1115,13 @@ mod tests {
     fn cli_accepts_last_session_command() {
         use clap::Parser;
 
+        // Legacy top-level alias `last-session` still parses (hidden,
+        // deprecated; the new form is `session previous`).
         let args = crate::cli::Args::try_parse_from(["ai-audit", "last-session"])
             .expect("bare last-session should work");
         match args.command {
-            crate::cli::Commands::LastSession { session_type, .. } => {
-                assert!(session_type.is_none());
+            crate::cli::Commands::LastSession(a) => {
+                assert!(a.session_type.is_none());
             }
             _ => panic!("expected LastSession command"),
         }
@@ -1132,8 +1134,8 @@ mod tests {
         let args = crate::cli::Args::try_parse_from(["ai-audit", "last-session", "-t", "opencode"])
             .expect("last-session with -t should work");
         match args.command {
-            crate::cli::Commands::LastSession { session_type, .. } => {
-                assert!(session_type.is_some());
+            crate::cli::Commands::LastSession(a) => {
+                assert!(a.session_type.is_some());
             }
             _ => panic!("expected LastSession command"),
         }

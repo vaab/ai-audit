@@ -123,7 +123,7 @@ fn render_human(info: &SessionDetailInfo, live: Option<LiveStatus>) {
         info.model.as_deref().unwrap_or("(none)")
     );
     println!();
-    println!("See also: ai-audit usage {}", info.session_id);
+    println!("See also: ai-audit session usage {}", info.session_id);
 }
 
 /// Stable JSON shape (acceptance-tested).  Field names are
