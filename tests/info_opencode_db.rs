@@ -138,7 +138,7 @@ fn opencode_session_info_renders_full_human_block() {
     // No live-status line when --no-live
     assert!(!stdout.contains("Live status:"), "got:\n{}", stdout);
     // Footer hint
-    assert!(stdout.contains("See also: ai-audit usage ses_test01"));
+    assert!(stdout.contains("See also: ai-audit session usage ses_test01"));
 }
 
 #[test]

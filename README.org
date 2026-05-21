@@ -15,20 +15,51 @@ This installs the =ai-audit= binary to =~/.cargo/bin/=.
 
 * Usage
 
+** Command structure
+
+All session-scoped commands live under =ai-audit session <verb>=.
+Short aliases and prefix inference are supported:
+
+| Command                       | Aliases     | Prefix examples |
+|-------------------------------+-------------+-----------------|
+| =session list=                | =ls=        | =s l=, =s li=    |
+| =session current=             | =cur=       | =s c=            |
+| =session previous=            | =prev=      | =s pr=           |
+| =session transcript=          | =tr=        | =s t=            |
+| =session permissions=         | =perms=     | =s pe=           |
+| =session usage=               | =tokens=    | =s u=            |
+| =session assisted-by=         | —           | =s a=            |
+| =session info=                | —           | =s i=            |
+| =session nudge=               | —           | =s n=            |
+
+So =ai-audit s ls= is equivalent to =ai-audit session list=.  Note
+that =s p= is *ambiguous* between =permissions= and =previous= — clap
+prints an error listing the candidates.  Use =s pe= or =s pr= to
+disambiguate.
+
+The legacy top-level forms (=list-sessions=, =current-session=,
+=last-session=, =transcript=, =permissions=, =usage=, =assisted-by=)
+still work for backwards compatibility but print a deprecation
+warning on stderr.  =last-session= is now spelled =session previous=
+(or =s prev=).
+
 ** List Sessions
 
-List all available sessions from both Claude Code and OpenCode:
+List all available sessions from Claude Code, OpenCode, and pi:
 
 #+begin_src bash
 # List all sessions (chronological order)
-ai-audit list-sessions
+ai-audit session list
 
 # Filter by type
-ai-audit list-sessions -t claudecode
-ai-audit list-sessions -t opencode
+ai-audit session list -t claudecode
+ai-audit session list -t opencode
+
+# Short form (alias)
+ai-audit s ls
 
 # JSON output
-ai-audit list-sessions --json
+ai-audit session list --json
 #+end_src
 
 Output format (tab-separated):
@@ -43,18 +74,18 @@ Filter sessions using text, time, and project filters:
 
 #+begin_src bash
 # Search by content (all messages)
-ai-audit list-sessions --search "some keyword"
+ai-audit session list --search "some keyword"
 
 # Filter by time range
-ai-audit list-sessions --timespan today
-ai-audit list-sessions --timespan "2026-02-01..2026-02-11"
+ai-audit session list --timespan today
+ai-audit session list --timespan "2026-02-01..2026-02-11"
 
 # Filter by project directory
-ai-audit list-sessions --project .
-ai-audit list-sessions -p ../fyl
+ai-audit session list --project .
+ai-audit session list -p ../fyl
 
 # Combine filters
-ai-audit list-sessions --timespan today --search "keyword" -t opencode
+ai-audit session list --timespan today --search "keyword" -t opencode
 #+end_src
 
 ** Current Session Detection
@@ -63,20 +94,25 @@ Detect which AI session is running (or was running) in the current context:
 
 #+begin_src bash
 # Auto-detect (env vars, process tree, fingerprinting)
-ai-audit current-session
+ai-audit session current
 
 # Identify session by matching text in last N messages
 # (useful after tmux-resurrect to find which session was active)
-ai-audit current-session --match "visible text from pane"
-ai-audit current-session --match "text" -t opencode -n 3
+ai-audit session current --match "visible text from pane"
+ai-audit session current --match "text" -t opencode -n 3
 
 # Identify session from a PID (e.g., an opencode process)
-ai-audit current-session --pid 286943
-ai-audit current-session --pid 286943 -t opencode
+ai-audit session current --pid 286943
+ai-audit session current --pid 286943 -t opencode
 
 # Output formats
-ai-audit current-session --json
-ai-audit current-session -0
+ai-audit session current --json
+ai-audit session current -0
+
+# Detect the last session used in the current tmux pane
+# (was: ai-audit last-session)
+ai-audit session previous
+ai-audit s prev -t opencode
 #+end_src
 
 Detection strategies (mutually exclusive):
@@ -103,16 +139,19 @@ Display the full conversation transcript of a session:
 
 #+begin_src bash
 # With explicit session ID
-ai-audit transcript <session-id>
+ai-audit session transcript <session-id>
 
 # Auto-detect current session
-ai-audit transcript
+ai-audit session transcript
+
+# Short form (alias)
+ai-audit s tr
 
 # Show only the last N entries
-ai-audit transcript -n 20
+ai-audit session transcript -n 20
 
 # Include thinking/reasoning blocks
-ai-audit transcript -v
+ai-audit session transcript -v
 #+end_src
 
 ** Permissions
@@ -121,10 +160,13 @@ List permission events for a session (claudecode or opencode):
 
 #+begin_src bash
 # Claude Code session (UUID format)
-ai-audit permissions 5593c91e-7bcd-4dff-b52f-f6266899f2d4
+ai-audit session permissions 5593c91e-7bcd-4dff-b52f-f6266899f2d4
 
 # OpenCode session (ses_ prefix)
-ai-audit permissions ses_426e8c1ceffecECQZeKXvtWNoo
+ai-audit session permissions ses_426e8c1ceffecECQZeKXvtWNoo
+
+# Short form (alias)
+ai-audit s perms ses_426e8c1ceffecECQZeKXvtWNoo
 #+end_src
 
 OpenCode output shows tool calls with permission decisions:

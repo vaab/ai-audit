@@ -54,17 +54,55 @@ src/
 
 ## CLI Commands
 
-```
-ai-audit <action> [options]
+The CLI uses a `<noun> <verb>` structure for session-scoped commands.
+All session inspectors plus per-session ops (`usage`, `assisted-by`)
+live under `ai-audit session <verb>`. Cross-session concerns
+(`activity`, `token-usage`, `rate`) stay at the top level.
 
-# Commands:
-ai-audit list-sessions [-s TEXT] [--timespan EXPR] [-p PATH] [-t TYPE]
-ai-audit current-session [--match TEXT | --pid PID] [-t TYPE]
-ai-audit transcript [SESSION-ID] [-n LAST]
-ai-audit permissions <session-id>
-ai-audit activity list | get <timespan> [IDENT...]
-ai-audit rate <instruction> --test <path>
 ```
+ai-audit <command> [options]
+
+# Top-level commands:
+ai-audit session <verb> [options]
+ai-audit activity list | get <timespan> [IDENT...]
+ai-audit token-usage <timespan> [filters...]
+ai-audit rate <instruction> --test <path>
+
+# session subcommands (with aliases):
+ai-audit session list         [aliases: ls]      [-s TEXT] [--timespan EXPR] [-p PATH] [-t TYPE]
+ai-audit session current      [aliases: cur]     [--match TEXT | --pid PID] [-t TYPE]
+ai-audit session previous     [aliases: prev]    [-t TYPE]
+ai-audit session transcript   [aliases: tr]      [SESSION-ID] [-n LAST]
+ai-audit session permissions  [aliases: perms]   <session-id>
+ai-audit session usage        [aliases: tokens]  [SESSION-ID] [filters...]
+ai-audit session assisted-by                     [--session ID]
+ai-audit session info                            [SESSION-ID]
+ai-audit session nudge                           <session-id | --all>
+```
+
+Short forms work via clap's `infer_subcommands` plus explicit
+aliases: `ai-audit s ls`, `ai-audit s cur`, `ai-audit s pr`
+(previous), `ai-audit s pe` (permissions). The prefix `s p` is
+**ambiguous** between `permissions` and `previous` and is rejected
+with a clear error — use `pe` / `pr` to disambiguate.
+
+### Legacy top-level commands (deprecated, hidden)
+
+The old top-level forms still parse for backward compatibility but
+emit a one-line deprecation warning on stderr:
+
+| Old (still works)          | New (canonical)                |
+|----------------------------|--------------------------------|
+| `ai-audit list-sessions`   | `ai-audit session list`        |
+| `ai-audit current-session` | `ai-audit session current`     |
+| `ai-audit last-session`    | `ai-audit session previous`    |
+| `ai-audit transcript`      | `ai-audit session transcript`  |
+| `ai-audit permissions`     | `ai-audit session permissions` |
+| `ai-audit usage`           | `ai-audit session usage`       |
+| `ai-audit assisted-by`     | `ai-audit session assisted-by` |
+
+Note the rename: `last-session` is now `session previous` (the verb
+form is friendlier and avoids any `l` ambiguity with `list`).
 
 ## Data Sources
 

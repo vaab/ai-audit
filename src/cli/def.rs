@@ -8,6 +8,7 @@ use crate::OutputFormat;
 /// Audit tool for AI assistant sessions
 #[derive(Parser)]
 #[command(name = "ai-audit", version, about)]
+#[command(infer_subcommands = true)]
 pub struct Args {
     /// Suppress non-error output
     #[arg(short, long, global = true)]
@@ -229,168 +230,231 @@ pub struct SessionInfoArgs {
     pub output: OutputOpts,
 }
 
+// ---------------------------------------------------------------------------
+// Payload structs reused by both new `session <verb>` subcommands and the
+// hidden top-level legacy commands.  This keeps the two surfaces in lockstep
+// without duplicating field definitions.
+// ---------------------------------------------------------------------------
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionPermissionsArgs {
+    /// Session ID (UUID or ses_* for OpenCode)
+    pub session: String,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionListArgs {
+    /// Filter by session type
+    #[arg(short = 't', long = "type")]
+    pub session_type: Option<SessionType>,
+
+    /// Filter by session ID (exact match)
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    /// Only list sessions containing a message matching this string
+    #[arg(short, long)]
+    pub search: Option<String>,
+
+    /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
+    #[arg(long)]
+    pub timespan: Option<String>,
+
+    /// Filter by project path (exact match; can be relative, e.g., "." or "../fyl")
+    #[arg(short, long)]
+    pub project: Option<String>,
+
+    /// Only list sessions where this file was written or edited
+    #[arg(short, long)]
+    pub file: Option<String>,
+
+    /// Include sub-agent sessions (hidden by default)
+    #[arg(short, long)]
+    pub all: bool,
+
+    /// List only sub-sessions of this parent session ID
+    #[arg(long)]
+    pub children_of: Option<String>,
+
+    #[command(flatten)]
+    pub status: SessionStatusOpts,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionTranscriptArgs {
+    /// Session ID (UUID for Claude Code, ses_* for OpenCode).
+    /// If omitted, auto-detects the current session.
+    pub session: Option<String>,
+
+    /// Show only the last N entries
+    #[arg(short = 'n', long)]
+    pub last: Option<usize>,
+
+    /// Show only tool_use entries that wrote or edited this file
+    #[arg(short, long)]
+    pub file: Option<String>,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionCurrentArgs {
+    /// Text to match against the last messages of session transcripts.
+    /// When provided, sessions are identified by searching for this string
+    /// in recent messages instead of using process-tree detection.
+    #[arg(short, long)]
+    pub r#match: Option<String>,
+
+    /// Filter by session type (claudecode or opencode)
+    #[arg(short = 't', long = "type")]
+    pub session_type: Option<SessionType>,
+
+    /// Number of recent messages to search when using --match (default: 5)
+    #[arg(short = 'n', long, default_value = "5")]
+    pub last_messages: usize,
+
+    /// Filter by project path (default: current directory)
+    #[arg(short, long)]
+    pub project: Option<String>,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionPreviousArgs {
+    /// Filter by session type (claudecode or opencode)
+    #[arg(short = 't', long = "type")]
+    pub session_type: Option<SessionType>,
+
+    /// Read scrollback from file instead of capturing from tmux pane
+    #[arg(long)]
+    pub scrollback_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionUsageArgs {
+    /// Session ID. If omitted, shows aggregated usage across all sessions.
+    pub session: Option<String>,
+
+    /// Filter by session type (claudecode or opencode)
+    #[arg(short = 't', long = "type")]
+    pub session_type: Option<SessionType>,
+
+    /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
+    #[arg(long)]
+    pub timespan: Option<String>,
+
+    /// Filter by project path
+    #[arg(short, long)]
+    pub project: Option<String>,
+
+    #[command(flatten)]
+    pub status: SessionStatusOpts,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct SessionAssistedByArgs {
+    /// Session ID to resolve.  If omitted, auto-detects.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Exit 0 silently when no current session can be detected.
+    /// Useful for `commit-msg` hooks running in human shells where
+    /// missing AI context should not block the commit.
+    #[arg(long = "quiet-if-no-session")]
+    pub quiet_if_no_session: bool,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
 #[derive(Subcommand)]
+#[command(infer_subcommands = true)]
 pub enum SessionAction {
-    /// Nudge resumable OpenCode sessions
-    Nudge(SessionNudgeArgs),
+    /// List available sessions
+    #[command(visible_alias = "ls")]
+    List(SessionListArgs),
+
+    /// Detect and print the current AI session ID
+    #[command(visible_alias = "cur")]
+    Current(SessionCurrentArgs),
+
+    /// Detect the last AI session used in the current tmux pane
+    #[command(visible_alias = "prev")]
+    Previous(SessionPreviousArgs),
+
+    /// Display full session transcript
+    #[command(visible_alias = "tr")]
+    Transcript(SessionTranscriptArgs),
+
+    /// List permission events for a session
+    #[command(visible_alias = "perms")]
+    Permissions(SessionPermissionsArgs),
+
+    /// Show token usage for a session or across all sessions
+    #[command(visible_alias = "tokens")]
+    Usage(SessionUsageArgs),
+
+    /// Resolve the kernel-canonical Assisted-by trailer for a session
+    AssistedBy(SessionAssistedByArgs),
+
     /// Show metadata for a single session
     Info(SessionInfoArgs),
+
+    /// Nudge resumable OpenCode sessions
+    Nudge(SessionNudgeArgs),
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
     /// List permission events for a session
-    Permissions {
-        /// Session ID (UUID or ses_* for OpenCode)
-        session: String,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    #[command(hide = true)]
+    Permissions(SessionPermissionsArgs),
     /// List available sessions
-    ListSessions {
-        /// Filter by session type
-        #[arg(short = 't', long = "type")]
-        session_type: Option<SessionType>,
-
-        /// Filter by session ID (exact match)
-        #[arg(long)]
-        session_id: Option<String>,
-
-        /// Only list sessions containing a message matching this string
-        #[arg(short, long)]
-        search: Option<String>,
-
-        /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
-        #[arg(long)]
-        timespan: Option<String>,
-
-        /// Filter by project path (exact match; can be relative, e.g., "." or "../fyl")
-        #[arg(short, long)]
-        project: Option<String>,
-
-        /// Only list sessions where this file was written or edited
-        #[arg(short, long)]
-        file: Option<String>,
-
-        /// Include sub-agent sessions (hidden by default)
-        #[arg(short, long)]
-        all: bool,
-
-        /// List only sub-sessions of this parent session ID
-        #[arg(long)]
-        children_of: Option<String>,
-
-        #[command(flatten)]
-        status: SessionStatusOpts,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    #[command(hide = true)]
+    ListSessions(SessionListArgs),
     /// User activity tracking (messages and permission grants)
     Activity {
         #[command(subcommand)]
         action: ActivityAction,
     },
     /// Display full session transcript
-    Transcript {
-        /// Session ID (UUID for Claude Code, ses_* for OpenCode).
-        /// If omitted, auto-detects the current session.
-        session: Option<String>,
-
-        /// Show only the last N entries
-        #[arg(short = 'n', long)]
-        last: Option<usize>,
-
-        /// Show only tool_use entries that wrote or edited this file
-        #[arg(short, long)]
-        file: Option<String>,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    #[command(hide = true)]
+    Transcript(SessionTranscriptArgs),
     /// Detect and print the current AI session ID
-    CurrentSession {
-        /// Text to match against the last messages of session transcripts.
-        /// When provided, sessions are identified by searching for this string
-        /// in recent messages instead of using process-tree detection.
-        #[arg(short, long)]
-        r#match: Option<String>,
-
-        /// Filter by session type (claudecode or opencode)
-        #[arg(short = 't', long = "type")]
-        session_type: Option<SessionType>,
-
-        /// Number of recent messages to search when using --match (default: 5)
-        #[arg(short = 'n', long, default_value = "5")]
-        last_messages: usize,
-
-        /// Filter by project path (default: current directory)
-        #[arg(short, long)]
-        project: Option<String>,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    #[command(hide = true)]
+    CurrentSession(SessionCurrentArgs),
     /// Detect the last AI session used in the current tmux pane
-    LastSession {
-        /// Filter by session type (claudecode or opencode)
-        #[arg(short = 't', long = "type")]
-        session_type: Option<SessionType>,
-
-        /// Read scrollback from file instead of capturing from tmux pane
-        #[arg(long)]
-        scrollback_file: Option<PathBuf>,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    #[command(hide = true)]
+    LastSession(SessionPreviousArgs),
     /// Manage sessions
     Session {
         #[command(subcommand)]
         action: SessionAction,
     },
     /// Show token usage for a session or across all sessions
-    Usage {
-        /// Session ID. If omitted, shows aggregated usage across all sessions.
-        session: Option<String>,
-
-        /// Filter by session type (claudecode or opencode)
-        #[arg(short = 't', long = "type")]
-        session_type: Option<SessionType>,
-
-        /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
-        #[arg(long)]
-        timespan: Option<String>,
-
-        /// Filter by project path
-        #[arg(short, long)]
-        project: Option<String>,
-
-        #[command(flatten)]
-        status: SessionStatusOpts,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    #[command(hide = true)]
+    Usage(SessionUsageArgs),
     /// Resolve the kernel-canonical Assisted-by trailer for a session
     ///
     /// Defaults to the auto-detected current session (same detection
-    /// path as `current-session`).  Use `--session` to bypass detection.
-    AssistedBy {
-        /// Session ID to resolve.  If omitted, auto-detects.
-        #[arg(long)]
-        session: Option<String>,
-
-        /// Exit 0 silently when no current session can be detected.
-        /// Useful for `commit-msg` hooks running in human shells where
-        /// missing AI context should not block the commit.
-        #[arg(long = "quiet-if-no-session")]
-        quiet_if_no_session: bool,
-
-        #[command(flatten)]
-        output: OutputOpts,
-    },
+    /// path as `session current`).  Use `--session` to bypass detection.
+    #[command(hide = true)]
+    AssistedBy(SessionAssistedByArgs),
     /// Per-message LLM token consumption events over a timespan
     ///
     /// Emits one record per assistant message that consumed tokens,
@@ -471,24 +535,38 @@ impl Commands {
     /// Extract the output format from any command variant.
     pub fn output_format(&self) -> OutputFormat {
         match self {
-            Commands::Permissions { output, .. }
-            | Commands::ListSessions { output, .. }
-            | Commands::Transcript { output, .. }
-            | Commands::CurrentSession { output, .. }
-            | Commands::LastSession { output, .. }
-            | Commands::Usage { output, .. }
-            | Commands::TokenUsage { output, .. }
-            | Commands::AssistedBy { output, .. } => output.format(),
-            Commands::Session { action } => match action {
-                SessionAction::Info(args) => args.output.format(),
-                SessionAction::Nudge(_) => OutputFormat::Human,
-            },
+            Commands::Permissions(a) => a.output.format(),
+            Commands::ListSessions(a) => a.output.format(),
+            Commands::Transcript(a) => a.output.format(),
+            Commands::CurrentSession(a) => a.output.format(),
+            Commands::LastSession(a) => a.output.format(),
+            Commands::Usage(a) => a.output.format(),
+            Commands::AssistedBy(a) => a.output.format(),
+            Commands::TokenUsage { output, .. } => output.format(),
+            Commands::Session { action } => action.output_format(),
             Commands::Rate { .. } => OutputFormat::Human,
             Commands::Activity { action } => match action {
                 ActivityAction::List { output, .. } | ActivityAction::Get { output, .. } => {
                     output.format()
                 }
             },
+        }
+    }
+}
+
+impl SessionAction {
+    /// Extract the output format from any session subcommand variant.
+    pub fn output_format(&self) -> OutputFormat {
+        match self {
+            SessionAction::List(a) => a.output.format(),
+            SessionAction::Current(a) => a.output.format(),
+            SessionAction::Previous(a) => a.output.format(),
+            SessionAction::Transcript(a) => a.output.format(),
+            SessionAction::Permissions(a) => a.output.format(),
+            SessionAction::Usage(a) => a.output.format(),
+            SessionAction::AssistedBy(a) => a.output.format(),
+            SessionAction::Info(a) => a.output.format(),
+            SessionAction::Nudge(_) => OutputFormat::Human,
         }
     }
 }
@@ -657,6 +735,320 @@ mod tests {
                 assert!(categs_file.is_some());
             }
             _ => panic!("expected activity get"),
+        }
+    }
+
+    // ====================================================================
+    // `session <verb>` restructure (formerly top-level commands)
+    // ====================================================================
+    //
+    // The CLI moved the read-only inspectors + `usage` + `assisted-by`
+    // under `session`. These tests pin:
+    //
+    //   1. The new canonical form parses and routes to `Commands::Session`
+    //      with the right `SessionAction` variant.
+    //   2. Each subcommand's visible alias works (`ls`, `cur`, `prev`,
+    //      `tr`, `perms`, `tokens`).
+    //   3. Clap's `infer_subcommands` resolves unambiguous prefixes
+    //      (e.g. `aa session li` -> `list`).
+    //   4. The ambiguous-prefix case (`s p` between `permissions` and
+    //      `previous`) is correctly rejected.
+    //   5. Every legacy top-level form (`list-sessions`, `current-session`,
+    //      `last-session`, `transcript`, `permissions <SESSION>`, `usage`,
+    //      `assisted-by`) still parses to its hidden `Commands::*` variant
+    //      — backwards compat for scripts and historical session
+    //      transcripts.
+    //   6. The top-level `s` prefix resolves to `session` (no ambiguity
+    //      since no other top-level command starts with `s`).
+
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).expect("parse should succeed")
+    }
+
+    #[test]
+    fn session_list_canonical() {
+        let args = parse(&["ai-audit", "session", "list"]);
+        match args.command {
+            Commands::Session {
+                action: SessionAction::List(_),
+            } => {}
+            _ => panic!("expected session list"),
+        }
+    }
+
+    #[test]
+    fn session_list_alias_ls() {
+        let args = parse(&["ai-audit", "session", "ls"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::List(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn session_list_inferred_from_prefix() {
+        // `li` is unambiguous because no other subcommand starts with `li`.
+        let args = parse(&["ai-audit", "session", "li"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::List(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn session_l_resolves_to_list() {
+        // `l` is unambiguous: no other `session` subcommand starts with `l`
+        // (`previous` replaced `last`, so the ambiguity is gone).
+        let args = parse(&["ai-audit", "session", "l"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::List(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn session_current_canonical_and_alias() {
+        for argv in [
+            &["ai-audit", "session", "current"][..],
+            &["ai-audit", "session", "cur"][..],
+        ] {
+            let args = parse(argv);
+            assert!(
+                matches!(
+                    args.command,
+                    Commands::Session {
+                        action: SessionAction::Current(_)
+                    }
+                ),
+                "failed for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_previous_canonical_and_alias() {
+        for argv in [
+            &["ai-audit", "session", "previous"][..],
+            &["ai-audit", "session", "prev"][..],
+        ] {
+            let args = parse(argv);
+            assert!(
+                matches!(
+                    args.command,
+                    Commands::Session {
+                        action: SessionAction::Previous(_)
+                    }
+                ),
+                "failed for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_transcript_canonical_and_alias() {
+        for argv in [
+            &["ai-audit", "session", "transcript", "ses_x"][..],
+            &["ai-audit", "session", "tr", "ses_x"][..],
+        ] {
+            let args = parse(argv);
+            assert!(
+                matches!(
+                    args.command,
+                    Commands::Session {
+                        action: SessionAction::Transcript(_)
+                    }
+                ),
+                "failed for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_permissions_canonical_and_alias() {
+        for argv in [
+            &["ai-audit", "session", "permissions", "ses_x"][..],
+            &["ai-audit", "session", "perms", "ses_x"][..],
+        ] {
+            let args = parse(argv);
+            assert!(
+                matches!(
+                    args.command,
+                    Commands::Session {
+                        action: SessionAction::Permissions(_)
+                    }
+                ),
+                "failed for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_usage_canonical_and_alias() {
+        for argv in [
+            &["ai-audit", "session", "usage"][..],
+            &["ai-audit", "session", "tokens"][..],
+        ] {
+            let args = parse(argv);
+            assert!(
+                matches!(
+                    args.command,
+                    Commands::Session {
+                        action: SessionAction::Usage(_)
+                    }
+                ),
+                "failed for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_assisted_by_canonical() {
+        let args = parse(&["ai-audit", "session", "assisted-by"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::AssistedBy(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn session_p_is_ambiguous_between_permissions_and_previous() {
+        // `p` matches `permissions`, `previous`, `prev`, and `perms`.
+        // Clap's `infer_subcommands` refuses to silently pick a winner
+        // and surfaces an error.  The exact phrasing depends on clap's
+        // version (currently "unrecognized subcommand 'p'" with a
+        // similar-commands tip listing several candidates).  The
+        // contract we pin here is the bare minimum: parsing fails and
+        // the error mentions at least one of the candidates so the
+        // user can disambiguate.
+        let result = Args::try_parse_from(["ai-audit", "session", "p"]);
+        let err = match result {
+            Ok(_) => panic!("expected ambiguous-prefix parse error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("previous") || msg.contains("permissions"),
+            "expected error to mention at least one candidate, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn session_pe_resolves_to_permissions() {
+        let args = parse(&["ai-audit", "session", "pe", "ses_x"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::Permissions(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn session_pr_resolves_to_previous() {
+        let args = parse(&["ai-audit", "session", "pr"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::Previous(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn top_level_s_resolves_to_session() {
+        // No other top-level command starts with `s`, so `s l` works.
+        let args = parse(&["ai-audit", "s", "l"]);
+        assert!(matches!(
+            args.command,
+            Commands::Session {
+                action: SessionAction::List(_)
+            }
+        ));
+    }
+
+    // ====================================================================
+    // Legacy top-level commands (hidden, deprecated) still parse.
+    // ====================================================================
+
+    #[test]
+    fn legacy_list_sessions_still_parses() {
+        let args = parse(&["ai-audit", "list-sessions"]);
+        assert!(matches!(args.command, Commands::ListSessions(_)));
+    }
+
+    #[test]
+    fn legacy_current_session_still_parses() {
+        let args = parse(&["ai-audit", "current-session"]);
+        assert!(matches!(args.command, Commands::CurrentSession(_)));
+    }
+
+    #[test]
+    fn legacy_last_session_still_parses() {
+        let args = parse(&["ai-audit", "last-session"]);
+        assert!(matches!(args.command, Commands::LastSession(_)));
+    }
+
+    #[test]
+    fn legacy_transcript_still_parses() {
+        let args = parse(&["ai-audit", "transcript", "ses_x"]);
+        assert!(matches!(args.command, Commands::Transcript(_)));
+    }
+
+    #[test]
+    fn legacy_permissions_still_parses() {
+        let args = parse(&["ai-audit", "permissions", "ses_x"]);
+        assert!(matches!(args.command, Commands::Permissions(_)));
+    }
+
+    #[test]
+    fn legacy_usage_still_parses() {
+        let args = parse(&["ai-audit", "usage"]);
+        assert!(matches!(args.command, Commands::Usage(_)));
+    }
+
+    #[test]
+    fn legacy_assisted_by_still_parses() {
+        let args = parse(&["ai-audit", "assisted-by"]);
+        assert!(matches!(args.command, Commands::AssistedBy(_)));
+    }
+
+    #[test]
+    fn session_list_carries_filter_flags() {
+        // Make sure flags flow through the payload struct correctly.
+        let args = parse(&[
+            "ai-audit", "session", "list", "--search", "needle", "-p", "/tmp", "-t", "opencode",
+        ]);
+        match args.command {
+            Commands::Session {
+                action: SessionAction::List(a),
+            } => {
+                assert_eq!(a.search.as_deref(), Some("needle"));
+                assert_eq!(a.project.as_deref(), Some("/tmp"));
+                assert_eq!(a.session_type, Some(SessionType::OpenCode));
+            }
+            _ => panic!("expected session list"),
+        }
+    }
+
+    #[test]
+    fn session_transcript_carries_session_id() {
+        let args = parse(&["ai-audit", "session", "tr", "ses_abc", "-n", "5"]);
+        match args.command {
+            Commands::Session {
+                action: SessionAction::Transcript(a),
+            } => {
+                assert_eq!(a.session.as_deref(), Some("ses_abc"));
+                assert_eq!(a.last, Some(5));
+            }
+            _ => panic!("expected session transcript"),
         }
     }
 }

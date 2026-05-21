@@ -295,6 +295,7 @@ mod tests {
 
     #[test]
     fn cli_accepts_static_status_csv() {
+        // The legacy top-level `list-sessions` still parses (hidden alias).
         let args = Args::try_parse_from([
             "ai-audit",
             "list-sessions",
@@ -303,8 +304,8 @@ mod tests {
         ])
         .unwrap();
         match args.command {
-            Commands::ListSessions { status, .. } => {
-                assert_eq!(status.status.unwrap().len(), 2);
+            Commands::ListSessions(a) => {
+                assert_eq!(a.status.status.unwrap().len(), 2);
             }
             _ => panic!("expected list-sessions"),
         }
@@ -327,8 +328,8 @@ mod tests {
         ])
         .unwrap();
         match args.command {
-            Commands::ListSessions { status, .. } => {
-                assert_eq!(status.live_status.unwrap().len(), 2);
+            Commands::ListSessions(a) => {
+                assert_eq!(a.status.live_status.unwrap().len(), 2);
             }
             _ => panic!("expected list-sessions"),
         }
