@@ -207,7 +207,7 @@ fn run_aggregated(
         },
         session_id: None,
         project: project.map(canonicalize_filter_path),
-        search: None,
+        search: Vec::new(),
         file: None,
         timespan: parse_timespan(timespan)?,
         last_message_in: parse_timespan(status.last_message_in.as_deref())?,

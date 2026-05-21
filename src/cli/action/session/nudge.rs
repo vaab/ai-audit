@@ -22,7 +22,7 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
     }
     if args.session.is_some()
         && (args.project.is_some()
-            || args.search.is_some()
+            || !args.search.is_empty()
             || args.timespan.is_some()
             || args.last_message_in.is_some()
             || args.status.is_some())

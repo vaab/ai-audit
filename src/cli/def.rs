@@ -140,9 +140,11 @@ pub struct SessionNudgeArgs {
     #[arg(short, long)]
     pub project: Option<String>,
 
-    /// Only nudge sessions containing a message matching this string
-    #[arg(short, long)]
-    pub search: Option<String>,
+    /// Only nudge sessions whose transcript contains this string.
+    /// Repeatable — when given multiple times, every needle must be
+    /// present (AND semantics).
+    #[arg(short, long = "search")]
+    pub search: Vec<String>,
 
     /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
     #[arg(long)]
@@ -255,9 +257,11 @@ pub struct SessionListArgs {
     #[arg(long)]
     pub session_id: Option<String>,
 
-    /// Only list sessions containing a message matching this string
-    #[arg(short, long)]
-    pub search: Option<String>,
+    /// Only list sessions whose transcript contains this string.
+    /// Repeatable — when given multiple times, every needle must be
+    /// present (AND semantics).
+    #[arg(short, long = "search")]
+    pub search: Vec<String>,
 
     /// Filter by timespan (e.g., "today", "2025-01-01..2025-01-02")
     #[arg(long)]
@@ -1030,11 +1034,50 @@ mod tests {
             Commands::Session {
                 action: SessionAction::List(a),
             } => {
-                assert_eq!(a.search.as_deref(), Some("needle"));
+                assert_eq!(a.search, vec!["needle".to_string()]);
                 assert_eq!(a.project.as_deref(), Some("/tmp"));
                 assert_eq!(a.session_type, Some(SessionType::OpenCode));
             }
             _ => panic!("expected session list"),
+        }
+    }
+
+    #[test]
+    fn session_list_accepts_repeated_search() {
+        // Multiple `-s`/`--search` flags collect into the Vec and
+        // compose with AND semantics downstream (see
+        // session_filter::combined_filters_intersect_multi_search).
+        let args = parse(&[
+            "ai-audit",
+            "session",
+            "list",
+            "-s",
+            "jwt",
+            "--search",
+            "middleware",
+        ]);
+        match args.command {
+            Commands::Session {
+                action: SessionAction::List(a),
+            } => {
+                assert_eq!(a.search, vec!["jwt".to_string(), "middleware".to_string()]);
+            }
+            _ => panic!("expected session list"),
+        }
+    }
+
+    #[test]
+    fn session_nudge_accepts_repeated_search() {
+        let args = parse(&[
+            "ai-audit", "session", "nudge", "--all", "-s", "stuck", "-s", "auth",
+        ]);
+        match args.command {
+            Commands::Session {
+                action: SessionAction::Nudge(a),
+            } => {
+                assert_eq!(a.search, vec!["stuck".to_string(), "auth".to_string()]);
+            }
+            _ => panic!("expected session nudge"),
         }
     }
 

@@ -64,7 +64,7 @@ fn run_list(a: SessionListArgs, quiet: bool) -> Result<()> {
     list_sessions::run(
         a.session_type,
         a.session_id.as_deref(),
-        a.search.as_deref(),
+        &a.search,
         a.timespan.as_deref(),
         a.project.as_deref(),
         a.file.as_deref(),

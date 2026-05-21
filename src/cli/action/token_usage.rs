@@ -366,7 +366,7 @@ pub fn run(
         session_type,
         session_id: session_id_filter,
         project: None,
-        search: None,
+        search: Vec::new(),
         file: None,
         timespan: Some((start_secs, end_secs)),
         last_message_in: None,
