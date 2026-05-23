@@ -23,7 +23,7 @@ use crate::session_index::{
     self as idx, mtime_ns_of, CachedHarnessIndex, CachedSession, SCHEMA_VERSION,
 };
 
-const CACHE_FILE: &str = "pi.json";
+pub(crate) const CACHE_FILE: &str = "pi.json";
 
 #[derive(Debug, Default, Clone)]
 pub struct PiIndex {

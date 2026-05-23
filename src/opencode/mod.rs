@@ -148,6 +148,222 @@ pub fn log_dir() -> PathBuf {
     crate::opencode_data_dir().join("log")
 }
 
+/// Report of what was wiped by [`delete_session`] for one OpenCode session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenCodeDeleteReport {
+    /// Row counts wiped from `opencode.db` (`session`, `message`, `part`).
+    pub db: db::DbDeleteReport,
+    /// Absolute paths of legacy file-tree entries that were unlinked
+    /// (in the order: directory-agents JSON → message dir → each
+    /// part dir → session/<project-hash>/<id>.json).
+    pub paths: Vec<PathBuf>,
+}
+
+impl OpenCodeDeleteReport {
+    /// Total artifacts wiped (DB rows + filesystem paths).
+    pub fn count(&self) -> usize {
+        self.db.total() + self.paths.len()
+    }
+}
+
+/// Wipe every OpenCode storage location for `session_id`.
+///
+/// Order (per `doc/admin.org § Atomicity / partial failure`):
+///   1. Remove the session-index cache entry (cheap, in-process).
+///   2. Delete the legacy file-tree (`storage/directory-agents/`,
+///      `storage/message/<id>/`, every
+///      `storage/part/<msg-id>/` referenced by the session's
+///      messages, and `storage/session/<project-hash>/<id>.json`).
+///   3. Delete primary SQLite rows via [`db::delete_session_rows`]
+///      (single transaction across `part`, `message`, `session`).
+///   4. Persist the updated cache.
+///
+/// **OFF LIMITS**: the `permission` table (per-project, not
+/// per-session), the `log/` directory (shared across all sessions),
+/// and the run cache (`~/.cache/ai-audit/opencode/run/`, content-hashed).
+///
+/// `dry_run` performs zero writes — only filesystem inspection and
+/// DB SELECT-only enumeration to predict the would-be wipe set.
+pub fn delete_session(session_id: &str, dry_run: bool) -> Result<OpenCodeDeleteReport> {
+    let mut report = OpenCodeDeleteReport::default();
+
+    // -- Filesystem path enumeration (used by both modes) ---------
+    // 1. directory-agents/<id>.json
+    let directory_agents_path = storage_dir().join(format!("{}.json", session_id));
+    // 2. storage/message/<id>/   (parent of all message JSON files;
+    //    listing it gives us the message IDs we need to find
+    //    storage/part/<msg-id>/ dirs)
+    let message_dir = crate::opencode_data_dir()
+        .join("storage/message")
+        .join(session_id);
+    let part_base = part_dir();
+    // 3. enumerate message IDs from message_dir → derive part dirs.
+    let part_dirs: Vec<PathBuf> = if message_dir.exists() {
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(&message_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem() {
+                    let msg_id = stem.to_string_lossy().to_string();
+                    let candidate = part_base.join(&msg_id);
+                    if candidate.exists() {
+                        out.push(candidate);
+                    }
+                }
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    // 4. storage/session/<project-hash>/<id>.json — must scan all
+    //    project-hash subdirs since we don't know which one.
+    let session_json_path = find_legacy_session_json(session_id);
+
+    // -- Dry-run: report what WOULD be wiped, then bail ----------
+    if dry_run {
+        if directory_agents_path.exists() {
+            report.paths.push(directory_agents_path.clone());
+        }
+        if message_dir.exists() {
+            report.paths.push(message_dir.clone());
+        }
+        for path in &part_dirs {
+            report.paths.push(path.clone());
+        }
+        if let Some(path) = &session_json_path {
+            report.paths.push(path.clone());
+        }
+        // DB row prediction: count what's there now (read-only).
+        if db::db_exists() {
+            let conn = db::open_db()?;
+            report.db = predict_db_delete(&conn, session_id)?;
+        }
+        return Ok(report);
+    }
+
+    // -- Real wipe ------------------------------------------------
+    // 1. Cache entry.
+    use crate::session_index::{self as idx, CachedHarnessIndex};
+    let mut cache = idx::load_harness_index(session_index::CACHE_FILE)
+        .unwrap_or_else(CachedHarnessIndex::empty);
+    cache.remove_session(session_id);
+
+    // 2. Legacy file-tree.  Order is fixed for predictable reports.
+    if directory_agents_path.exists() {
+        fs::remove_file(&directory_agents_path)
+            .with_context(|| format!("Failed to remove {}", directory_agents_path.display()))?;
+        log::debug!(
+            "opencode delete {}: removed {}",
+            session_id,
+            directory_agents_path.display()
+        );
+        report.paths.push(directory_agents_path);
+    }
+    if message_dir.exists() {
+        // Note: `remove_dir_all` deletes the dir AND every JSON
+        // inside.  We've already snapshotted the message IDs above
+        // so we know which part dirs to clean.
+        fs::remove_dir_all(&message_dir)
+            .with_context(|| format!("Failed to remove message dir {}", message_dir.display()))?;
+        log::debug!(
+            "opencode delete {}: removed message dir {}",
+            session_id,
+            message_dir.display()
+        );
+        report.paths.push(message_dir);
+    }
+    for path in part_dirs {
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("Failed to remove part dir {}", path.display()))?;
+            log::debug!(
+                "opencode delete {}: removed part dir {}",
+                session_id,
+                path.display()
+            );
+            report.paths.push(path);
+        }
+    }
+    if let Some(path) = session_json_path {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
+            log::debug!("opencode delete {}: removed {}", session_id, path.display());
+            report.paths.push(path);
+        }
+    }
+
+    // 3. SQLite rows (atomic transaction).  Only attempt if the DB
+    //    file actually exists — fresh installs with file-tree-only
+    //    storage still need to work.
+    if db::db_exists() {
+        let mut conn = db::open_db_rw()?;
+        report.db = db::delete_session_rows(&mut conn, session_id)?;
+    }
+
+    // 4. Persist cache.
+    let cache_dir = idx::cache_dir().ok_or_else(|| {
+        anyhow::anyhow!("Unable to resolve XDG cache dir for session-index cache")
+    })?;
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("Failed to create cache dir {}", cache_dir.display()))?;
+    idx::save_harness_index(session_index::CACHE_FILE, &cache)?;
+
+    Ok(report)
+}
+
+/// Scan `storage/session/<project-hash>/` for a file named
+/// `<session_id>.json`.  Returns the first match (there should only
+/// ever be one).  Used by [`delete_session`] to locate the
+/// legacy-tree entry without knowing the project hash up front.
+fn find_legacy_session_json(session_id: &str) -> Option<PathBuf> {
+    let base = crate::opencode_data_dir().join("storage/session");
+    if !base.exists() {
+        return None;
+    }
+    let needle = format!("{}.json", session_id);
+    for project_entry in fs::read_dir(&base).ok()?.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let candidate = project_path.join(&needle);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Read-only SQLite row counts for a dry-run prediction of
+/// [`db::delete_session_rows`]'s would-be effect.
+fn predict_db_delete(conn: &rusqlite::Connection, session_id: &str) -> Result<db::DbDeleteReport> {
+    fn count_one(conn: &rusqlite::Connection, sql: &str, id: &str) -> Result<usize> {
+        Ok(conn.query_row(sql, [id], |row| row.get::<_, i64>(0))? as usize)
+    }
+    Ok(db::DbDeleteReport {
+        session_rows: count_one(
+            conn,
+            "SELECT COUNT(*) FROM session WHERE id = ?",
+            session_id,
+        )?,
+        message_rows: count_one(
+            conn,
+            "SELECT COUNT(*) FROM message WHERE session_id = ?",
+            session_id,
+        )?,
+        part_rows: count_one(
+            conn,
+            "SELECT COUNT(*) FROM part WHERE session_id = ?",
+            session_id,
+        )?,
+    })
+}
+
 pub fn get_session_info(session_id: &str) -> Result<SessionInfo> {
     // Try DB first (richer data), fall back to file-based
     if let Ok(info) = db::get_session_info_from_db(session_id) {
@@ -788,6 +1004,370 @@ fn merge_sessions(
     let mut merged: Vec<SessionInfo> = by_id.into_values().collect();
     merged.sort_by_key(|s| s.started_at);
     merged
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        home: Option<String>,
+        xdg_cache_home: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.xdg_cache_home {
+                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
+            }
+        }
+    }
+
+    fn with_temp_home(home: &Path) -> EnvGuard {
+        let guard = EnvGuard {
+            home: std::env::var("HOME").ok(),
+            xdg_cache_home: std::env::var("XDG_CACHE_HOME").ok(),
+        };
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        }
+        guard
+    }
+
+    /// Seed a complete OpenCode storage layout under
+    /// `<home>/.local/share/opencode/` for `session_id`.
+    ///
+    /// Creates:
+    ///   * SQLite DB with one session, two messages, three parts.
+    ///   * Legacy file-tree: directory-agents JSON, session JSON
+    ///     under a fake project-hash dir, message dir with two
+    ///     entries, two part dirs.
+    fn seed(home: &Path, session_id: &str, project_hash: &str) -> SeedPaths {
+        let data_dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = data_dir.join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        // 1. SQLite DB
+        let db_path = data_dir.join("opencode.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            db::create_schema(&conn).unwrap();
+            // permission table — must NOT be touched.
+            conn.execute_batch(
+                "CREATE TABLE permission (
+                    project_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO permission (project_id, data) VALUES (?, ?)",
+                ["proj_1", "{\"allow\":[\"*\"]}"],
+            )
+            .unwrap();
+            // The session being deleted.
+            conn.execute(
+                "INSERT INTO session (id, project_id, parent_id, directory, title, \
+                 time_created, time_updated) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                rusqlite::params![session_id, "proj_1", "/proj", "T", 1, 2],
+            )
+            .unwrap();
+            // A sibling session that must NOT be touched.
+            conn.execute(
+                "INSERT INTO session (id, project_id, parent_id, directory, title, \
+                 time_created, time_updated) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                rusqlite::params!["ses_keep", "proj_1", "/proj", "K", 3, 4],
+            )
+            .unwrap();
+            for (msg_id, sid) in [
+                ("msg_a", session_id),
+                ("msg_b", session_id),
+                ("msg_x", "ses_keep"),
+            ] {
+                conn.execute(
+                    "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+                     VALUES (?, ?, 10, 10, '{}')",
+                    rusqlite::params![msg_id, sid],
+                )
+                .unwrap();
+            }
+            for (pid, mid, sid) in [
+                ("prt_a1", "msg_a", session_id),
+                ("prt_a2", "msg_a", session_id),
+                ("prt_b1", "msg_b", session_id),
+                ("prt_x1", "msg_x", "ses_keep"),
+            ] {
+                conn.execute(
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, \
+                     data) VALUES (?, ?, ?, 20, 20, '{\"type\":\"text\"}')",
+                    rusqlite::params![pid, mid, sid],
+                )
+                .unwrap();
+            }
+        }
+
+        // 2. Legacy directory-agents JSON
+        let dir_agents = storage.join("directory-agents");
+        std::fs::create_dir_all(&dir_agents).unwrap();
+        let dir_agents_path = dir_agents.join(format!("{}.json", session_id));
+        std::fs::write(
+            &dir_agents_path,
+            format!(
+                r#"{{"sessionID":"{}","updatedAt":2,"directory":"/proj"}}"#,
+                session_id
+            ),
+        )
+        .unwrap();
+
+        // 3. Legacy storage/session/<project_hash>/<id>.json
+        let session_proj_dir = storage.join("session").join(project_hash);
+        std::fs::create_dir_all(&session_proj_dir).unwrap();
+        let session_json_path = session_proj_dir.join(format!("{}.json", session_id));
+        std::fs::write(
+            &session_json_path,
+            format!(r#"{{"id":"{}","directory":"/proj"}}"#, session_id),
+        )
+        .unwrap();
+
+        // 4. Legacy message dir + part dirs (2 messages → 2 part dirs)
+        let message_dir = storage.join("message").join(session_id);
+        std::fs::create_dir_all(&message_dir).unwrap();
+        std::fs::write(message_dir.join("msg_a.json"), "{}").unwrap();
+        std::fs::write(message_dir.join("msg_b.json"), "{}").unwrap();
+
+        let part_a_dir = storage.join("part").join("msg_a");
+        std::fs::create_dir_all(&part_a_dir).unwrap();
+        std::fs::write(part_a_dir.join("prt_a1.json"), r#"{"type":"text"}"#).unwrap();
+        std::fs::write(part_a_dir.join("prt_a2.json"), r#"{"type":"text"}"#).unwrap();
+
+        let part_b_dir = storage.join("part").join("msg_b");
+        std::fs::create_dir_all(&part_b_dir).unwrap();
+        std::fs::write(part_b_dir.join("prt_b1.json"), r#"{"type":"text"}"#).unwrap();
+
+        // Sibling part dir that must survive.
+        let part_x_dir = storage.join("part").join("msg_x");
+        std::fs::create_dir_all(&part_x_dir).unwrap();
+        std::fs::write(part_x_dir.join("prt_x1.json"), r#"{"type":"text"}"#).unwrap();
+
+        SeedPaths {
+            db_path,
+            dir_agents_path,
+            session_json_path,
+            message_dir,
+            part_a_dir,
+            part_b_dir,
+            part_x_dir,
+        }
+    }
+
+    struct SeedPaths {
+        db_path: std::path::PathBuf,
+        dir_agents_path: std::path::PathBuf,
+        session_json_path: std::path::PathBuf,
+        message_dir: std::path::PathBuf,
+        part_a_dir: std::path::PathBuf,
+        part_b_dir: std::path::PathBuf,
+        part_x_dir: std::path::PathBuf,
+    }
+
+    #[test]
+    fn delete_session_wipes_db_rows_and_legacy_tree() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let seeded = seed(tmp.path(), "ses_target", "proj_hash_1");
+
+        let report = delete_session("ses_target", false).unwrap();
+
+        // -- DB side --------------------------------------------
+        assert_eq!(report.db.session_rows, 1);
+        assert_eq!(report.db.message_rows, 2);
+        assert_eq!(report.db.part_rows, 3);
+
+        let conn = Connection::open(&seeded.db_path).unwrap();
+        let n_session: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_session, 1, "ses_keep must survive");
+        let n_msg_target: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE session_id = 'ses_target'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_msg_target, 0);
+        let n_part_target: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM part WHERE session_id = 'ses_target'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_part_target, 0);
+        let perm: String = conn
+            .query_row(
+                "SELECT data FROM permission WHERE project_id = 'proj_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(perm, "{\"allow\":[\"*\"]}");
+
+        // -- Filesystem side ------------------------------------
+        assert!(!seeded.dir_agents_path.exists());
+        assert!(!seeded.session_json_path.exists());
+        assert!(!seeded.message_dir.exists());
+        assert!(!seeded.part_a_dir.exists());
+        assert!(!seeded.part_b_dir.exists());
+        // Sibling part dir survives.
+        assert!(seeded.part_x_dir.exists());
+    }
+
+    #[test]
+    fn delete_session_dry_run_does_not_write() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let seeded = seed(tmp.path(), "ses_target", "proj_hash_1");
+
+        // Snapshot DB row counts BEFORE.
+        let conn_pre = Connection::open(&seeded.db_path).unwrap();
+        let pre_sessions: i64 = conn_pre
+            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .unwrap();
+        drop(conn_pre);
+
+        let report = delete_session("ses_target", true).unwrap();
+
+        // Report predicts what would happen.
+        assert_eq!(report.db.session_rows, 1);
+        assert_eq!(report.db.message_rows, 2);
+        assert_eq!(report.db.part_rows, 3);
+        // All paths still exist.
+        assert!(seeded.dir_agents_path.exists());
+        assert!(seeded.session_json_path.exists());
+        assert!(seeded.message_dir.exists());
+        assert!(seeded.part_a_dir.exists());
+        assert!(seeded.part_b_dir.exists());
+
+        // DB unchanged.
+        let conn_post = Connection::open(&seeded.db_path).unwrap();
+        let post_sessions: i64 = conn_post
+            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pre_sessions, post_sessions);
+    }
+
+    #[test]
+    fn delete_session_works_with_db_only_no_legacy_tree() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        // Seed full layout, then nuke the legacy tree (simulates a
+        // machine that's fully migrated to SQLite-only storage).
+        let seeded = seed(tmp.path(), "ses_target", "proj_hash_1");
+        std::fs::remove_dir_all(tmp.path().join(".local/share/opencode/storage")).unwrap();
+
+        let report = delete_session("ses_target", false).unwrap();
+
+        // DB still wiped.
+        assert_eq!(report.db.session_rows, 1);
+        assert_eq!(report.db.part_rows, 3);
+        // No filesystem paths reported (nothing was there).
+        assert_eq!(report.paths.len(), 0);
+
+        let conn = Connection::open(&seeded.db_path).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session WHERE id = 'ses_target'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn delete_session_works_with_legacy_only_no_db() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let seeded = seed(tmp.path(), "ses_target", "proj_hash_1");
+        // Remove the DB to simulate legacy-only layout.
+        std::fs::remove_file(&seeded.db_path).unwrap();
+        // Also remove WAL/SHM side-files if present.
+        let _ = std::fs::remove_file(seeded.db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(seeded.db_path.with_extension("db-shm"));
+
+        let report = delete_session("ses_target", false).unwrap();
+
+        // Zero DB rows (DB doesn't exist).
+        assert_eq!(report.db.total(), 0);
+        // Files wiped.
+        assert!(!seeded.dir_agents_path.exists());
+        assert!(!seeded.message_dir.exists());
+        assert!(!seeded.part_a_dir.exists());
+    }
+
+    #[test]
+    fn delete_session_is_noop_on_missing_session() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+
+        let report = delete_session("ses_ghost", false).unwrap();
+        assert_eq!(report.count(), 0);
+    }
+
+    #[test]
+    fn delete_session_never_touches_permission_table() {
+        // Belt-and-suspenders regression guard separate from the
+        // pure-DB test in db.rs.  Snapshots the full permission
+        // table before/after and asserts byte-identical.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let seeded = seed(tmp.path(), "ses_target", "proj_hash_1");
+
+        let conn = Connection::open(&seeded.db_path).unwrap();
+        let before: Vec<(String, String)> = conn
+            .prepare("SELECT project_id, data FROM permission ORDER BY project_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        drop(conn);
+
+        delete_session("ses_target", false).unwrap();
+
+        let conn = Connection::open(&seeded.db_path).unwrap();
+        let after: Vec<(String, String)> = conn
+            .prepare("SELECT project_id, data FROM permission ORDER BY project_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(before, after);
+    }
 }
 
 #[cfg(test)]
