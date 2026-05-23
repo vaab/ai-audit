@@ -37,7 +37,7 @@ pub use sanity::{AiTaskSpec, LlmOutputCutShort};
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::provider::{
     brand_for_llm_provider, Message, ModelAttribution, Provider, Session, SessionProvider,
@@ -60,6 +60,196 @@ pub fn pi_data_dir() -> PathBuf {
 /// Pi sessions directory.
 pub fn sessions_dir() -> PathBuf {
     pi_data_dir().join("sessions")
+}
+
+/// Report of what was wiped by [`delete_session`] for one Pi session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PiDeleteReport {
+    /// Absolute paths of JSONL files unlinked.  When `--cascade` was
+    /// used and child sessions were deleted, their JSONL files appear
+    /// here too (one entry per file).
+    pub paths: Vec<PathBuf>,
+    /// `true` when the parent project directory was pruned because
+    /// its last session was deleted.
+    pub pruned_project_dir: bool,
+    /// Number of child sessions cascaded.  Equal to 0 when
+    /// `--cascade` wasn't passed or there were no children.
+    pub cascaded: usize,
+}
+
+impl PiDeleteReport {
+    pub fn count(&self) -> usize {
+        self.paths.len()
+    }
+}
+
+/// Discover every session whose `parent_id` is `session_id`.
+///
+/// Used by [`delete_session`] for the `--cascade` path.  Returns an
+/// empty vec when the session has no children (the common case) or
+/// when the sessions directory is missing.
+pub fn list_child_sessions(session_id: &str) -> Result<Vec<String>> {
+    let all = session::list_sessions()?;
+    Ok(all
+        .into_iter()
+        .filter(|s| s.parent_id.as_deref() == Some(session_id))
+        .map(|s| s.session_id)
+        .collect())
+}
+
+/// Wipe one Pi session.
+///
+/// Pi has no permission/approval model, no SQLite database, no
+/// auxiliary log files keyed by session id, no run cache that
+/// references the session.  The only on-disk state is the JSONL
+/// transcript plus the ai-audit session-index cache entry.
+///
+/// Order:
+///   1. Remove the session-index cache entry (cheap, in-process).
+///   2. If `cascade` is `true` AND the session has children, also
+///      remove each child's JSONL file and cache entry (recursive,
+///      depth-first).  If `cascade` is `false` and children exist,
+///      this function returns an error — the caller decides whether
+///      to retry with cascade.
+///   3. Remove the session's own JSONL file (missing → silent).
+///   4. Try `rmdir` on the parent project directory (silent if
+///      non-empty or permission-denied — never an error).
+///   5. Persist the updated cache.
+///
+/// `dry_run` mode performs zero writes — reports what WOULD be wiped.
+pub fn delete_session(session_id: &str, cascade: bool, dry_run: bool) -> Result<PiDeleteReport> {
+    use crate::session_index::{self as idx, CachedHarnessIndex};
+
+    let mut report = PiDeleteReport::default();
+
+    // -- Cascade gate --------------------------------------------
+    let children = list_child_sessions(session_id).unwrap_or_default();
+    if !children.is_empty() && !cascade {
+        anyhow::bail!(
+            "pi session {} has {} child session(s) ({}); pass --cascade \
+             to recursively delete the subtree",
+            session_id,
+            children.len(),
+            preview_ids(&children),
+        );
+    }
+
+    // -- Locate JSONL files ---------------------------------------
+    let jsonl_self = session::find_session_file(session_id);
+    let mut jsonl_children: Vec<(String, PathBuf)> = Vec::new();
+    for child_id in &children {
+        if let Some(path) = session::find_session_file(child_id) {
+            jsonl_children.push((child_id.clone(), path));
+        }
+    }
+
+    // -- Dry-run ---------------------------------------------------
+    if dry_run {
+        for (_, path) in &jsonl_children {
+            report.paths.push(path.clone());
+        }
+        if let Some(path) = &jsonl_self {
+            report.paths.push(path.clone());
+            if let Some(parent) = path.parent() {
+                if would_become_empty_after(parent, std::iter::once(path.as_path())) {
+                    report.paths.push(parent.to_path_buf());
+                    report.pruned_project_dir = true;
+                }
+            }
+        }
+        report.cascaded = children.len();
+        return Ok(report);
+    }
+
+    // -- Real wipe ------------------------------------------------
+    let mut cache = idx::load_harness_index(session_index::CACHE_FILE)
+        .unwrap_or_else(CachedHarnessIndex::empty);
+    cache.remove_session(session_id);
+
+    // 2. Children (cascade).
+    for (child_id, path) in jsonl_children {
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| {
+                format!(
+                    "Failed to remove pi child session {} at {}",
+                    child_id,
+                    path.display()
+                )
+            })?;
+            log::debug!(
+                "pi delete {} (cascade child {}): removed {}",
+                session_id,
+                child_id,
+                path.display()
+            );
+            report.paths.push(path);
+        }
+        cache.remove_session(&child_id);
+        report.cascaded += 1;
+    }
+
+    // 3. Self.
+    if let Some(path) = jsonl_self {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove pi session file {}", path.display()))?;
+            log::debug!("pi delete {}: removed {}", session_id, path.display());
+            report.paths.push(path.clone());
+
+            // 4. Prune empty project dir (silent failure on non-empty).
+            if let Some(parent) = path.parent() {
+                if std::fs::remove_dir(parent).is_ok() {
+                    log::debug!(
+                        "pi delete {}: pruned empty project dir {}",
+                        session_id,
+                        parent.display()
+                    );
+                    report.paths.push(parent.to_path_buf());
+                    report.pruned_project_dir = true;
+                }
+            }
+        }
+    }
+
+    // 5. Persist cache.
+    let cache_dir = idx::cache_dir().ok_or_else(|| {
+        anyhow::anyhow!("Unable to resolve XDG cache dir for session-index cache")
+    })?;
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("Failed to create cache dir {}", cache_dir.display()))?;
+    idx::save_harness_index(session_index::CACHE_FILE, &cache)?;
+
+    Ok(report)
+}
+
+/// Preview a slice of IDs for inclusion in an error message —
+/// truncate at 5 with `... and N more` overflow.
+fn preview_ids(ids: &[String]) -> String {
+    if ids.len() <= 5 {
+        return ids.join(", ");
+    }
+    let head = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    format!("{}, ... and {} more", head, ids.len() - 5)
+}
+
+/// Predicate: would `parent` be empty after the iterator of children
+/// is removed?  Used for dry-run prune prediction (Pi).
+fn would_become_empty_after<'a, I: IntoIterator<Item = &'a std::path::Path>>(
+    parent: &std::path::Path,
+    children: I,
+) -> bool {
+    let to_remove: std::collections::HashSet<&std::path::Path> = children.into_iter().collect();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(it) => it,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !to_remove.contains(path.as_path()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Pi provider adapter.
@@ -205,6 +395,260 @@ pub fn resolve_attribution_from_jsonl(content: &str, session_id: &str) -> Result
         mode: last_assistant.mode.clone(),
         variant: None,
     })
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        pi_dir: Option<String>,
+        home: Option<String>,
+        xdg_cache_home: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.pi_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+                }
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.xdg_cache_home {
+                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
+            }
+        }
+    }
+
+    fn setup_env(home: &Path, pi_dir: &Path) -> EnvGuard {
+        let guard = EnvGuard {
+            pi_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
+            home: std::env::var("HOME").ok(),
+            xdg_cache_home: std::env::var("XDG_CACHE_HOME").ok(),
+        };
+        unsafe {
+            std::env::set_var("PI_CODING_AGENT_DIR", pi_dir);
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        }
+        guard
+    }
+
+    /// Write a top-level pi session JSONL.  Returns the file path.
+    fn seed_top_level(
+        pi_dir: &Path,
+        encoded_cwd: &str,
+        session_uuid: &str,
+        cwd: &str,
+    ) -> std::path::PathBuf {
+        let project_dir = pi_dir.join("sessions").join(encoded_cwd);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join(format!("2026-01-01T00-00-00_{}.jsonl", session_uuid));
+        let body = format!(
+            r#"{{"type":"session","version":3,"id":"{}","timestamp":"2026-01-01T00:00:00Z","cwd":"{}"}}"#,
+            session_uuid, cwd
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Write a sub-agent pi session JSONL whose directory layout
+    /// makes `derive_parent_id` recover the parent UUID from the
+    /// ancestor dir name.  Returns the file path.
+    fn seed_subagent(
+        pi_dir: &Path,
+        encoded_cwd: &str,
+        parent_uuid: &str,
+        entry_id: &str,
+        run_n: usize,
+        child_uuid: &str,
+        cwd: &str,
+    ) -> std::path::PathBuf {
+        let dir = pi_dir
+            .join("sessions")
+            .join(encoded_cwd)
+            .join(format!("2026-01-01T00-00-00_{}", parent_uuid))
+            .join(entry_id)
+            .join(format!("run-{}", run_n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let body = format!(
+            r#"{{"type":"session","version":3,"id":"{}","timestamp":"2026-01-01T00:00:01Z","cwd":"{}"}}"#,
+            child_uuid, cwd
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    // Hand-built UUIDv7 examples — version nibble is `7` at offset
+    // 14, variant nibble is `8` at offset 19.  Hyphens at 8, 13, 18, 23.
+    const UUID_TOP: &str = "019191cd-7be0-7000-8000-000000000001";
+    const UUID_CHILD_1: &str = "019191cd-7be0-7000-8000-000000000002";
+    const UUID_CHILD_2: &str = "019191cd-7be0-7000-8000-000000000003";
+    const UUID_UNRELATED: &str = "019191cd-7be0-7000-8000-00000000000a";
+
+    #[test]
+    fn delete_session_removes_top_level_jsonl_and_prunes_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let path = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_TOP, "/tmp/proj");
+        let project_dir = path.parent().unwrap().to_path_buf();
+
+        let report = delete_session(UUID_TOP, false, false).unwrap();
+
+        assert!(!path.exists());
+        assert!(!project_dir.exists(), "empty project dir should be pruned");
+        assert!(report.pruned_project_dir);
+        assert_eq!(report.cascaded, 0);
+    }
+
+    #[test]
+    fn delete_session_keeps_non_empty_project_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let target = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_TOP, "/tmp/proj");
+        let sibling = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_UNRELATED, "/tmp/proj");
+        let project_dir = target.parent().unwrap().to_path_buf();
+
+        let report = delete_session(UUID_TOP, false, false).unwrap();
+
+        assert!(!target.exists());
+        assert!(sibling.exists(), "sibling session must survive");
+        assert!(project_dir.exists(), "project dir kept (has sibling)");
+        assert!(!report.pruned_project_dir);
+    }
+
+    #[test]
+    fn delete_session_refuses_without_cascade_when_children_exist() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let parent = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_TOP, "/tmp/proj");
+        let child = seed_subagent(
+            tmp_pi.path(),
+            "-tmp-proj",
+            UUID_TOP,
+            "entry_1",
+            0,
+            UUID_CHILD_1,
+            "/tmp/proj",
+        );
+
+        let err = delete_session(UUID_TOP, false, false).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--cascade"));
+        assert!(msg.contains(UUID_CHILD_1) || msg.contains("1 child"));
+
+        // Files untouched.
+        assert!(parent.exists());
+        assert!(child.exists());
+    }
+
+    #[test]
+    fn delete_session_cascade_removes_children_and_parent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let parent = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_TOP, "/tmp/proj");
+        let child_1 = seed_subagent(
+            tmp_pi.path(),
+            "-tmp-proj",
+            UUID_TOP,
+            "entry_1",
+            0,
+            UUID_CHILD_1,
+            "/tmp/proj",
+        );
+        let child_2 = seed_subagent(
+            tmp_pi.path(),
+            "-tmp-proj",
+            UUID_TOP,
+            "entry_1",
+            1,
+            UUID_CHILD_2,
+            "/tmp/proj",
+        );
+
+        let report = delete_session(UUID_TOP, true, false).unwrap();
+
+        assert!(!parent.exists());
+        assert!(!child_1.exists());
+        assert!(!child_2.exists());
+        assert_eq!(report.cascaded, 2);
+    }
+
+    #[test]
+    fn delete_session_dry_run_does_not_write() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let path = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_TOP, "/tmp/proj");
+
+        let report = delete_session(UUID_TOP, false, true).unwrap();
+        assert!(path.exists());
+        assert!(report.paths.iter().any(|p| p == &path));
+    }
+
+    #[test]
+    fn delete_session_dry_run_with_cascade_predicts_children() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let parent = seed_top_level(tmp_pi.path(), "-tmp-proj", UUID_TOP, "/tmp/proj");
+        let child = seed_subagent(
+            tmp_pi.path(),
+            "-tmp-proj",
+            UUID_TOP,
+            "entry_1",
+            0,
+            UUID_CHILD_1,
+            "/tmp/proj",
+        );
+
+        let report = delete_session(UUID_TOP, true, true).unwrap();
+        assert!(parent.exists());
+        assert!(child.exists());
+        assert_eq!(report.cascaded, 1);
+        assert!(report.paths.iter().any(|p| p == &child));
+        assert!(report.paths.iter().any(|p| p == &parent));
+    }
+
+    #[test]
+    fn delete_session_is_noop_on_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_pi = TempDir::new().unwrap();
+        let _guard = setup_env(tmp_home.path(), tmp_pi.path());
+
+        let report = delete_session(UUID_TOP, false, false).unwrap();
+        assert_eq!(report.count(), 0);
+        assert_eq!(report.cascaded, 0);
+    }
 }
 
 #[cfg(test)]

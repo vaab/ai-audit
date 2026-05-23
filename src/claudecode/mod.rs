@@ -26,6 +26,166 @@ pub fn resolve_debug_file(session_id: &str) -> PathBuf {
     debug_dir().join(format!("{}.txt", session_id))
 }
 
+/// Report of paths wiped by [`delete_session`].
+///
+/// Used by the top-level CLI handler to render per-session human /
+/// JSON / NUL output.  Empty / missing files are NOT reported as
+/// "deleted" — only paths that actually existed before the call
+/// appear in `paths`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeDeleteReport {
+    /// Absolute paths of files (and possibly the project dir) that
+    /// were unlinked.  Order: transcript JSONL → debug log → pruned
+    /// project dir (if it became empty).
+    pub paths: Vec<PathBuf>,
+    /// `true` when the project dir was pruned because the last
+    /// session under it was deleted.
+    pub pruned_project_dir: bool,
+}
+
+impl ClaudeDeleteReport {
+    /// Total number of files / dirs unlinked.
+    pub fn count(&self) -> usize {
+        self.paths.len()
+    }
+}
+
+/// Wipe every storage location a Claude Code session occupies.
+///
+/// Order (per `doc/admin.org § Atomicity / partial failure`):
+///   1. Remove the session-index cache entry (cheap, in-process).
+///   2. Delete the debug log if it exists (optional secondary).
+///   3. Delete the transcript JSONL (primary).
+///   4. If the parent project directory is now empty, prune it.
+///   5. Persist the updated cache.
+///
+/// Missing files are silently ignored — re-running delete on an
+/// already-wiped session is a no-op (returns an empty report).
+///
+/// `dry_run` mode reports what WOULD be deleted without performing
+/// any writes (filesystem inspection only).
+pub fn delete_session(session_id: &str, dry_run: bool) -> Result<ClaudeDeleteReport> {
+    use crate::session_index::{self as idx, CachedHarnessIndex};
+
+    let mut report = ClaudeDeleteReport::default();
+
+    let jsonl = session::find_session_file(session_id);
+    let debug = {
+        let p = resolve_debug_file(session_id);
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+
+    if dry_run {
+        if let Some(path) = &debug {
+            report.paths.push(path.clone());
+        }
+        if let Some(path) = &jsonl {
+            report.paths.push(path.clone());
+            // Predict project-dir prune: it would happen iff the
+            // directory contains exactly one entry (the file we're
+            // about to delete).
+            if let Some(parent) = path.parent() {
+                if would_become_empty(parent, path) {
+                    report.paths.push(parent.to_path_buf());
+                    report.pruned_project_dir = true;
+                }
+            }
+        }
+        return Ok(report);
+    }
+
+    // 1. Cache entry — load → mutate → defer save until step 5.
+    let mut cache = idx::load_harness_index(session_index::CACHE_FILE)
+        .unwrap_or_else(CachedHarnessIndex::empty);
+    cache.remove_session(session_id);
+
+    // 2. Debug log.
+    if let Some(path) = debug {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| {
+                anyhow::anyhow!("Failed to remove debug log {}: {}", path.display(), error)
+            })?;
+            log::debug!(
+                "claudecode delete {}: removed {}",
+                session_id,
+                path.display()
+            );
+            report.paths.push(path);
+        }
+    }
+
+    // 3. Transcript JSONL.
+    if let Some(path) = jsonl {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| {
+                anyhow::anyhow!("Failed to remove transcript {}: {}", path.display(), error)
+            })?;
+            log::debug!(
+                "claudecode delete {}: removed {}",
+                session_id,
+                path.display()
+            );
+            report.paths.push(path.clone());
+
+            // 4. Prune empty project dir (silently — non-empty is
+            // the common case and not a failure).
+            if let Some(parent) = path.parent() {
+                if std::fs::remove_dir(parent).is_ok() {
+                    log::debug!(
+                        "claudecode delete {}: pruned empty project dir {}",
+                        session_id,
+                        parent.display()
+                    );
+                    report.paths.push(parent.to_path_buf());
+                    report.pruned_project_dir = true;
+                }
+            }
+        }
+    }
+
+    // 5. Persist cache (always — even if nothing was on disk, the
+    // cache entry needed to go).
+    let cache_dir = idx::cache_dir().ok_or_else(|| {
+        anyhow::anyhow!("Unable to resolve XDG cache dir for session-index cache")
+    })?;
+    std::fs::create_dir_all(&cache_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to create cache dir {}: {}",
+            cache_dir.display(),
+            error
+        )
+    })?;
+    idx::save_harness_index(session_index::CACHE_FILE, &cache)?;
+
+    Ok(report)
+}
+
+/// Predicate: would `parent` become empty if `child` were unlinked?
+///
+/// Used by `delete_session(_, dry_run=true)` to predict whether the
+/// project-dir prune step would fire.  Returns `false` on permission
+/// errors / missing dirs (the safe default — predict no prune).
+fn would_become_empty(parent: &std::path::Path, child: &std::path::Path) -> bool {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(it) => it,
+        Err(_) => return false,
+    };
+    let mut others = 0usize;
+    for entry in entries.flatten() {
+        if entry.path() != child {
+            others += 1;
+            if others > 0 {
+                return false;
+            }
+        }
+    }
+    others == 0
+}
+
 /// Claude Code provider adapter.
 pub struct ClaudeCodeProvider;
 
@@ -132,6 +292,159 @@ pub fn resolve_attribution_from_messages(
         mode: None,
         variant: None,
     })
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        home: Option<String>,
+        xdg_cache_home: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.xdg_cache_home {
+                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
+            }
+        }
+    }
+
+    fn with_temp_home(home: &Path) -> EnvGuard {
+        let guard = EnvGuard {
+            home: std::env::var("HOME").ok(),
+            xdg_cache_home: std::env::var("XDG_CACHE_HOME").ok(),
+        };
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        }
+        guard
+    }
+
+    /// Create `~/.claude/projects/<encoded>/<session>.jsonl` and an
+    /// optional `~/.claude/debug/<session>.txt` under the given fake
+    /// home directory.  Returns (jsonl_path, optional debug_path).
+    fn seed_session(
+        home: &Path,
+        encoded_proj: &str,
+        session_id: &str,
+        with_debug: bool,
+    ) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+        let project_dir = home.join(".claude").join("projects").join(encoded_proj);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let jsonl = project_dir.join(format!("{}.jsonl", session_id));
+        std::fs::write(&jsonl, r#"{"cwd":"/proj","type":"user"}"#).unwrap();
+
+        let debug = if with_debug {
+            let debug_dir = home.join(".claude").join("debug");
+            std::fs::create_dir_all(&debug_dir).unwrap();
+            let path = debug_dir.join(format!("{}.txt", session_id));
+            std::fs::write(&path, "debug log content").unwrap();
+            Some(path)
+        } else {
+            None
+        };
+
+        (jsonl, debug)
+    }
+
+    #[test]
+    fn delete_session_removes_jsonl_and_debug_and_prunes_empty_project_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let (jsonl, debug) = seed_session(tmp.path(), "-proj-a", "ses_aaa", true);
+        let project_dir = jsonl.parent().unwrap().to_path_buf();
+
+        let report = delete_session("ses_aaa", false).unwrap();
+
+        assert!(!jsonl.exists(), "JSONL should be deleted");
+        assert!(
+            !debug.as_ref().unwrap().exists(),
+            "debug log should be deleted"
+        );
+        assert!(
+            !project_dir.exists(),
+            "empty project dir should have been pruned"
+        );
+        assert!(report.pruned_project_dir);
+        assert_eq!(report.count(), 3); // debug + jsonl + project dir
+    }
+
+    #[test]
+    fn delete_session_leaves_non_empty_project_dir_alone() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let (target_jsonl, _) = seed_session(tmp.path(), "-proj-a", "ses_target", false);
+        // Sibling session in the same project dir — keeps the dir non-empty.
+        seed_session(tmp.path(), "-proj-a", "ses_sibling", false);
+
+        let report = delete_session("ses_target", false).unwrap();
+
+        assert!(!target_jsonl.exists());
+        assert!(target_jsonl.parent().unwrap().exists(), "project dir kept");
+        assert!(!report.pruned_project_dir);
+        assert_eq!(report.count(), 1);
+    }
+
+    #[test]
+    fn delete_session_works_when_debug_log_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let (jsonl, _) = seed_session(tmp.path(), "-proj-a", "ses_nodbg", false);
+
+        let report = delete_session("ses_nodbg", false).unwrap();
+
+        assert!(!jsonl.exists());
+        // Only the jsonl + pruned dir = 2 entries (no debug log).
+        assert_eq!(report.count(), 2);
+    }
+
+    #[test]
+    fn delete_session_is_noop_on_missing_session() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+
+        // No seeded session — directories don't even exist.
+        let report = delete_session("ses_ghost", false).unwrap();
+        assert_eq!(report.count(), 0);
+        assert!(!report.pruned_project_dir);
+    }
+
+    #[test]
+    fn delete_session_dry_run_does_not_write() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _guard = with_temp_home(tmp.path());
+        let (jsonl, debug) = seed_session(tmp.path(), "-proj-a", "ses_aaa", true);
+
+        let report = delete_session("ses_aaa", true).unwrap();
+
+        // Files still present.
+        assert!(jsonl.exists());
+        assert!(debug.as_ref().unwrap().exists());
+        // But the report enumerates what WOULD have been deleted.
+        assert!(report.pruned_project_dir);
+        assert!(report.paths.iter().any(|p| p == &jsonl));
+        assert!(report.paths.iter().any(|p| p == debug.as_ref().unwrap()));
+    }
 }
 
 #[cfg(test)]

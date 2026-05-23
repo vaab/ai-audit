@@ -32,7 +32,7 @@ use crate::session_index::{
     self as idx, mtime_ns_of, CachedHarnessIndex, CachedSession, SCHEMA_VERSION,
 };
 
-const CACHE_FILE: &str = "opencode.json";
+pub(crate) const CACHE_FILE: &str = "opencode.json";
 
 #[derive(Debug, Default, Clone)]
 pub struct OpenCodeIndex {

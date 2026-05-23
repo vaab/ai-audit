@@ -27,7 +27,7 @@ use crate::session_index::{
     self as idx, mtime_ns_of, CachedHarnessIndex, CachedSession, SCHEMA_VERSION,
 };
 
-const CACHE_FILE: &str = "claudecode.json";
+pub(crate) const CACHE_FILE: &str = "claudecode.json";
 
 /// Live runtime view backed by the persisted cache.
 #[derive(Debug, Default, Clone)]
