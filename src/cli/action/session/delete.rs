@@ -602,6 +602,10 @@ fn render_nul(outcomes: &[SessionOutcome]) -> Result<()> {
     Ok(())
 }
 
+// `&PathBuf` rather than `&Path` is intentional: it matches the
+// iterator yield type from `Vec<PathBuf>::iter()`, avoiding a closure
+// or explicit `.as_path()` conversion at every call site.
+#[allow(clippy::ptr_arg)]
 fn path_to_string(p: &PathBuf) -> String {
     p.to_string_lossy().into_owned()
 }

@@ -14,6 +14,24 @@ pub mod session_filter;
 pub mod session_index;
 pub mod transcript;
 
+/// Crate-wide mutex serializing tests that mutate process-global
+/// environment variables (``HOME``, ``XDG_CACHE_HOME``,
+/// ``PI_CODING_AGENT_DIR``, ``*_SESSION_ID``).
+///
+/// Several test modules (claudecode / opencode / pi / activity /
+/// session-delete) need to redirect ``HOME`` to a tempdir to exercise
+/// data-dir helpers in isolation.  Without a SHARED lock, two tests
+/// from different modules can race and end up reading each other's
+/// HOME, corrupting fixtures.  This lock makes any HOME-mutating
+/// test critical section globally serial, which is the same trade-off
+/// the existing ``activity.rs`` ENV_LOCK was already making but in a
+/// module-local way.
+///
+/// Acquire it as the FIRST line of any test that calls
+/// ``unsafe { std::env::set_var("HOME", ...) }`` (or similar).
+#[cfg(test)]
+pub static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

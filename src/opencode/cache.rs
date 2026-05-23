@@ -244,8 +244,14 @@ pub fn write_cache(
 mod tests {
     use super::*;
 
+    // ``git hash-object`` consults ``~/.gitconfig`` and the user's
+    // git object cache; if another test concurrently redirects HOME,
+    // those lookups fail.  Serialize against the shared lock.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
+
     #[test]
     fn test_git_hash_string() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let hash = git_hash_string("test content").unwrap();
         assert_eq!(hash.len(), 40);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
@@ -253,6 +259,7 @@ mod tests {
 
     #[test]
     fn test_git_hash_string_consistency() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let hash1 = git_hash_string("same content").unwrap();
         let hash2 = git_hash_string("same content").unwrap();
         assert_eq!(hash1, hash2);
@@ -260,6 +267,7 @@ mod tests {
 
     #[test]
     fn test_git_hash_string_different() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let hash1 = git_hash_string("content a").unwrap();
         let hash2 = git_hash_string("content b").unwrap();
         assert_ne!(hash1, hash2);

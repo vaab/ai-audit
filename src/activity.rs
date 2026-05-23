@@ -1825,10 +1825,10 @@ pub fn activity_summary(event: &ActivityEvent) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::Mutex;
     use tempfile::{tempdir, NamedTempFile};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared crate-level lock — see ``crate::TEST_ENV_LOCK``.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     struct EnvGuard {
         home: Option<String>,

@@ -64,8 +64,16 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    // ``git hash-object`` reads ``~/.gitconfig`` on startup; if another
+    // test in the suite is concurrently redirecting ``HOME`` to a
+    // tempdir, this lookup fails ("cache rebuild failed").  Serialize
+    // these tests against the shared HOME-mutating lock so they always
+    // see the real user ``HOME``.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
+
     #[test]
     fn test_git_hash_format() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Create a temporary file with known content
         let mut temp_file = NamedTempFile::new()?;
         temp_file.write_all(b"test content")?;
@@ -86,12 +94,14 @@ mod tests {
 
     #[test]
     fn test_git_hash_nonexistent_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let result = git_hash_file(Path::new("/nonexistent/path/to/file.txt"));
         assert!(result.is_err(), "Should fail for nonexistent file");
     }
 
     #[test]
     fn test_git_hash_consistency() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Create a temporary file
         let mut temp_file = NamedTempFile::new()?;
         temp_file.write_all(b"consistent content")?;
