@@ -1011,10 +1011,10 @@ mod delete_tests {
     use super::*;
     use rusqlite::Connection;
     use std::path::Path;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared crate-level lock — see ``crate::TEST_ENV_LOCK``.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     struct EnvGuard {
         home: Option<String>,
