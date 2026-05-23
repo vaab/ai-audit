@@ -210,6 +210,102 @@ pub struct SessionNudgeArgs {
     pub fork: bool,
 }
 
+/// Arguments for `session delete` — wipe one or more sessions across
+/// every storage location ai-audit reads (transcripts, debug logs,
+/// SQLite rows, legacy file-tree, session-index cache).
+///
+/// Filter shape mirrors `SessionListArgs` / `SessionNudgeArgs`: a
+/// positional `<session-id>`, batch via `--all` + filter flags, or
+/// `--ids-file` for piped IDs.  Exactly one of the three target
+/// modes must be supplied.
+///
+/// Safety:
+///   * `--dry-run` is the only safety mechanism (no `--yes`, no
+///     confirmation prompt — the filter is the contract).
+///   * Self-deletion (target ID matches `$OPENCODE_SESSION_ID` /
+///     `$CLAUDE_SESSION_ID` / `$PI_SESSION_ID` or
+///     `session-detect::detect_current_session()`) is rejected with
+///     a clear error.  No override flag is provided in v1.
+///   * Child sessions (`parent_id == target`) are rejected unless
+///     `--cascade` is passed; the error lists the child IDs.
+#[derive(ClapArgs, Debug, Clone)]
+#[command(group = ArgGroup::new("delete-target").required(true).args(["session", "all", "ids_file"]))]
+pub struct SessionDeleteArgs {
+    /// Session ID to delete (positional).  Mutually exclusive with
+    /// `--all`, `--ids-file`, and every filter flag.
+    pub session: Option<String>,
+
+    /// Filter by session type
+    #[arg(short = 't', long = "type")]
+    pub session_type: Option<SessionType>,
+
+    /// Filter by session ID (exact match — useful with `--type`
+    /// for unambiguous targeting from a script).
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+
+    /// Only delete sessions whose transcript contains this string.
+    /// Repeatable — every needle must be present (AND semantics).
+    #[arg(short, long = "search")]
+    pub search: Vec<String>,
+
+    /// Filter by timespan (e.g., "today", "..2026-01-01")
+    #[arg(long)]
+    pub timespan: Option<String>,
+
+    /// Filter by last message timestamp timespan
+    #[arg(long = "last-message-in")]
+    pub last_message_in: Option<String>,
+
+    /// Filter by project path (canonicalized; supports `.`, relative
+    /// paths)
+    #[arg(short, long)]
+    pub project: Option<String>,
+
+    /// Only delete sessions where this file was written or edited
+    #[arg(short, long)]
+    pub file: Option<String>,
+
+    /// Filter by static status values (comma-separated)
+    #[arg(
+        long = "status",
+        alias = "filter-by-static-status",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub status: Option<Vec<StaticStatusArg>>,
+
+    /// Read session IDs from a file (or `-` for stdin).  Format is
+    /// auto-detected: if the first non-whitespace byte is `{`, the
+    /// content is parsed as newline-delimited JSON (`session_id` or
+    /// `id` field per line, matching `session list -j`).  Otherwise
+    /// NUL-separated plain IDs are expected (matching
+    /// `session list -0` and `activity get --categs-file`).
+    #[arg(long = "ids-file", value_name = "PATH")]
+    pub ids_file: Option<PathBuf>,
+
+    /// Delete all sessions matching the filter flags.  Required when
+    /// using filters without a positional `<session-id>` or
+    /// `--ids-file` (safety: prevents accidental "delete everything"
+    /// from an empty-filter typo).
+    #[arg(long)]
+    pub all: bool,
+
+    /// Also delete child sessions whose `parent_id` matches a target.
+    /// Without this flag, the command refuses to delete a parent
+    /// session and lists the child IDs in the error message.
+    #[arg(long)]
+    pub cascade: bool,
+
+    /// Print what would be deleted (count + per-session path
+    /// summary) without performing any writes.  Always exits 0.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 pub struct SessionInfoArgs {
     /// Session ID. If omitted, auto-detects the current session.
@@ -421,6 +517,14 @@ pub enum SessionAction {
 
     /// Nudge resumable OpenCode sessions
     Nudge(SessionNudgeArgs),
+
+    /// Delete sessions (wipes transcripts, DB rows, debug logs, and cache).
+    ///
+    /// Composes with the same filter flags as `session list`; pipe
+    /// `session list -j` into `session delete --ids-file -` for
+    /// pipeline composition.  `--dry-run` is the only safety
+    /// mechanism — no confirmation prompt, no `--yes`.
+    Delete(SessionDeleteArgs),
 }
 
 #[derive(Subcommand)]
@@ -571,6 +675,7 @@ impl SessionAction {
             SessionAction::AssistedBy(a) => a.output.format(),
             SessionAction::Info(a) => a.output.format(),
             SessionAction::Nudge(_) => OutputFormat::Human,
+            SessionAction::Delete(a) => a.output.format(),
         }
     }
 }

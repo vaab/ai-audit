@@ -164,6 +164,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, verbose: u8) -> Result<()> {
             SessionAction::AssistedBy(a) => run_assisted_by(a),
             SessionAction::Info(args) => session::run_info(args),
             SessionAction::Nudge(args) => session::run_nudge(args),
+            SessionAction::Delete(args) => session::run_delete(args),
         },
 
         // ---- Legacy top-level commands (hidden, deprecated) ------------

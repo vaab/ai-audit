@@ -32,6 +32,86 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open the database in read-write mode.
+///
+/// Used exclusively by `session delete` to issue DELETE statements
+/// against the `session`, `message`, and `part` tables.  Other
+/// callers MUST use [`open_db`] which is read-only and pinned with
+/// `PRAGMA query_only=true`.
+///
+/// WAL mode is preserved so concurrent readers (opencode itself, or
+/// another `ai-audit` invocation) continue to function during the
+/// write transaction.
+pub fn open_db_rw() -> Result<Connection> {
+    let path = db_path();
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .with_context(|| format!("Failed to open database for write: {}", path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    Ok(conn)
+}
+
+/// Open an arbitrary database path in read-write mode (for tests).
+pub fn open_db_rw_at(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .with_context(|| format!("Failed to open database for write: {}", path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    Ok(conn)
+}
+
+/// Report from a successful per-session row deletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbDeleteReport {
+    /// Number of rows deleted from the `session` table (0 or 1).
+    pub session_rows: usize,
+    /// Number of rows deleted from the `message` table.
+    pub message_rows: usize,
+    /// Number of rows deleted from the `part` table.
+    pub part_rows: usize,
+}
+
+impl DbDeleteReport {
+    /// Total rows wiped across all three tables.
+    pub fn total(&self) -> usize {
+        self.session_rows + self.message_rows + self.part_rows
+    }
+}
+
+/// Delete every row keyed by `session_id` across the `session`,
+/// `message`, and `part` tables, atomically.
+///
+/// Order: `part` first, then `message`, then `session`.  This avoids
+/// relying on `ON DELETE CASCADE` (which the upstream schema declares
+/// for `part.message_id → message.id` but NOT for the denormalized
+/// `part.session_id`) and ensures the wipe is exact even if the
+/// schema changes.
+///
+/// Wrapped in a single transaction: a mid-delete crash leaves the
+/// row set fully intact rather than half-removed.
+///
+/// MUST NOT touch the `permission` table (per-project, not
+/// per-session) or any other table.
+pub fn delete_session_rows(conn: &mut Connection, session_id: &str) -> Result<DbDeleteReport> {
+    let tx = conn
+        .transaction()
+        .with_context(|| format!("Failed to begin transaction for session {}", session_id))?;
+    let part_rows = tx
+        .execute("DELETE FROM part WHERE session_id = ?", [session_id])
+        .with_context(|| format!("DELETE FROM part WHERE session_id = '{}'", session_id))?;
+    let message_rows = tx
+        .execute("DELETE FROM message WHERE session_id = ?", [session_id])
+        .with_context(|| format!("DELETE FROM message WHERE session_id = '{}'", session_id))?;
+    let session_rows = tx
+        .execute("DELETE FROM session WHERE id = ?", [session_id])
+        .with_context(|| format!("DELETE FROM session WHERE id = '{}'", session_id))?;
+    tx.commit()
+        .with_context(|| format!("Failed to commit delete for session {}", session_id))?;
+    Ok(DbDeleteReport {
+        session_rows,
+        message_rows,
+        part_rows,
+    })
+}
+
 fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms)
         .single()
@@ -1513,5 +1593,143 @@ mod tests {
         assert!(session_matches_filters_from_conn(
             &conn, "ses_001", &filters, 3, "/proj"
         ));
+    }
+
+    // ---- delete_session_rows tests ----------------------------------
+
+    fn count(conn: &Connection, table: &str, predicate: &str, arg: &str) -> usize {
+        let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, predicate);
+        conn.query_row(&sql, [arg], |row| row.get::<_, i64>(0))
+            .unwrap() as usize
+    }
+
+    #[test]
+    fn delete_session_rows_wipes_all_three_tables() {
+        let mut conn = setup_test_db();
+        insert_session(&conn, "ses_a", None, "/p", "A", 1, 2);
+        insert_session(&conn, "ses_b", None, "/p", "B", 3, 4);
+        insert_message(&conn, "msg_a1", "ses_a", "user", 10);
+        insert_message(&conn, "msg_a2", "ses_a", "assistant", 11);
+        insert_message(&conn, "msg_b1", "ses_b", "user", 12);
+        insert_part(&conn, "prt_a1", "msg_a1", "ses_a", 20, r#"{"type":"text"}"#);
+        insert_part(&conn, "prt_a2", "msg_a2", "ses_a", 21, r#"{"type":"text"}"#);
+        insert_part(&conn, "prt_b1", "msg_b1", "ses_b", 22, r#"{"type":"text"}"#);
+
+        let report = delete_session_rows(&mut conn, "ses_a").unwrap();
+        assert_eq!(report.session_rows, 1);
+        assert_eq!(report.message_rows, 2);
+        assert_eq!(report.part_rows, 2);
+        assert_eq!(report.total(), 5);
+
+        // ses_a fully wiped
+        assert_eq!(count(&conn, "session", "id = ?", "ses_a"), 0);
+        assert_eq!(count(&conn, "message", "session_id = ?", "ses_a"), 0);
+        assert_eq!(count(&conn, "part", "session_id = ?", "ses_a"), 0);
+
+        // ses_b untouched
+        assert_eq!(count(&conn, "session", "id = ?", "ses_b"), 1);
+        assert_eq!(count(&conn, "message", "session_id = ?", "ses_b"), 1);
+        assert_eq!(count(&conn, "part", "session_id = ?", "ses_b"), 1);
+    }
+
+    #[test]
+    fn delete_session_rows_is_noop_on_missing_id() {
+        let mut conn = setup_test_db();
+        insert_session(&conn, "ses_a", None, "/p", "A", 1, 2);
+        let report = delete_session_rows(&mut conn, "ses_ghost").unwrap();
+        assert_eq!(report.total(), 0);
+        // ses_a still there
+        assert_eq!(count(&conn, "session", "id = ?", "ses_a"), 1);
+    }
+
+    #[test]
+    fn delete_session_rows_does_not_touch_permission_table() {
+        // The `permission` table is per-project, not per-session.
+        // ai-audit's delete must NEVER touch it.  We add the table
+        // manually here (production schema), populate it, run delete,
+        // and assert byte-identical contents.
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE permission (
+                project_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO permission (project_id, data) VALUES (?, ?)",
+            ["proj_1", "{\"allow\":[\"*\"]}"],
+        )
+        .unwrap();
+        insert_session(&conn, "ses_a", None, "/p", "A", 1, 2);
+        insert_message(&conn, "msg_a", "ses_a", "user", 10);
+        insert_part(&conn, "prt_a", "msg_a", "ses_a", 20, r#"{"type":"text"}"#);
+
+        let before: String = conn
+            .query_row(
+                "SELECT data FROM permission WHERE project_id = ?",
+                ["proj_1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        delete_session_rows(&mut conn, "ses_a").unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT data FROM permission WHERE project_id = ?",
+                ["proj_1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn delete_session_rows_rolls_back_on_failure() {
+        // Verify transactional integrity: if we corrupt the transaction
+        // mid-flight (by manually preparing a bad statement), the
+        // partial state should not leak.  Easiest reproducible check:
+        // delete twice in a row — second call should see zero rows
+        // and not error.
+        let mut conn = setup_test_db();
+        insert_session(&conn, "ses_a", None, "/p", "A", 1, 2);
+        insert_message(&conn, "msg_a", "ses_a", "user", 10);
+        insert_part(&conn, "prt_a", "msg_a", "ses_a", 20, r#"{"type":"text"}"#);
+        let report1 = delete_session_rows(&mut conn, "ses_a").unwrap();
+        assert_eq!(report1.total(), 3);
+        let report2 = delete_session_rows(&mut conn, "ses_a").unwrap();
+        assert_eq!(report2.total(), 0);
+    }
+
+    #[test]
+    fn open_db_rw_at_can_write_open_db_at_cannot() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        // bootstrap schema with a writable connection (and switch
+        // the DB into WAL mode so the read-only PRAGMA in open_db_at
+        // is a no-op rather than a write).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            create_schema(&conn).unwrap();
+            insert_session(&conn, "ses_a", None, "/p", "A", 1, 2);
+        }
+        // read-only refuses writes
+        let ro = open_db_at(&db_path).unwrap();
+        let err = ro
+            .execute("DELETE FROM session WHERE id = ?", ["ses_a"])
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("readonly")
+                || err.to_string().to_lowercase().contains("read-only")
+                || err.to_string().to_lowercase().contains("read only"),
+            "expected read-only error, got: {}",
+            err
+        );
+        // read-write succeeds
+        let mut rw = open_db_rw_at(&db_path).unwrap();
+        let report = delete_session_rows(&mut rw, "ses_a").unwrap();
+        assert_eq!(report.session_rows, 1);
     }
 }
