@@ -182,10 +182,12 @@ fn assemble_nul_stream(
                 )
                 .unwrap();
         }
-        let Some(bounds) = bounds_opt else {
-            continue;
+        // Mirror of production logic in src/cli/action/activity.rs:
+        // zero-event ident → [null, now); bounded → leading/gap/trailing.
+        let intervals = match &bounds_opt {
+            Some(bounds) => empty_segments::intervals_for(bounds, now),
+            None => empty_segments::intervals_for_no_events(now),
         };
-        let intervals = empty_segments::intervals_for(&bounds, now);
         if !intervals.is_empty() {
             out.push_str(&empty_segments::format_record(ident, &intervals));
         }
@@ -243,7 +245,18 @@ fn empty_segment_control_records_precede_events_and_cache_hits() {
         "\0claudecode-msg@/proj-one\0{\"kind\":\"empty\",\"intervals\":[[null,129600],[172800,345600],[388801,432000]]}\0";
     assert!(first.starts_with(expected_prefix));
     assert!(first.contains("\0claudecode-msg@/proj-two\0{\"kind\":\"empty\""));
-    assert!(!first.contains("claudecode-msg@/proj-zero\0{\"kind\":\"empty\""));
+    // Zero-event ident (proj-zero) now emits a single [null, now)
+    // empty-zone declaration — see intervals_for_no_events.  Previously
+    // (pre-[null, now) protocol) this ident was silently dropped from
+    // the wire, which left fyl unable to learn "this category is
+    // definitively empty".
+    let expected_proj_zero = format!(
+        "\0claudecode-msg@/proj-zero\0{{\"kind\":\"empty\",\"intervals\":[[null,{now}]]}}\0",
+    );
+    assert!(
+        first.contains(&expected_proj_zero),
+        "expected zero-event ident proj-zero to emit [null, {now}) control record"
+    );
 
     let first_event_marker = "129600\0claudecode-msg@/proj-one\0";
     let pos_control = first.find("\0claudecode-msg@/proj-two\0").unwrap();
@@ -252,14 +265,27 @@ fn empty_segment_control_records_precede_events_and_cache_hits() {
         pos_control < pos_event,
         "control records must precede events"
     );
+    // The zero-event ident's control record must also land in the
+    // control-records block, before any event record.
+    let pos_zero_control = first.find("\0claudecode-msg@/proj-zero\0").unwrap();
+    assert!(
+        pos_zero_control < pos_event,
+        "zero-event control record must precede events"
+    );
 
     let cache_file = temp
         .path()
         .join(".cache/ai-audit/empty-segments/claudecode-msg___proj-one.json");
     assert!(cache_file.exists());
 
+    // Re-run with the same ident set: every entry must be a cache hit
+    // (scan_count stays at 0) and the output must be byte-identical to
+    // the first invocation.  Note: we MUST pass the full ident list,
+    // not a slice — under the [null, now) protocol, zero-event idents
+    // (proj-zero here) emit a control record that disappears if the
+    // ident is dropped from the request.
     let mut second_scan_count = 0;
-    let second = assemble_nul_stream(&config, &requested_idents[..2], now, &mut second_scan_count);
+    let second = assemble_nul_stream(&config, &requested_idents, now, &mut second_scan_count);
     assert_eq!(second_scan_count, 0);
     assert_output_eq(&second, &first);
 }
