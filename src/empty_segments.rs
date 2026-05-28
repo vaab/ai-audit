@@ -106,6 +106,27 @@ pub fn ranges_to_set(ranges: &[[i64; 2]]) -> BTreeSet<i64> {
     days
 }
 
+/// Empty-zone intervals for an ident that has produced **zero events
+/// ever** for its current source-file fingerprint.
+///
+/// Asserts a single half-open `[null, now)` interval — "from the
+/// beginning of time up to (but not including) the moment of this
+/// query, this ident has no events".  The right edge is the current
+/// `now`, not `u64::MAX`, because ai-audit cannot honestly assert
+/// emptiness into the future: a session file written at `t > now`
+/// could legitimately produce events for this ident under the same
+/// fingerprint.
+///
+/// Degenerate guard: when `now <= 0` (impossible in practice — Unix
+/// epoch is always positive at runtime) returns an empty vec so
+/// `format_record`'s non-empty invariant is preserved.
+pub fn intervals_for_no_events(now: i64) -> Vec<(Option<i64>, Option<i64>)> {
+    if now <= 0 {
+        return Vec::new();
+    }
+    vec![(None, Some(now))]
+}
+
 pub fn intervals_for(bounds: &Bounds, now: i64) -> Vec<(Option<i64>, Option<i64>)> {
     if bounds.days.is_empty() {
         return Vec::new();
@@ -367,6 +388,44 @@ mod tests {
             days: BTreeSet::new(),
         };
         assert!(intervals_for(&bounds, 100).is_empty());
+    }
+
+    /// Spec-pin: a zero-event ident (cache `bounds: None`) must emit a
+    /// single `[null, now)` interval so fyl learns "this category has
+    /// produced no events from the beginning of time up to this query".
+    ///
+    /// The right edge is exactly `now` (not `u64::MAX`) — ai-audit
+    /// cannot honestly assert emptiness into the future.  Each
+    /// subsequent invocation slides the right edge forward, and fyl
+    /// merges the strictly-wider assertion as a refresh.
+    #[test]
+    fn intervals_for_no_events_emits_single_null_to_now_interval() {
+        let now = 1_779_157_519; // 2026-05-10T02:25:19Z
+        assert_eq!(intervals_for_no_events(now), vec![(None, Some(now))]);
+    }
+
+    /// Degenerate guard: at runtime `now` is always > 0 (Unix epoch),
+    /// but the function must not emit a malformed `[null, 0)` or
+    /// `[null, -N)` record if some test or pathological caller passes
+    /// `now <= 0`.  `format_record` requires a non-empty interval list,
+    /// so an empty vec correctly signals "skip emission" upstream.
+    #[test]
+    fn intervals_for_no_events_returns_empty_for_nonpositive_now() {
+        assert!(intervals_for_no_events(0).is_empty());
+        assert!(intervals_for_no_events(-1).is_empty());
+    }
+
+    /// The wire shape for a zero-event ident must match the format
+    /// already accepted by fyl's parser for `null`-bounded intervals.
+    /// Golden test against the literal byte sequence emitted on stdout.
+    #[test]
+    fn format_record_for_no_events_ident_matches_golden() {
+        let now = 1_779_157_519;
+        let intervals = intervals_for_no_events(now);
+        assert_output_eq(
+            &format_record("claudecode-msg@/tmp/test-changelog", &intervals),
+            "\0claudecode-msg@/tmp/test-changelog\0{\"kind\":\"empty\",\"intervals\":[[null,1779157519]]}\0",
+        );
     }
 
     #[test]

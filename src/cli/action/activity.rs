@@ -204,10 +204,17 @@ pub fn run(action: ActivityAction) -> Result<()> {
                             )?;
                         }
 
-                        let Some(bounds) = bounds_opt else {
-                            continue;
+                        // Zero-event ident: emit a single [null, now)
+                        // empty-zone declaration so fyl learns "this
+                        // category has produced no events from the
+                        // beginning of time up to this query".
+                        // Otherwise: emit the bounded leading/gap/
+                        // trailing intervals derived from observed
+                        // events.
+                        let intervals = match &bounds_opt {
+                            Some(bounds) => empty_segments::intervals_for(bounds, now),
+                            None => empty_segments::intervals_for_no_events(now),
                         };
-                        let intervals = empty_segments::intervals_for(&bounds, now);
                         if !intervals.is_empty() {
                             write!(
                                 handle,
