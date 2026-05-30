@@ -11,7 +11,8 @@ use crate::opencode::server_client::{
     compute_live, resolve_server_credentials, LiveStatus, ServerClient,
 };
 use crate::opencode::status::{
-    fetch_last_user_message, fetch_user_message_before_last_assistant, StaticStatus,
+    count_prior_completed_assistant_siblings, fetch_last_user_message,
+    fetch_user_message_before_last_assistant, StaticStatus,
 };
 use crate::provider::detect_provider;
 use crate::session_filter::{canonicalize_filter_path, list_filtered, SessionFilter};
@@ -246,8 +247,21 @@ pub fn run(args: SessionNudgeArgs) -> Result<()> {
 
 /// Choose the nudge strategy for a single session.
 ///
-/// `UserPending` and `AssistantEmpty` use `CleanResume` (revert + re-fire
-/// the existing user turn verbatim — no "continue" pollution).
+/// `UserPending` always uses `CleanResume` (revert + re-fire the
+/// existing user turn verbatim — no "continue" pollution).
+///
+/// `AssistantEmpty` is split based on how many COMPLETED assistant
+/// messages share the same `parentID` as the empty last message
+/// (mirrors vigil-watch's `priorCompletedAssistantSiblings` field —
+/// see `count_prior_completed_assistant_siblings` for the rationale):
+///   * `0` siblings → `AssistantEmptyFirst` shape.  `CleanResume` is
+///     safe and preferred (nothing was committed yet).
+///   * `> 0` siblings → `AssistantEmptyContinuation` shape.  The
+///     empty assistant message is a continuation step under a turn
+///     whose prior steps already produced side-effects.
+///     `CleanResume` would `revert` past the user message and
+///     DISCARD those side-effects.  We must use `ContinuePrompt`
+///     (abort + post `"continue"`) to preserve the prior work.
 ///
 /// `AssistantPartial` and `AssistantToolStuck` use `ContinuePrompt`
 /// (preserve the partial work; let the LLM continue from there).
@@ -271,7 +285,7 @@ fn resolve_strategy(
     continue_prompt: &str,
 ) -> Result<NudgeStrategy> {
     match status {
-        StaticStatus::UserPending | StaticStatus::AssistantEmpty => {
+        StaticStatus::UserPending => {
             let payload = fetch_last_user_message(conn, session_id)?.ok_or_else(|| {
                 anyhow!(
                     "session {} has static={} but no user message was found in DB",
@@ -285,6 +299,36 @@ fn resolve_strategy(
                 agent: payload.agent,
                 model: payload.model,
             })
+        }
+        StaticStatus::AssistantEmpty => {
+            let prior_siblings = count_prior_completed_assistant_siblings(conn, session_id)?;
+            if prior_siblings == 0 {
+                // First-attempt empty: revert + replay is safe.
+                let payload = fetch_last_user_message(conn, session_id)?.ok_or_else(|| {
+                    anyhow!(
+                        "session {} has static={} but no user message was found in DB",
+                        session_id,
+                        status.as_str(),
+                    )
+                })?;
+                Ok(NudgeStrategy::CleanResume {
+                    user_msg_id: payload.user_msg_id,
+                    text: payload.text,
+                    agent: payload.agent,
+                    model: payload.model,
+                })
+            } else {
+                // Continuation empty: prior steps committed side
+                // effects (tool calls, file edits).  CleanResume
+                // would discard them; use ContinuePrompt to preserve
+                // the prior work and let the LLM resume mid-turn.
+                let payload = fetch_user_message_before_last_assistant(conn, session_id)?;
+                Ok(NudgeStrategy::ContinuePrompt {
+                    prompt: continue_prompt.to_string(),
+                    agent: payload.as_ref().and_then(|p| p.agent.clone()),
+                    model: payload.and_then(|p| p.model),
+                })
+            }
         }
         StaticStatus::AssistantPartial
         | StaticStatus::AssistantToolStuck
@@ -370,23 +414,29 @@ fn dry_run_message(
         session.live_status.as_str(),
         session.project_dir,
         action,
-        shape_reason(session.static_extension.status),
+        shape_reason(session.static_extension.status, strategy),
     )
 }
 
-fn shape_reason(status: StaticStatus) -> &'static str {
-    match status {
-        StaticStatus::UserPending => {
+fn shape_reason(status: StaticStatus, strategy: &NudgeStrategy) -> &'static str {
+    match (status, strategy) {
+        (StaticStatus::UserPending, _) => {
             "LLM will respond to your existing user turn (no 'continue' marker)"
         }
-        StaticStatus::AssistantEmpty => {
-            "empty assistant stub deleted, original user turn re-fired (no 'continue' marker)"
+        // AssistantEmpty splits on prior completed siblings under
+        // the same parentID — see `resolve_strategy` and
+        // `count_prior_completed_assistant_siblings`.
+        (StaticStatus::AssistantEmpty, NudgeStrategy::CleanResume { .. }) => {
+            "first-attempt empty: empty assistant stub deleted, original user turn re-fired (no 'continue' marker)"
         }
-        StaticStatus::AssistantPartial => "continue from truncated response",
-        StaticStatus::AssistantToolStuck => {
+        (StaticStatus::AssistantEmpty, NudgeStrategy::ContinuePrompt { .. }) => {
+            "continuation empty: prior steps' side effects preserved; LLM resumes mid-turn via 'continue'"
+        }
+        (StaticStatus::AssistantPartial, _) => "continue from truncated response",
+        (StaticStatus::AssistantToolStuck, _) => {
             "opencode synthesizes interrupted tools as errors in LLM context"
         }
-        StaticStatus::Completed => "not resumable",
+        (StaticStatus::Completed, _) => "not resumable",
     }
 }
 
@@ -418,9 +468,13 @@ fn success_message(plan: &NudgePlan) -> String {
             truncate(text, 60)
         ),
         (NudgeStrategy::CleanResume { text, .. }, StaticStatus::AssistantEmpty) => format!(
-            "nudged {} (assistant-empty: clean-resume; deleted empty stub and replayed your user turn {:?})",
+            "nudged {} (assistant-empty [first attempt]: clean-resume; deleted empty stub and replayed your user turn {:?})",
             plan.session_id,
             truncate(text, 60)
+        ),
+        (NudgeStrategy::ContinuePrompt { prompt, .. }, StaticStatus::AssistantEmpty) => format!(
+            "nudged {} (assistant-empty [continuation]: posted {:?}; preserved prior steps' side effects instead of reverting)",
+            plan.session_id, prompt
         ),
         (NudgeStrategy::ContinuePrompt { prompt, .. }, StaticStatus::AssistantPartial) => format!(
             "nudged {} (assistant-partial: posted {:?} to continue from truncated response)",
@@ -531,7 +585,14 @@ mod tests {
         );
         assert_eq!(
             success_message(&plan(StaticStatus::AssistantEmpty, clean_resume("do Y"))),
-            "nudged ses_1 (assistant-empty: clean-resume; deleted empty stub and replayed your user turn \"do Y\")"
+            "nudged ses_1 (assistant-empty [first attempt]: clean-resume; deleted empty stub and replayed your user turn \"do Y\")"
+        );
+        assert_eq!(
+            success_message(&plan(
+                StaticStatus::AssistantEmpty,
+                continue_prompt("continue")
+            )),
+            "nudged ses_1 (assistant-empty [continuation]: posted \"continue\"; preserved prior steps' side effects instead of reverting)"
         );
         assert_eq!(
             success_message(&plan(StaticStatus::AssistantPartial, continue_prompt("continue"))),
@@ -641,7 +702,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_strategy_assistant_empty_returns_clean_resume() {
+    fn resolve_strategy_assistant_empty_first_attempt_returns_clean_resume() {
+        // AssistantEmpty with NO prior completed assistant siblings
+        // under the same parentID — the "first-attempt empty" shape.
+        // CleanResume is safe (nothing was committed yet).
         let conn = db_with_user_message("ses_1", "msg_user", "build it");
         let strategy =
             resolve_strategy(&conn, "ses_1", StaticStatus::AssistantEmpty, "continue").unwrap();
@@ -652,7 +716,175 @@ mod tests {
                 assert_eq!(user_msg_id, "msg_user");
                 assert_eq!(text, "build it");
             }
-            other => panic!("expected CleanResume, got {other:?}"),
+            other => panic!("expected CleanResume (first-attempt empty), got {other:?}"),
+        }
+    }
+
+    /// Regression for the postman-outbox / multi-step shape: an
+    /// assistant turn that produced ONE OR MORE successful steps
+    /// (each its own completed assistant message under the same
+    /// parentID as the user message), then died at the start of a
+    /// continuation step with `parts_total == 0`.  Reverting past
+    /// the user message would DISCARD the completed steps' side
+    /// effects — the exact failure mode the split was designed to
+    /// prevent.  Must route to ContinuePrompt.
+    #[test]
+    fn resolve_strategy_assistant_empty_continuation_returns_continue_prompt() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        // User message (the parent of the assistant turn).
+        let user_data = serde_json::json!({
+            "role": "user",
+            "time": { "completed": null },
+            "agent": "investigator",
+            "model": { "providerID": "anthropic", "modelID": "claude-opus-4-7" },
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_user', 'ses_1', 1000, ?)",
+            [user_data],
+        )
+        .unwrap();
+        // Two completed assistant siblings under parentID=msg_user
+        // — the "prior steps with side effects" the empty continuation
+        // would discard if we ran CleanResume.
+        for (id, ts) in [("msg_a1", 1500i64), ("msg_a2", 1600)] {
+            let data = serde_json::json!({
+                "role": "assistant",
+                "parentID": "msg_user",
+                "time": { "completed": 1700 },
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data) \
+                 VALUES (?, 'ses_1', ?, ?)",
+                rusqlite::params![id, ts, data],
+            )
+            .unwrap();
+        }
+        // The empty continuation step: assistant, parentID=msg_user,
+        // NOT completed, no parts.
+        let empty_data = serde_json::json!({
+            "role": "assistant",
+            "parentID": "msg_user",
+            "time": { "completed": null },
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_empty', 'ses_1', 1800, ?)",
+            [empty_data],
+        )
+        .unwrap();
+
+        let strategy =
+            resolve_strategy(&conn, "ses_1", StaticStatus::AssistantEmpty, "continue").unwrap();
+        match strategy {
+            NudgeStrategy::ContinuePrompt { prompt, agent, model } => {
+                assert_eq!(prompt, "continue");
+                // Agent/model recovered from the user message preceding
+                // the broken assistant turn (same path as
+                // AssistantPartial / AssistantToolStuck).
+                assert_eq!(agent.as_deref(), Some("investigator"));
+                let model = model.expect("model should be recovered from user message");
+                assert_eq!(model.provider_id, "anthropic");
+                assert_eq!(model.model_id, "claude-opus-4-7");
+            }
+            other => panic!(
+                "expected ContinuePrompt (continuation empty must NOT revert prior steps' side effects), got {other:?}"
+            ),
+        }
+    }
+
+    /// Errored prior siblings do NOT count as "completed" for the
+    /// split — a prior step that died is not committed work to
+    /// preserve.  When all siblings under the parentID are errored,
+    /// the empty continuation must still route to CleanResume
+    /// (matches vigil-watch's `$.error IS NOT NULL` filter).
+    #[test]
+    fn resolve_strategy_assistant_empty_ignores_errored_siblings() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES ('ses_1', NULL, '', '', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        let user_data = r#"{"role":"user","time":{"completed":null}}"#;
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_user', 'ses_1', 1000, ?)",
+            [user_data],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, time_created, data) \
+             VALUES ('prt_text', 'msg_user', 1100, ?)",
+            [r#"{"type":"text","text":"redo it"}"#],
+        )
+        .unwrap();
+        // Prior assistant sibling: completed BUT errored — does not
+        // count as preserved work.
+        let errored_data = serde_json::json!({
+            "role": "assistant",
+            "parentID": "msg_user",
+            "time": { "completed": 1500 },
+            "error": { "name": "APIError", "data": { "message": "boom" } },
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_a1', 'ses_1', 1500, ?)",
+            [errored_data],
+        )
+        .unwrap();
+        // Empty continuation.
+        let empty_data = serde_json::json!({
+            "role": "assistant",
+            "parentID": "msg_user",
+            "time": { "completed": null },
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) \
+             VALUES ('msg_empty', 'ses_1', 1800, ?)",
+            [empty_data],
+        )
+        .unwrap();
+
+        let strategy =
+            resolve_strategy(&conn, "ses_1", StaticStatus::AssistantEmpty, "continue").unwrap();
+        match strategy {
+            NudgeStrategy::CleanResume { text, .. } => {
+                assert_eq!(text, "redo it");
+            }
+            other => panic!(
+                "expected CleanResume (no committed siblings — only errored ones), got {other:?}"
+            ),
         }
     }
 
