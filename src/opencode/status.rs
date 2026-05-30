@@ -442,6 +442,83 @@ pub fn fetch_user_message_before_last_assistant(
     }))
 }
 
+/// Count COMPLETED assistant messages that share the same `parentID`
+/// as the LAST message of the session, excluding the last message
+/// itself.
+///
+/// Mirrors vigil-watch's `priorCompletedAssistantSiblings` field
+/// (see `vigil-watch/src/session_status/classifier.rs:208`).  Used
+/// to split the `AssistantEmpty` shape into two recovery flavors:
+///
+/// * `0` siblings → the empty assistant message is a FIRST attempt
+///   at the user turn.  Nothing was committed; `CleanResume`
+///   (revert past the user message and replay it) is safe and
+///   preferred (no "continue" pollution in the transcript).
+/// * `> 0` siblings → the empty assistant message is a CONTINUATION
+///   step under a turn whose prior steps already produced
+///   side-effects (tool calls, file edits).  `CleanResume` would
+///   `revert` past the user message and discard those side-effects.
+///   `ContinuePrompt` (abort + post `"continue"`) preserves the
+///   prior steps' work and lets the LLM pick up from where it
+///   stalled.
+///
+/// Returns `0` when:
+///   - the session has no messages,
+///   - the last message has no `parentID` (e.g. older opencode
+///     persistence format),
+///   - no matching siblings exist.
+///
+/// All three degrade to "no siblings", which falls back to the
+/// pre-split behaviour (`CleanResume` for `AssistantEmpty`).  This
+/// is the conservative choice: misclassifying a continuation-empty
+/// as first-empty is the SAME outcome we had before the split.
+pub fn count_prior_completed_assistant_siblings(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<usize> {
+    // Find the last message (parentID + id).  We need the id so we
+    // can exclude the last message itself from the sibling count
+    // (in the assistant-empty case the last message IS an assistant
+    // message under the same parentID, but it is NOT completed, so
+    // it would already fall out of the `time.completed IS NOT NULL`
+    // filter — still, excluding it explicitly matches vigil-watch's
+    // behaviour and guards against subtle edge cases).
+    let mut stmt = conn.prepare(
+        "SELECT m.id, json_extract(m.data,'$.parentID') AS parent_id
+         FROM message m
+         WHERE m.session_id = ?
+         ORDER BY m.time_created DESC, m.id DESC
+         LIMIT 1",
+    )?;
+    let last: Option<(String, Option<String>)> = stmt
+        .query_row([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    let Some((last_id, Some(parent_id))) = last else {
+        return Ok(0);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(*)
+         FROM message m
+         WHERE m.session_id = ?
+           AND m.id != ?
+           AND json_extract(m.data,'$.parentID') = ?
+           AND json_extract(m.data,'$.role') = 'assistant'
+           AND json_extract(m.data,'$.time.completed') IS NOT NULL
+           AND json_extract(m.data,'$.error') IS NULL",
+    )?;
+    let count: i64 = stmt.query_row(rusqlite::params![session_id, last_id, parent_id], |row| {
+        row.get(0)
+    })?;
+    Ok(count.max(0) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,5 +1431,212 @@ mod tests {
         let meta = fetch_last_message_meta(&conn, &[]).unwrap();
         let status = classify_static(meta.get("ses_1").unwrap());
         assert_eq!(status, StaticStatus::AssistantToolStuck);
+    }
+
+    /// Insert a message with a custom JSON `data` blob (parentID,
+    /// completed timestamp, error, etc.).  Used by the sibling-count
+    /// tests that need fine-grained control over the message shape.
+    fn insert_message_with_data(
+        conn: &Connection,
+        msg_id: &str,
+        session_id: &str,
+        time_created: i64,
+        data: serde_json::Value,
+    ) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+            rusqlite::params![msg_id, session_id, time_created, data.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn make_session(conn: &Connection, session_id: &str) {
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES (?, NULL, '', '', 1000, 2000)",
+            [session_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn count_siblings_zero_when_session_has_no_messages() {
+        let conn = setup_db();
+        make_session(&conn, "ses_1");
+        assert_eq!(
+            count_prior_completed_assistant_siblings(&conn, "ses_1").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn count_siblings_zero_when_last_message_has_no_parent_id() {
+        // First-attempt empty under a freshly-created user turn: the
+        // user message has no parentID, so the sibling scan has no
+        // anchor and returns 0 (degrades to the pre-split behaviour
+        // / CleanResume).
+        let conn = setup_db();
+        make_session(&conn, "ses_1");
+        insert_message_with_data(
+            &conn,
+            "msg_user",
+            "ses_1",
+            1000,
+            serde_json::json!({
+                "role": "user",
+                "time": { "completed": null },
+            }),
+        );
+        assert_eq!(
+            count_prior_completed_assistant_siblings(&conn, "ses_1").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn count_siblings_counts_only_completed_assistant_siblings_under_same_parent() {
+        // Shape: user msg (parent), 2 completed assistant siblings,
+        // 1 incomplete assistant sibling (the broken empty turn).
+        // Expected: 2 (the broken turn itself is excluded, and only
+        // completed siblings count).
+        let conn = setup_db();
+        make_session(&conn, "ses_1");
+        insert_message_with_data(
+            &conn,
+            "msg_user",
+            "ses_1",
+            1000,
+            serde_json::json!({
+                "role": "user",
+                "time": { "completed": null },
+            }),
+        );
+        for (id, ts) in [("msg_a1", 1500i64), ("msg_a2", 1600)] {
+            insert_message_with_data(
+                &conn,
+                id,
+                "ses_1",
+                ts,
+                serde_json::json!({
+                    "role": "assistant",
+                    "parentID": "msg_user",
+                    "time": { "completed": 1700 },
+                }),
+            );
+        }
+        // The broken empty turn (LAST message).
+        insert_message_with_data(
+            &conn,
+            "msg_empty",
+            "ses_1",
+            2000,
+            serde_json::json!({
+                "role": "assistant",
+                "parentID": "msg_user",
+                "time": { "completed": null },
+            }),
+        );
+
+        assert_eq!(
+            count_prior_completed_assistant_siblings(&conn, "ses_1").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn count_siblings_excludes_errored_siblings() {
+        // Errored prior siblings represent work that ALSO died — not
+        // committed work to preserve.  Mirrors vigil-watch's
+        // `s_errored` filter (classifier.rs:313).
+        let conn = setup_db();
+        make_session(&conn, "ses_1");
+        insert_message_with_data(
+            &conn,
+            "msg_user",
+            "ses_1",
+            1000,
+            serde_json::json!({"role":"user","time":{"completed":null}}),
+        );
+        insert_message_with_data(
+            &conn,
+            "msg_a1",
+            "ses_1",
+            1500,
+            serde_json::json!({
+                "role": "assistant",
+                "parentID": "msg_user",
+                "time": { "completed": 1700 },
+                "error": { "name": "APIError" },
+            }),
+        );
+        insert_message_with_data(
+            &conn,
+            "msg_empty",
+            "ses_1",
+            2000,
+            serde_json::json!({
+                "role": "assistant",
+                "parentID": "msg_user",
+                "time": { "completed": null },
+            }),
+        );
+
+        assert_eq!(
+            count_prior_completed_assistant_siblings(&conn, "ses_1").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn count_siblings_excludes_other_parents() {
+        // A previous user turn's completed assistant should NOT count
+        // as a sibling of the current turn's empty assistant — they
+        // belong to different parentIDs.
+        let conn = setup_db();
+        make_session(&conn, "ses_1");
+        insert_message_with_data(
+            &conn,
+            "msg_user_old",
+            "ses_1",
+            500,
+            serde_json::json!({"role":"user","time":{"completed":null}}),
+        );
+        insert_message_with_data(
+            &conn,
+            "msg_a_old",
+            "ses_1",
+            600,
+            serde_json::json!({
+                "role": "assistant",
+                "parentID": "msg_user_old",
+                "time": { "completed": 700 },
+            }),
+        );
+        // Newer user turn + its empty continuation under a DIFFERENT parent.
+        insert_message_with_data(
+            &conn,
+            "msg_user_new",
+            "ses_1",
+            1000,
+            serde_json::json!({"role":"user","time":{"completed":null}}),
+        );
+        insert_message_with_data(
+            &conn,
+            "msg_empty",
+            "ses_1",
+            2000,
+            serde_json::json!({
+                "role": "assistant",
+                "parentID": "msg_user_new",
+                "time": { "completed": null },
+            }),
+        );
+
+        // Only the empty's own parentID (msg_user_new) is checked,
+        // and there are no completed assistants under it.
+        assert_eq!(
+            count_prior_completed_assistant_siblings(&conn, "ses_1").unwrap(),
+            0
+        );
     }
 }
