@@ -253,18 +253,26 @@ fn extract_user_text(content: &serde_json::Value) -> String {
     }
 }
 
-/// Truncate a title to [`MAX_TITLE_LEN`] characters at a word boundary.
+/// Truncate a title to [`MAX_TITLE_LEN`] bytes at a character and word boundary.
 ///
-/// If the title exceeds the limit, it is cut at the last space before the
-/// limit and "..." is appended.
+/// If the title exceeds the limit in bytes, it is cut at the last space before
+/// the last char boundary that fits within [`MAX_TITLE_LEN`] bytes, and "..."
+/// is appended.  This avoids panicking on multi-byte UTF-8 characters (e.g.
+/// `✔`, `→`, CJK) that straddle the byte limit.
 fn truncate_title(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.len() <= MAX_TITLE_LEN {
         return trimmed.to_string();
     }
-    // Find last space before the limit
-    let truncated = &trimmed[..MAX_TITLE_LEN];
-    let cut_at = truncated.rfind(' ').unwrap_or(MAX_TITLE_LEN);
+    // Find the largest byte index <= MAX_TITLE_LEN that sits on a char boundary.
+    let byte_limit = trimmed
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i < MAX_TITLE_LEN)
+        .last()
+        .unwrap_or(0);
+    let truncated = &trimmed[..byte_limit];
+    let cut_at = truncated.rfind(' ').unwrap_or(byte_limit);
     format!("{}...", &trimmed[..cut_at])
 }
 
@@ -1184,6 +1192,36 @@ mod tests {
     #[test]
     fn test_truncate_title_trims_whitespace() {
         assert_eq!(truncate_title("  hello world  "), "hello world");
+    }
+
+    /// Regression test: multi-byte UTF-8 character (✔, 3 bytes) straddling the
+    /// byte limit must not panic.  The string is built so that ✔ starts at byte
+    /// 78, i.e. bytes 78-80 inclusive, which previously caused a panic when the
+    /// code did `&trimmed[..80]`.
+    #[test]
+    fn test_truncate_title_multibyte_char_at_byte_limit() {
+        // 78 ASCII bytes + ✔ (3 bytes) + some trailing text → total > 80 bytes.
+        let prefix = "a".repeat(78);
+        let text = format!("{}✔ trailing words here", prefix);
+        assert!(text.len() > MAX_TITLE_LEN, "test string must exceed byte limit");
+        // Must not panic; result must end with "..."
+        let result = truncate_title(&text);
+        assert!(result.ends_with("..."), "expected ellipsis, got: {result:?}");
+        // Result must be valid UTF-8 (no broken char boundaries).
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    /// A title whose first multi-byte character sits exactly at byte MAX_TITLE_LEN-1
+    /// (i.e. its first byte is at MAX_TITLE_LEN-1) must also not panic.
+    #[test]
+    fn test_truncate_title_multibyte_char_one_byte_before_limit() {
+        // 79 ASCII bytes + ✔ (3 bytes) + trailing text.
+        let prefix = "a".repeat(79);
+        let text = format!("{}✔ more words", prefix);
+        assert!(text.len() > MAX_TITLE_LEN);
+        let result = truncate_title(&text);
+        assert!(result.ends_with("..."));
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 
     #[test]
