@@ -2,8 +2,8 @@
 
 * Description
 
-CLI tool to audit and monitor AI assistant sessions. Supports Claude Code
-and OpenCode.
+CLI tool to audit and monitor AI assistant sessions. Supports Claude
+Code, OpenCode, and pi (badlogic/pi-mono).
 
 * Installation
 
@@ -17,7 +17,21 @@ This installs the =ai-audit= binary to =~/.cargo/bin/=.
 
 ** Command structure
 
-All session-scoped commands live under =ai-audit session <verb>=.
+The CLI uses a =<noun> <verb>= structure.  All session-scoped
+commands live under =ai-audit session <verb>=.  Cross-session
+concerns (=activity=, =token-usage=, =rate=) stay at the top level.
+
+*** Top-level commands
+
+| Command                  | Description                                      |
+|--------------------------+--------------------------------------------------|
+| =session <verb>=         | Session inspection and management (see below)    |
+| =activity <list/get>=    | User activity tracking (messages + permissions)  |
+| =token-usage <timespan>= | Per-message LLM token consumption events         |
+| =rate <instruction>=     | Rate agent instructions against test cases       |
+
+*** Session subcommands
+
 Short aliases and prefix inference are supported:
 
 | Command                       | Aliases     | Prefix examples |
@@ -31,6 +45,7 @@ Short aliases and prefix inference are supported:
 | =session assisted-by=         | —           | =s a=            |
 | =session info=                | —           | =s i=            |
 | =session nudge=               | —           | =s n=            |
+| =session delete=              | —           | =s d=            |
 
 So =ai-audit s ls= is equivalent to =ai-audit session list=.  Note
 that =s p= is *ambiguous* between =permissions= and =previous= — clap
@@ -54,6 +69,7 @@ ai-audit session list
 # Filter by type
 ai-audit session list -t claudecode
 ai-audit session list -t opencode
+ai-audit session list -t pi
 
 # Short form (alias)
 ai-audit s ls
@@ -87,6 +103,31 @@ ai-audit session list -p ../fyl
 # Combine filters
 ai-audit session list --timespan today --search "keyword" -t opencode
 #+end_src
+
+*** Status filters (OpenCode)
+
+=session list= and =session usage= also accept a status-filtering
+subsystem derived from each session's last message and its parts:
+
+#+begin_src bash
+# Filter by static status (comma-separated)
+ai-audit session list --status assistant-empty,assistant-tool-stuck
+
+# Shorthand for the resumable static-status set
+ai-audit session list --resumable
+
+# Filter by when the last message landed
+ai-audit session list --last-message-in 30m
+
+# Include / filter by live status (probes the running opencode server)
+ai-audit session list --output-live-status
+ai-audit session list --filter-by-live-status running,idle
+ai-audit session list --server-url http://127.0.0.1:4096
+#+end_src
+
+Static-status values: =completed=, =user-pending=, =assistant-empty=,
+=assistant-partial=, =assistant-tool-stuck=.  Live-status values:
+=running=, =idle=, =server-unreachable=.
 
 ** Current Session Detection
 
@@ -129,7 +170,7 @@ Options:
 |--------------------+--------------------------------------------------------|
 | =-m, --match=      | Text to match in recent messages                       |
 | =--pid=            | PID of an AI assistant process                         |
-| =-t, --type=       | Filter by provider (=claudecode= or =opencode=)       |
+| =-t, --type=       | Filter by provider (=claudecode=, =opencode=, =pi=)   |
 | =-n, --last-messages= | Messages to search with =--match= (default: 5)     |
 | =-p, --project=    | Filter by project path                                 |
 
@@ -173,6 +214,88 @@ OpenCode output shows tool calls with permission decisions:
 #+begin_example
 2026-01-20 01:49:03      ASK      bash         axdfguij
 #+end_example
+
+pi has no permission/approval model, so =session permissions= errors
+out for pi sessions.
+
+** Session Info
+
+Show metadata for a single session (auto-detects the current session
+when no ID is given):
+
+#+begin_src bash
+# Explicit session ID
+ai-audit session info ses_426e8c1ceffecECQZeKXvtWNoo
+
+# Auto-detect the current session
+ai-audit session info
+
+# Skip the live-status HTTP probe (OpenCode only; useful offline)
+ai-audit session info --no-live
+
+# JSON output
+ai-audit session info --json
+#+end_src
+
+For OpenCode sessions the live status is probed from the running
+opencode HTTP server unless =--no-live= is passed.
+
+** Nudge
+
+Revive resumable OpenCode sessions by replaying or appending a prompt
+(OpenCode only):
+
+#+begin_src bash
+# Nudge a single session
+ai-audit session nudge ses_426e8c1ceffecECQZeKXvtWNoo
+
+# Nudge every session matching filters
+ai-audit session nudge --all --status assistant-empty
+ai-audit session nudge --all -p . --search "stuck"
+
+# Preview the plan without posting any prompt
+ai-audit session nudge --all --dry-run
+
+# Override the prompt that gets posted (default: "continue")
+ai-audit session nudge ses_x --continue-prompt "please continue"
+
+# Fork instead of mutating the original session
+ai-audit session nudge ses_x --fork
+#+end_src
+
+A positional =<session-id>= cannot be combined with the filter flags
+(=--project=, =--search=, =--timespan=, =--last-message-in=,
+=--status=); use =--all= with filters to target a batch.
+
+** Delete
+
+Wipe one or more sessions across every storage location ai-audit reads
+(transcripts, debug logs, SQLite rows, legacy file-tree, session-index
+cache):
+
+#+begin_src bash
+# Delete a single session
+ai-audit session delete ses_426e8c1ceffecECQZeKXvtWNoo
+
+# Preview what would be deleted (the only safety mechanism)
+ai-audit session delete --all -t opencode --dry-run
+
+# Batch delete via filters (--all required as a guard)
+ai-audit session delete --all --timespan "..2026-01-01"
+
+# Pipe IDs from `session list -j` (or `-0`)
+ai-audit session list -j --status assistant-empty \
+  | ai-audit session delete --ids-file -
+
+# Also delete child sessions of a parent
+ai-audit session delete ses_parent --cascade
+#+end_src
+
+Safety: there is no confirmation prompt and no =--yes= — =--dry-run=
+is the only safeguard, so the filter is the contract.  Deleting the
+*current* session (matched via =$*_SESSION_ID= or tmux fingerprinting)
+is rejected.  Deleting a parent session is refused unless =--cascade=
+is passed.
 
 ** Token Usage
 
@@ -254,6 +377,68 @@ Given a session whose cwd is =/home/vaab/dev/rs/ai-audit/doc=, with a
 When no =.git= ancestor exists, =project= and =subpath= are empty,
 =project_path= falls back to =cwd= (with =$HOME= collapse), and =cwd=
 is unchanged.  Use =--project=""= to filter for these.
+
+* Activity
+
+User activity tracking — messages and permission grants — keyed by an
+activity identifier (e.g. =claude-msg@rs/ai-audit=,
+=pi-msg@rs/ai-audit=).
+
+#+begin_src bash
+# List all available activity identifiers
+ai-audit activity list
+
+# Get activity events for a timespan
+ai-audit activity get today
+ai-audit activity get "2026-02-01..2026-02-11"
+
+# Filter by identifier(s)
+ai-audit activity get today claude-msg@rs/ai-audit
+
+# Restrict to specific sessions (repeatable)
+ai-audit activity get today -s ses_abc -s ses_def
+
+# Read additional identifiers from a NUL-separated file (or `-` for stdin)
+ai-audit activity get today --categs-file idents.nul
+
+# Machine-parseable output
+ai-audit activity get today -j
+ai-audit activity get today -0
+#+end_src
+
+Since pi has no permission model, only =pi-msg@<project>= activity
+identifiers are emitted for pi sessions.
+
+* Rate
+
+Rate agent instructions against test cases.  Runs the agent under test
+(via =pi=) with each requested model, then judges the output against
+the test's checklist (also via =pi=).
+
+#+begin_src bash
+# Rate an instruction file against a test file or directory
+ai-audit rate instructions.md --test tests/
+
+# Override agent / judge models (comma-separated)
+ai-audit rate instructions.md --test tests/ \
+  --agent-models anthropic/claude-sonnet-4 \
+  --judge-models anthropic/claude-opus-4
+
+# Set a per-invocation timeout and bypass the cache
+ai-audit rate instructions.md --test tests/ --timeout 120 --no-cache
+
+# Supply a custom judge prompt
+ai-audit rate instructions.md --test tests/ --judge-prompt judge.md
+#+end_src
+
+| Flag                | Description                                       |
+|---------------------+---------------------------------------------------|
+| =--test=            | Test file or directory (required)                  |
+| =--agent-models=    | Agent models, comma-separated (default: pi default) |
+| =--judge-models=    | Judge models, comma-separated (default: pi default) |
+| =--timeout=         | Timeout in seconds                                 |
+| =--no-cache=        | Force recomputation, ignore cache                  |
+| =--judge-prompt=    | Path to a custom judge prompt                      |
 
 * Output Formats
 
