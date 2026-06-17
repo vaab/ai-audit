@@ -2,6 +2,7 @@ pub mod activity;
 pub mod claudecode;
 pub mod cli;
 pub mod config;
+pub mod edits;
 pub mod empty_segments;
 pub mod format;
 pub mod opencode;

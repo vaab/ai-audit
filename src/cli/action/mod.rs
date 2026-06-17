@@ -2,6 +2,7 @@
 
 mod activity;
 mod assisted_by;
+mod edited_files;
 mod last_session;
 mod list_sessions;
 mod permissions;
@@ -14,9 +15,9 @@ mod usage;
 use anyhow::{anyhow, Result};
 
 use super::def::{
-    Commands, SessionAction, SessionAssistedByArgs, SessionCurrentArgs, SessionListArgs,
-    SessionPermissionsArgs, SessionPreviousArgs, SessionTranscriptArgs, SessionType,
-    SessionUsageArgs,
+    Commands, SessionAction, SessionAssistedByArgs, SessionCurrentArgs, SessionEditedFilesArgs,
+    SessionListArgs, SessionPermissionsArgs, SessionPreviousArgs, SessionTranscriptArgs,
+    SessionType, SessionUsageArgs,
 };
 
 /// Resolve a session ID: use explicit value if given, else auto-detect.
@@ -84,6 +85,18 @@ fn run_transcript(a: SessionTranscriptArgs, verbose: u8) -> Result<()> {
         a.file.as_deref(),
         a.output.format(),
         verbose,
+    )
+}
+
+fn run_edited_files(a: SessionEditedFilesArgs) -> Result<()> {
+    let session_id = resolve_session(a.session)?;
+    edited_files::run(
+        &session_id,
+        a.apply,
+        a.extract,
+        a.out,
+        a.patch,
+        a.output.format(),
     )
 }
 
@@ -159,6 +172,7 @@ pub fn dispatch(cmd: Commands, quiet: bool, verbose: u8) -> Result<()> {
             SessionAction::Current(a) => run_current(a),
             SessionAction::Previous(a) => run_previous(a),
             SessionAction::Transcript(a) => run_transcript(a, verbose),
+            SessionAction::EditedFiles(a) => run_edited_files(a),
             SessionAction::Permissions(a) => run_permissions(a),
             SessionAction::Usage(a) => run_usage(a, quiet),
             SessionAction::AssistedBy(a) => run_assisted_by(a),

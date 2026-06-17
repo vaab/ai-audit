@@ -73,6 +73,7 @@ ai-audit session list         [aliases: ls]      [-s TEXT] [--timespan EXPR] [-p
 ai-audit session current      [aliases: cur]     [--match TEXT | --pid PID] [-t TYPE]
 ai-audit session previous     [aliases: prev]    [-t TYPE]
 ai-audit session transcript   [aliases: tr]      [SESSION-ID] [-n LAST]
+ai-audit session edited-files [aliases: ef]      [SESSION-ID] [-p] [--apply DIR | --extract FILE [--out PATH]]
 ai-audit session permissions  [aliases: perms]   <session-id>
 ai-audit session usage        [aliases: tokens]  [SESSION-ID] [filters...]
 ai-audit session assisted-by                     [--session ID]
@@ -85,6 +86,52 @@ aliases: `ai-audit s ls`, `ai-audit s cur`, `ai-audit s pr`
 (previous), `ai-audit s pe` (permissions). The prefix `s p` is
 **ambiguous** between `permissions` and `previous` and is rejected
 with a clear error — use `pe` / `pr` to disambiguate.
+
+### `session edited-files` (modes)
+
+Surfaces the file write/edit operations recorded in a session's
+transcript (`Write` / `Edit` / `MultiEdit` and their snake/camelCase
+variants across all three providers). The normalized op model lives
+in `src/edits.rs` (`FileOp::Write` / `FileOp::Edit`, `extract_ops`,
+`stat`); the write-tool detection there is the single source of truth
+(`session transcript`'s `-f` filter defers to `crate::edits::is_write_tool`).
+
+- **stat** (default): mimics `git diff --stat` — one line per touched
+  file as ` <path> | <N> <+/- histogram>`, where `N` is the total
+  changed lines and the bar is proportional `+` (insertions, green) /
+  `-` (deletions, red), scaled to a fixed budget. Closes with a
+  `N files changed, I insertions(+), D deletions(-)` summary (zero
+  clauses omitted; `file`/`insertion`/`deletion` singularized).
+  Insertions/deletions are derived from op *content* (no on-disk diff
+  context): a `Write` counts its whole content as insertions; an
+  `Edit` counts `count_lines(old)` deletions + `count_lines(new)`
+  insertions (a `replace_all` block is counted once). Honors `-j`
+  (JSONL of `EditedFile`, now including `insertions`/`deletions`) and
+  `-0` (NUL-separated paths).
+- **`-p` / `--patch`**: prints the raw content of every op in
+  chronological order instead of the stat summary — NOT a unified
+  diff. Each op gets a `=== <path> (write|edit[, replace-all]) ===`
+  header; `Write` shows the literal content, `Edit` shows `--- old` /
+  `--- new` blocks verbatim. With `-j` it emits one `FileOp` JSON
+  object per op (`{"op":"write",…}` / `{"op":"edit",…}` with full
+  content/old/new); with `-0` it emits NUL-delimited per-op records.
+  Mutually exclusive with `--apply` and `--extract`.
+- **`--apply <DIR>`**: replays every op in chronological order onto
+  `DIR`. Recorded absolute paths are re-rooted under `DIR`
+  (`/home/u/a.rs` → `<DIR>/home/u/a.rs`) so replay never escapes the
+  destination. `Edit` ops use **exact-match** semantics (the
+  `old_string` must appear exactly once unless `replace_all`); a
+  miss is reported and the op fails loudly, but replay
+  continues-on-error and exits non-zero if any op failed. Editing a
+  pre-existing file that isn't present under `DIR` therefore fails by
+  design — apply onto a copy of the original tree, not an empty dir.
+- **`--extract <FILE> [--out <PATH>]`**: reconstructs the final
+  content of a single file by replaying just its ops from the last
+  in-session `Write` onward. Files that were only edited (never
+  written in-session) cannot be reconstructed and error out.
+  Defaults to stdout; `--out` writes to a path.
+
+`--apply` and `--extract` are mutually exclusive.
 
 ### Legacy top-level commands (deprecated, hidden)
 

@@ -405,6 +405,40 @@ pub struct SessionTranscriptArgs {
 }
 
 #[derive(ClapArgs, Debug, Clone)]
+pub struct SessionEditedFilesArgs {
+    /// Session ID (UUID for Claude Code, ses_* for OpenCode, UUIDv7 for pi).
+    /// If omitted, auto-detects the current session.
+    pub session: Option<String>,
+
+    /// Replay the recorded write/edit operations onto this directory.
+    #[arg(long, conflicts_with = "extract")]
+    pub apply: Option<PathBuf>,
+
+    /// Reconstruct and emit the final content of a single file (path as
+    /// recorded in the session). Must have been Written in-session.
+    #[arg(long, conflicts_with = "apply")]
+    pub extract: Option<String>,
+
+    /// Destination for --extract output (default: stdout).
+    #[arg(long, requires = "extract")]
+    pub out: Option<PathBuf>,
+
+    /// Show the raw content of each recorded op (write content, and
+    /// edit old/new blocks) instead of the per-file stat summary.
+    /// Not a unified diff — literal old/new text with minimal framing.
+    #[arg(
+        short = 'p',
+        long,
+        conflicts_with = "apply",
+        conflicts_with = "extract"
+    )]
+    pub patch: bool,
+
+    #[command(flatten)]
+    pub output: OutputOpts,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
 pub struct SessionCurrentArgs {
     /// Text to match against the last messages of session transcripts.
     /// When provided, sessions are identified by searching for this string
@@ -500,6 +534,10 @@ pub enum SessionAction {
     /// Display full session transcript
     #[command(visible_alias = "tr")]
     Transcript(SessionTranscriptArgs),
+
+    /// List files written/edited in a session; replay or extract them.
+    #[command(visible_alias = "ef")]
+    EditedFiles(SessionEditedFilesArgs),
 
     /// List permission events for a session
     #[command(visible_alias = "perms")]
@@ -670,6 +708,7 @@ impl SessionAction {
             SessionAction::Current(a) => a.output.format(),
             SessionAction::Previous(a) => a.output.format(),
             SessionAction::Transcript(a) => a.output.format(),
+            SessionAction::EditedFiles(a) => a.output.format(),
             SessionAction::Permissions(a) => a.output.format(),
             SessionAction::Usage(a) => a.output.format(),
             SessionAction::AssistedBy(a) => a.output.format(),

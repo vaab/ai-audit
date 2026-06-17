@@ -7,16 +7,6 @@ use crate::activity::format_timestamp_display;
 use crate::transcript::{EntryType, Role, TranscriptEntry};
 use crate::OutputFormat;
 
-/// Tool names (case-insensitive) that write or edit files.
-const WRITE_TOOL_NAMES: &[&str] = &[
-    "write",
-    "edit",
-    "multiedit",
-    "createfile",
-    "multi_edit",
-    "create",
-];
-
 pub fn run(
     session: &str,
     last: Option<usize>,
@@ -170,8 +160,10 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
 
 /// Check if a transcript entry is a tool_use that writes/edits the given file.
 ///
-/// Handles both Claude Code (`file_path` key) and OpenCode (`filePath` / `file_path` keys)
-/// tool input formats. Tool names are matched case-insensitively to handle both providers.
+/// Delegates write-tool recognition and path extraction to
+/// [`crate::edits`] so that the single-source-of-truth list of write
+/// tool names lives in one place; this wrapper only adds the
+/// transcript-entry plumbing and the path-matching step.
 fn entry_targets_file(entry: &TranscriptEntry, target_path: &str) -> bool {
     if !matches!(entry.entry_type, EntryType::ToolUse) {
         return false;
@@ -180,18 +172,14 @@ fn entry_targets_file(entry: &TranscriptEntry, target_path: &str) -> bool {
         Some(n) => n,
         None => return false,
     };
-    if !WRITE_TOOL_NAMES.contains(&tool_name.to_ascii_lowercase().as_str()) {
+    if !crate::edits::is_write_tool(tool_name) {
         return false;
     }
     let input = match &entry.tool_input {
         Some(v) => v,
         None => return false,
     };
-    let tool_path = input
-        .get("file_path")
-        .or_else(|| input.get("filePath"))
-        .and_then(|p| p.as_str());
-    match tool_path {
+    match crate::edits::input_path(input) {
         Some(p) => crate::file_path_matches(p, target_path),
         None => false,
     }
