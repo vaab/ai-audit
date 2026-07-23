@@ -15,20 +15,19 @@ use crate::transcript::{EntryType, Role, TranscriptEntry};
 /// by timestamp+role+content. If only one source has data, that is used.
 pub fn parse_transcript(session_id: &str) -> Result<Vec<TranscriptEntry>> {
     let storage_dir = crate::opencode_data_dir().join("storage");
-    let file_entries = parse_transcript_from_dir(&storage_dir, session_id).ok();
-    let db_entries = parse_transcript_from_db(session_id).ok();
+    let file_entries = parse_transcript_from_dir(&storage_dir, session_id);
+    let db_entries = parse_transcript_from_db(session_id);
 
     match (file_entries, db_entries) {
-        (Some(fe), Some(de)) if !fe.is_empty() && !de.is_empty() => {
+        (Ok(fe), Ok(de)) if !fe.is_empty() && !de.is_empty() => {
             Ok(merge_transcript_entries(fe, de))
         }
-        (Some(fe), _) if !fe.is_empty() => Ok(fe),
-        (_, Some(de)) if !de.is_empty() => Ok(de),
-        // Both empty or both errored — try file-based for the error message
-        _ => {
-            let storage_dir = crate::opencode_data_dir().join("storage");
-            parse_transcript_from_dir(&storage_dir, session_id)
-        }
+        (Ok(fe), _) if !fe.is_empty() => Ok(fe),
+        (_, Ok(de)) if !de.is_empty() => Ok(de),
+        (_, Err(db_error)) if super::db::db_exists() => Err(db_error),
+        (Err(file_error), _) => Err(file_error),
+        (Ok(_), Ok(_)) => Ok(Vec::new()),
+        (Ok(_), Err(db_error)) => Err(db_error),
     }
 }
 
@@ -45,7 +44,18 @@ pub fn parse_transcript_from_conn(
 ) -> Result<Vec<TranscriptEntry>> {
     let messages = super::db::get_messages_for_session(conn, session_id)?;
     if messages.is_empty() {
-        anyhow::bail!("No messages found for session: {}", session_id);
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?)",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if exists {
+            anyhow::bail!("OpenCode session has no messages: {}", session_id);
+        }
+        anyhow::bail!(
+            "OpenCode session not found: {}; check that the session ID is complete and exact",
+            session_id
+        );
     }
 
     let mut entries = Vec::new();
@@ -840,8 +850,18 @@ mod tests {
     #[test]
     fn test_parse_transcript_from_db_empty_session() {
         let conn = setup_transcript_db();
-        let result = parse_transcript_from_conn(&conn, "ses_missing");
-        assert!(result.is_err());
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated) \
+             VALUES (?1, 'project', NULL, '/project', '', 1, 1)",
+            ["ses_empty"],
+        )
+        .unwrap();
+
+        let error = parse_transcript_from_conn(&conn, "ses_empty").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OpenCode session has no messages: ses_empty"
+        );
     }
 
     fn insert_msg_with_data(
