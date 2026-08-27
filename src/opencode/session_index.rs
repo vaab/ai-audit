@@ -23,7 +23,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -85,6 +85,15 @@ fn refresh_file_cache(session_dir: &Path, existing: &mut CachedHarnessIndex) {
         Err(_) => return,
     };
 
+    // Build the path -> id reverse map ONCE.  Resolving each visited
+    // file by scanning ``sessions_by_id`` linearly made this walk
+    // O(files x sessions).
+    let id_by_path: HashMap<std::path::PathBuf, String> = existing
+        .sessions_by_id
+        .iter()
+        .filter_map(|(id, s)| s.path.as_ref().map(|p| (p.clone(), id.clone())))
+        .collect();
+
     let mut visited: HashSet<String> = HashSet::new();
     let mut added = 0usize;
     let mut refreshed = 0usize;
@@ -109,12 +118,9 @@ fn refresh_file_cache(session_dir: &Path, existing: &mut CachedHarnessIndex) {
             };
             let current_mtime = mtime_ns_of(&metadata);
 
-            // Look up by path (we don't yet know the session_id).
-            let existing_id = existing
-                .sessions_by_id
-                .iter()
-                .find(|(_, s)| s.path.as_deref() == Some(path.as_path()))
-                .map(|(id, _)| id.clone());
+            // Look up by path (we don't yet know the session_id)
+            // through the prebuilt map: O(1) instead of O(sessions).
+            let existing_id = id_by_path.get(&path).cloned();
 
             if let Some(id) = &existing_id {
                 visited.insert(id.clone());

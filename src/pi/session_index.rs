@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -115,8 +115,10 @@ pub fn update_and_load(_config: &Config) -> Result<PiIndex> {
         return Ok(PiIndex { inner: existing });
     }
 
+    let id_by_path = build_id_by_path(&existing);
+
     let mut visited_paths: HashSet<std::path::PathBuf> = HashSet::new();
-    let (added, refreshed) = walk(&base, &mut existing, &mut visited_paths);
+    let (added, refreshed) = walk(&base, &mut existing, &id_by_path, &mut visited_paths);
 
     if added > 0 || refreshed > 0 {
         log::debug!(
@@ -152,9 +154,24 @@ pub fn update_and_load(_config: &Config) -> Result<PiIndex> {
     Ok(PiIndex { inner: existing })
 }
 
+/// Reverse map of the index: on-disk session file -> session id.
+///
+/// Built once per `update_and_load`.  Resolving each visited file by
+/// scanning `sessions_by_id` linearly made the walk O(files x
+/// sessions), which dominated runtime once the store grew to a few
+/// thousand sessions.
+fn build_id_by_path(existing: &CachedHarnessIndex) -> HashMap<std::path::PathBuf, String> {
+    existing
+        .sessions_by_id
+        .iter()
+        .filter_map(|(id, s)| s.path.as_ref().map(|p| (p.clone(), id.clone())))
+        .collect()
+}
+
 fn walk(
     dir: &Path,
     existing: &mut CachedHarnessIndex,
+    id_by_path: &HashMap<std::path::PathBuf, String>,
     visited_paths: &mut HashSet<std::path::PathBuf>,
 ) -> (usize, usize) {
     let entries = match fs::read_dir(dir) {
@@ -167,7 +184,7 @@ fn walk(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let (a, r) = walk(&path, existing, visited_paths);
+            let (a, r) = walk(&path, existing, id_by_path, visited_paths);
             added += a;
             refreshed += r;
             continue;
@@ -188,15 +205,8 @@ fn walk(
         // We parse on first encounter to learn the id, then use the
         // cached entry's mtime_ns to gate subsequent runs.
 
-        // Cheap lookup: scan existing by path.  Pi has at most a few
-        // hundred sessions; linear scan is acceptable.
-        let existing_id = existing
-            .sessions_by_id
-            .iter()
-            .find(|(_, s)| s.path.as_deref() == Some(path.as_path()))
-            .map(|(id, _)| id.clone());
-
-        if let Some(id) = &existing_id {
+        // O(1) lookup through the prebuilt path -> id map.
+        if let Some(id) = id_by_path.get(&path) {
             if let Some(s) = existing.sessions_by_id.get(id) {
                 if s.mtime_ns == current_mtime {
                     continue;
@@ -305,13 +315,15 @@ mod tests {
         );
         let mut idx = CachedHarnessIndex::empty();
         let mut visited = HashSet::new();
-        let (added, refreshed) = walk(dir.path(), &mut idx, &mut visited);
+        let map = build_id_by_path(&idx);
+        let (added, refreshed) = walk(dir.path(), &mut idx, &map, &mut visited);
         assert_eq!(added, 1);
         assert_eq!(refreshed, 0);
         assert_eq!(idx.sessions_by_id.len(), 1);
 
         // Second pass: same mtime → no-op.
-        let (added2, refreshed2) = walk(dir.path(), &mut idx, &mut visited);
+        let map = build_id_by_path(&idx);
+        let (added2, refreshed2) = walk(dir.path(), &mut idx, &map, &mut visited);
         assert_eq!(added2, 0);
         assert_eq!(refreshed2, 0);
     }
@@ -326,7 +338,8 @@ mod tests {
         );
         let mut idx = CachedHarnessIndex::empty();
         let mut visited = HashSet::new();
-        walk(dir.path(), &mut idx, &mut visited);
+        let map = build_id_by_path(&idx);
+        walk(dir.path(), &mut idx, &map, &mut visited);
         assert_eq!(
             idx.sessions_by_id["01900000-0000-7000-8000-000000000001"].cwds,
             vec!["/old"]
@@ -338,7 +351,8 @@ mod tests {
         )
         .unwrap();
         set_file_mtime(&path, FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
-        let (added, refreshed) = walk(dir.path(), &mut idx, &mut visited);
+        let map = build_id_by_path(&idx);
+        let (added, refreshed) = walk(dir.path(), &mut idx, &map, &mut visited);
         assert_eq!(added, 0);
         assert_eq!(refreshed, 1);
         assert_eq!(
@@ -364,7 +378,8 @@ mod tests {
         );
         let mut idx = CachedHarnessIndex::empty();
         let mut visited = HashSet::new();
-        walk(dir.path(), &mut idx, &mut visited);
+        let map = build_id_by_path(&idx);
+        walk(dir.path(), &mut idx, &map, &mut visited);
         assert_eq!(idx.sessions_by_id.len(), 1);
         assert_eq!(
             idx.sessions_by_id["01900000-0000-7000-8000-000000000001"].cwds,
@@ -378,7 +393,8 @@ mod tests {
         write_pi_session(dir.path(), "session.jsonl", "not json");
         let mut idx = CachedHarnessIndex::empty();
         let mut visited = HashSet::new();
-        walk(dir.path(), &mut idx, &mut visited);
+        let map = build_id_by_path(&idx);
+        walk(dir.path(), &mut idx, &map, &mut visited);
         assert!(idx.sessions_by_id.is_empty());
     }
 
