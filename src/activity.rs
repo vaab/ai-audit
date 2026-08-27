@@ -1360,6 +1360,8 @@ fn collect_all_activity_events(
     }
 
     strip_preload_permissions(&mut all_events);
+    strip_configured_noise(&mut all_events, config.activity_noise_filters());
+    strip_noisy_titled_sessions(&mut all_events, config.session_title_noise_filters());
     all_events.sort_by_key(|event| event.timestamp);
     log::debug!(
         "collect_all_activity_events: {} events in {:?}",
@@ -1694,6 +1696,101 @@ fn strip_preload_permissions(events: &mut Vec<ActivityEvent>) {
             None => true,
         }
     });
+}
+
+/// Remove message events whose content matches a configured
+/// `activity-noise-filters` regex.
+///
+/// Many sessions are started by machines rather than by a human at a
+/// keyboard: the vigil-watch scheduler fires cron-driven tasks, Layer-3
+/// data-flow stations spawn a session per item, and hooks inject
+/// `<system-reminder>` blocks mid-conversation.  Each of those writes a
+/// *user-role* message, so they are indistinguishable from typing at the
+/// message level — but their content is fixed boilerplate.  Matching that
+/// boilerplate is what separates them.
+///
+/// Patterns are matched against the raw content, so anchor with `^` to
+/// target an opening preamble.  Only `Message` events are considered:
+/// permission events carry rule names, not prose, and are handled by
+/// [`strip_preload_permissions`].
+fn strip_configured_noise(events: &mut Vec<ActivityEvent>, patterns: &[regex::Regex]) {
+    if patterns.is_empty() {
+        return;
+    }
+
+    let before = events.len();
+    events.retain(|event| match &event.data {
+        ActivityData::Message { content } => !patterns.iter().any(|re| re.is_match(content)),
+        _ => true,
+    });
+
+    let dropped = before - events.len();
+    if dropped > 0 {
+        log::debug!(
+            "strip_configured_noise: dropped {} of {} events via {} pattern(s)",
+            dropped,
+            before,
+            patterns.len()
+        );
+    }
+}
+
+/// Drop every event belonging to a session whose *title* matches a
+/// configured `session-title-noise-filters` regex.
+///
+/// Complements [`strip_configured_noise`], which matches message
+/// content: some machine-driven sessions have no fixed prompt to match
+/// on, but the process that created them marks the session itself.
+/// vigil-watch's scheduler is the motivating case — it prefixes every
+/// scheduled session's title with `⊙ ` (U+2299), so one pattern
+/// retires a whole class of automation, including future tasks whose
+/// prompts nobody has seen yet.
+///
+/// Titles are read fresh from the OpenCode DB rather than from the
+/// session-index cache: the marker is applied *asynchronously* once
+/// opencode's title-generating LLM finishes, so a cached title can
+/// predate the prefix and would silently miss.
+///
+/// Sessions with no title, and providers that record none, are always
+/// kept — absence of a title is not evidence of automation.
+fn strip_noisy_titled_sessions(events: &mut Vec<ActivityEvent>, patterns: &[regex::Regex]) {
+    if patterns.is_empty() || events.is_empty() || !crate::opencode::db::db_exists() {
+        return;
+    }
+
+    let Ok(conn) = crate::opencode::db::open_db() else {
+        log::warn!("session-title-noise-filters: cannot open opencode DB; skipping title filter");
+        return;
+    };
+    let Ok(sessions) = crate::opencode::db::list_sessions_from_conn(&conn) else {
+        log::warn!("session-title-noise-filters: cannot list sessions; skipping title filter");
+        return;
+    };
+
+    // Only the sessions whose title matches — typically a small set
+    // relative to the full session list.
+    let noisy: std::collections::HashSet<String> = sessions
+        .into_iter()
+        .filter(|s| !s.title.is_empty() && patterns.iter().any(|re| re.is_match(&s.title)))
+        .map(|s| s.session_id)
+        .collect();
+
+    if noisy.is_empty() {
+        return;
+    }
+
+    let before = events.len();
+    events.retain(|event| !noisy.contains(&event.session_id));
+
+    let dropped = before - events.len();
+    if dropped > 0 {
+        log::debug!(
+            "strip_noisy_titled_sessions: dropped {} of {} events across {} titled session(s)",
+            dropped,
+            before,
+            noisy.len()
+        );
+    }
 }
 
 /// Filter for which activities to include
@@ -2592,6 +2689,151 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, "ses_abc123");
+    }
+
+    /// Build a `Message` activity event with the given content.
+    fn noise_msg(timestamp: i64, content: &str) -> ActivityEvent {
+        ActivityEvent {
+            timestamp,
+            ident: "opencode-msg@project".to_string(),
+            session_id: "ses_test".to_string(),
+            activity_type: ActivityType::Message,
+            data: ActivityData::Message {
+                content: content.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_strip_configured_noise_drops_matching_content() {
+        let config = crate::config::Config::with_noise_filters(&[r"^Process inbox and outbox"]);
+        let mut events = vec![
+            noise_msg(100, "Process inbox and outbox/answered"),
+            noise_msg(200, "why is the build failing?"),
+        ];
+
+        strip_configured_noise(&mut events, config.activity_noise_filters());
+
+        assert_eq!(events.len(), 1);
+        match &events[0].data {
+            ActivityData::Message { content } => assert_eq!(content, "why is the build failing?"),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strip_configured_noise_matches_across_newlines() {
+        // The weather-cron prompt is multiline; a pattern anchored on
+        // its first line must still match the whole content.
+        let config =
+            crate::config::Config::with_noise_filters(&[r"^You are a deterministic-helper-runner"]);
+        let mut events = vec![noise_msg(
+            100,
+            "You are a deterministic-helper-runner firing on a recurring cron.\n\nStep 1: run it.",
+        )];
+
+        strip_configured_noise(&mut events, config.activity_noise_filters());
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_strip_configured_noise_preserves_short_human_replies() {
+        // Regression guard: short replies the user actually types are
+        // high-frequency too, but they are NOT noise.
+        let config = crate::config::Config::with_noise_filters(&[
+            r"^You have an input item to process\. Follow your system instructions",
+            r"^Run a commit pass\.",
+            r"^Commit any changes",
+            r"^<system-reminder>",
+        ]);
+        let human = ["continue", "proceed", "commit", "ok", "done", "yes"];
+        let mut events: Vec<ActivityEvent> = human
+            .iter()
+            .enumerate()
+            .map(|(i, c)| noise_msg(i as i64, c))
+            .collect();
+        let expected = events.len();
+
+        strip_configured_noise(&mut events, config.activity_noise_filters());
+
+        assert_eq!(events.len(), expected, "human replies must survive");
+    }
+
+    #[test]
+    fn test_strip_configured_noise_empty_config_is_noop() {
+        let config = crate::config::Config::with_noise_filters(&[]);
+        let mut events = vec![noise_msg(100, "anything at all")];
+
+        strip_configured_noise(&mut events, config.activity_noise_filters());
+
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_strip_configured_noise_skips_invalid_pattern() {
+        // An unclosed group is invalid; it must be skipped (with a
+        // warning) rather than aborting, and the valid one still applies.
+        let config = crate::config::Config::with_noise_filters(&["(unclosed", r"^drop me"]);
+        assert_eq!(config.activity_noise_filters().len(), 1);
+
+        let mut events = vec![noise_msg(100, "drop me now"), noise_msg(200, "keep me")];
+        strip_configured_noise(&mut events, config.activity_noise_filters());
+
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_strip_configured_noise_leaves_permission_events() {
+        // Permission payloads carry rule names, not prose: a content
+        // pattern must never reach them.
+        let config = crate::config::Config::with_noise_filters(&[r".*"]);
+        let mut events = vec![ActivityEvent {
+            timestamp: 100,
+            ident: "opencode-perm@project".to_string(),
+            session_id: "ses_test".to_string(),
+            activity_type: ActivityType::Permission,
+            data: ActivityData::Permission {
+                rules: vec!["Bash(ls)".to_string()],
+            },
+        }];
+
+        strip_configured_noise(&mut events, config.activity_noise_filters());
+
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_session_title_filter_matches_scheduled_marker() {
+        // vigil-watch prefixes scheduled-session titles with U+2299
+        // CIRCLED DOT OPERATOR followed by a space.
+        let config = crate::config::Config::with_session_title_filters(&["^\u{2299} "]);
+        let pats = config.session_title_noise_filters();
+        assert_eq!(pats.len(), 1);
+
+        assert!(pats[0].is_match("⊙ Process inbox and outbox"));
+        assert!(pats[0].is_match("⊙ Health inbox processing"));
+        // Not scheduled: ordinary titles and the default placeholder.
+        assert!(!pats[0].is_match("Add scroll shadows to sidebars"));
+        assert!(!pats[0].is_match("New session - 2026-08-19T19:30:43.109Z"));
+        // The glyph must be a prefix, not merely present.
+        assert!(!pats[0].is_match("why does ⊙ show up in titles?"));
+    }
+
+    #[test]
+    fn test_session_title_filter_empty_is_noop() {
+        let config = crate::config::Config::with_session_title_filters(&[]);
+        let mut events = vec![noise_msg(100, "anything")];
+
+        strip_noisy_titled_sessions(&mut events, config.session_title_noise_filters());
+
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_session_title_filter_skips_invalid_pattern() {
+        let config = crate::config::Config::with_session_title_filters(&["(unclosed", "^⊙ "]);
+        assert_eq!(config.session_title_noise_filters().len(), 1);
     }
 
     #[test]

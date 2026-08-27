@@ -24,6 +24,24 @@ pub struct Config {
     #[serde(skip)]
     path_rules: Vec<PathRule>,
 
+    /// Regex patterns identifying machine-generated message content.
+    /// Raw (uncompiled) form as read from the config file.
+    #[serde(rename = "activity-noise-filters", default)]
+    activity_noise_filters_raw: Vec<String>,
+
+    /// Compiled noise filters
+    #[serde(skip)]
+    activity_noise_filters: Vec<Regex>,
+
+    /// Regex patterns matched against a session's *title*; every event
+    /// of a matching session is dropped.  Raw (uncompiled) form.
+    #[serde(rename = "session-title-noise-filters", default)]
+    session_title_noise_filters_raw: Vec<String>,
+
+    /// Compiled session-title filters
+    #[serde(skip)]
+    session_title_noise_filters: Vec<Regex>,
+
     /// Provider-specific config blocks parsed lazily by providers.
     #[serde(flatten, default)]
     pub provider_blocks: HashMap<String, Value>,
@@ -87,12 +105,57 @@ impl Config {
         }
 
         self.path_rules = rules;
+        self.compile_noise_filters();
         Ok(())
+    }
+
+    /// Compile the `activity-noise-filters` regexes.
+    ///
+    /// An invalid pattern is warned about and skipped rather than
+    /// aborting the load: one malformed entry must not take down
+    /// every other activity query.
+    fn compile_noise_filters(&mut self) {
+        self.activity_noise_filters =
+            Self::compile_patterns(&self.activity_noise_filters_raw, "activity-noise-filter");
+        self.session_title_noise_filters = Self::compile_patterns(
+            &self.session_title_noise_filters_raw,
+            "session-title-noise-filter",
+        );
+    }
+
+    /// Compile a list of user-supplied regexes, warning about and
+    /// skipping any that are malformed.
+    fn compile_patterns(raw: &[String], label: &str) -> Vec<Regex> {
+        raw.iter()
+            .filter_map(|pattern| match Regex::new(pattern) {
+                Ok(regex) => Some(regex),
+                Err(e) => {
+                    log::warn!("Invalid {} pattern '{}': {}", label, pattern, e);
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Get compiled path rules
     pub fn path_rules(&self) -> &[PathRule] {
         &self.path_rules
+    }
+
+    /// Compiled patterns matching machine-generated message content.
+    ///
+    /// A message whose content matches ANY of these is dropped from
+    /// activity output — see `activity::strip_configured_noise`.
+    pub fn activity_noise_filters(&self) -> &[Regex] {
+        &self.activity_noise_filters
+    }
+
+    /// Compiled patterns matched against session titles.
+    ///
+    /// Every event of a session whose title matches is dropped — see
+    /// `activity::strip_noisy_titled_sessions`.
+    pub fn session_title_noise_filters(&self) -> &[Regex] {
+        &self.session_title_noise_filters
     }
 
     pub fn provider_block(&self, key: &str) -> Option<&Value> {
@@ -152,8 +215,34 @@ impl Config {
         Ok(Self {
             path_rules_raw: Vec::new(),
             path_rules: compiled_rules,
+            activity_noise_filters_raw: Vec::new(),
+            activity_noise_filters: Vec::new(),
+            session_title_noise_filters_raw: Vec::new(),
+            session_title_noise_filters: Vec::new(),
             provider_blocks: HashMap::new(),
         })
+    }
+
+    /// Create a config with specific noise filters (for testing).
+    #[cfg(test)]
+    pub fn with_noise_filters(patterns: &[&str]) -> Self {
+        let mut config = Self {
+            activity_noise_filters_raw: patterns.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        config.compile_noise_filters();
+        config
+    }
+
+    /// Create a config with specific session-title filters (for testing).
+    #[cfg(test)]
+    pub fn with_session_title_filters(patterns: &[&str]) -> Self {
+        let mut config = Self {
+            session_title_noise_filters_raw: patterns.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        config.compile_noise_filters();
+        config
     }
 }
 
