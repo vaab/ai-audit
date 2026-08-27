@@ -12,6 +12,7 @@ pub mod config;
 pub mod db;
 pub mod enrich;
 pub mod info;
+pub mod latency;
 pub mod nudge;
 pub mod permissions;
 pub mod server_client;
@@ -73,6 +74,13 @@ impl SessionProvider for OpenCodeProvider {
 
     fn list_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         self::list_messages(session_id)
+    }
+
+    fn message_part_latencies(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::provider::MessagePartLatencies> {
+        latency::message_part_latencies(session_id)
     }
 
     fn resolve_attribution(&self, session_id: &str) -> Result<ModelAttribution> {

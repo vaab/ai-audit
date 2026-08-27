@@ -168,9 +168,11 @@ fn build_opencode_db(home: &Path) {
     .unwrap();
 
     // One text part + one completed tool part inside the assistant
-    // message.  Note: no part.time.start — the parser will fall
-    // back to msg.time.created for the tool, which is exactly the
-    // production shape the zero-pair filter is designed to skip.
+    // message.  Note: no part-level `time.start` / `time.end` — the
+    // "untimed" production shape that exercises the fallback path
+    // (part-walking returns no override, so token_usage falls back
+    // to the transcript-walked wall-clock; for opencode, the
+    // per-harness mapping then sets `llm_generation_s = None`).
     conn.execute(
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
          VALUES ('prt_text', 'msg_a', 'ses_gentest1', 1700000002100, 1700000002100, ?1)",
@@ -185,13 +187,84 @@ fn build_opencode_db(home: &Path) {
     .unwrap();
 }
 
+/// Phase-B opencode fixture: same shape as `build_opencode_db` but
+/// with per-part `time.start` / `time.end` populated, exercising the
+/// part-walking path that derives clean `llm_generation_s` and a
+/// non-null `tool_latency_s_before` from intra-message tool parts.
+fn build_opencode_db_with_part_timing(home: &Path) {
+    let db_dir = home.join(".local/share/opencode");
+    fs::create_dir_all(&db_dir).unwrap();
+    let conn = Connection::open(db_dir.join("opencode.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(OPENCODE_SCHEMA).unwrap();
+
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated) \
+         VALUES ('ses_gentest2', 'proj_1', NULL, '/home/u/oc-proj', 'gen test 2', 1700000000000, 1700000020000)",
+        [],
+    )
+    .unwrap();
+
+    // User @ 1700000001000.
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_u', 'ses_gentest2', 1700000001000, 1700000001000, ?1)",
+        params![r#"{"role":"user","time":{"created":1700000001000}}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_user', 'msg_u', 'ses_gentest2', 1700000001000, 1700000001000, ?1)",
+        params![r#"{"type":"text","text":"please run the tool","time":{"start":1700000001000,"end":1700000001000}}"#],
+    )
+    .unwrap();
+
+    // Assistant @ 1700000002000 (start) / 1700000010000 (end).
+    // 8 s total wall-clock for the message; per parts:
+    //   - text part [2000..3000]   = 1.0 s  → llm_generation_s
+    //   - tool part [3000..7000]   = 4.0 s  → tool_latency_s_before
+    //   - text part [7000..10000]  = 3.0 s  → llm_generation_s
+    // Expected: llm_generation_s = 4.0, tool_latency_s_before = 4.0.
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_a', 'ses_gentest2', 1700000002000, 1700000010000, ?1)",
+        params![r#"{"role":"assistant","time":{"created":1700000002000,"completed":1700000010000},"agent":"build","providerID":"anthropic","modelID":"claude-opus-4-7","tokens":{"input":100,"output":50,"cache":{"read":0,"write":0}}}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_t1', 'msg_a', 'ses_gentest2', 1700000002000, 1700000003000, ?1)",
+        params![
+            r#"{"type":"text","text":"reading","time":{"start":1700000002000,"end":1700000003000}}"#
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_tool', 'msg_a', 'ses_gentest2', 1700000003000, 1700000007000, ?1)",
+        params![r#"{"type":"tool","tool":"bash","state":{"status":"completed","output":"ok"},"time":{"start":1700000003000,"end":1700000007000}}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_t2', 'msg_a', 'ses_gentest2', 1700000007000, 1700000010000, ?1)",
+        params![
+            r#"{"type":"text","text":"done","time":{"start":1700000007000,"end":1700000010000}}"#
+        ],
+    )
+    .unwrap();
+}
+
 #[test]
-fn opencode_records_have_llm_generation_s_null() {
-    // opencode: Message.timestamp = time.created (message START).
-    // Tools execute as parts INSIDE the message, so
-    // response_wall_clock_s mixes LLM + tool time and CANNOT be
-    // reused as `llm_generation_s`.  The C-phase contract is:
-    // opencode `llm_generation_s` is `null` (pending part-walking).
+fn opencode_records_without_part_timing_have_llm_generation_s_null() {
+    // When opencode parts have no `time.start` / `time.end` (older
+    // sessions, server-crash mid-emit), the part-walking override
+    // is absent and we fall back to the transcript-walked
+    // wall-clock.  The per-harness mapping then forces
+    // `llm_generation_s = None` for opencode — we MUST NOT copy
+    // wall-clock into generation time for opencode, because that
+    // wall-clock measures user-input → model-started and would
+    // include bundled tool runtime.
     let home = tempdir().unwrap();
     build_opencode_db(home.path());
 
@@ -245,8 +318,9 @@ fn opencode_records_have_llm_generation_s_null() {
         rec
     );
 
-    // llm_generation_s must be `null` for opencode in phase C — the
-    // clean signal is not yet derivable through the unified
+    // llm_generation_s must be `null` for opencode when no part
+    // timing exists — the clean signal is not derivable through the
+    // unified
     // TranscriptEntry API.  This is the cross-harness contract: the
     // field name carries a uniform promise, and we honour it by
     // emitting `null` rather than a misleading copy of the wall-clock.
@@ -258,6 +332,76 @@ fn opencode_records_have_llm_generation_s_null() {
 
     // Field was renamed: the obsolete `llm_latency_s` key must not
     // reappear in a future regression.
+    assert!(
+        rec.get("llm_latency_s").is_none(),
+        "field renamed; `llm_latency_s` must not appear:\n{}",
+        rec
+    );
+}
+
+#[test]
+fn opencode_records_with_part_timing_have_part_attributed_latencies() {
+    // Phase-B contract: when opencode supplies part-level
+    // `time.start` / `time.end`, `llm_generation_s` carries the sum
+    // of text+reasoning part durations, and `tool_latency_s_before`
+    // carries the sum of tool-part durations — BOTH are derived
+    // from the same authoritative source (the opencode SQLite
+    // store).  The transcript-walked wall-clock
+    // (`response_wall_clock_s`) remains available as a separate
+    // field for diagnostics.
+    let home = tempdir().unwrap();
+    build_opencode_db_with_part_timing(home.path());
+
+    let output = Command::cargo_bin("ai-audit")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env_remove("OPENCODE_SESSION_ID")
+        .env_remove("CLAUDE_SESSION_ID")
+        .env_remove("PI_SESSION_ID")
+        .args([
+            "token-usage",
+            "2023-11-14T22:13:00Z..2023-11-14T22:14:00Z",
+            "-j",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected 1 record:\n{}", stdout);
+
+    let rec: Value = serde_json::from_str(lines[0]).unwrap();
+
+    // Fixture: text 1s + tool 4s + text 3s.
+    // llm_generation_s   = 1 + 3 = 4.0
+    // tool_latency_s_before = 4.0
+    // response_wall_clock_s = msg.timestamp − last input marker:
+    //   user.text part is at 1700000001000 (start=end), assistant
+    //   message starts at 1700000002000 → wall-clock = 1.0 s.
+    assert_eq!(
+        rec.get("llm_generation_s").and_then(|v| v.as_f64()),
+        Some(4.0),
+        "opencode part-attributed llm_generation_s should be 4.0 \
+         (sum of text+reasoning part durations):\n{}",
+        rec
+    );
+    assert_eq!(
+        rec.get("tool_latency_s_before").and_then(|v| v.as_f64()),
+        Some(4.0),
+        "opencode part-attributed tool_latency_s_before should be 4.0:\n{}",
+        rec
+    );
+    assert_eq!(
+        rec.get("response_wall_clock_s").and_then(|v| v.as_f64()),
+        Some(1.0),
+        "opencode response_wall_clock_s should stay at 1.0 \
+         (transcript-walked wall-clock, NOT replaced by part data):\n{}",
+        rec
+    );
+
+    // Regression guard: the obsolete field must not be present.
     assert!(
         rec.get("llm_latency_s").is_none(),
         "field renamed; `llm_latency_s` must not appear:\n{}",

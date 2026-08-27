@@ -87,11 +87,12 @@ pub enum Field {
     /// - pi + claudecode: equal to `response_wall_clock_s` (their
     ///   `Message.timestamp` is the *end* of the assistant turn and
     ///   tools execute between turns, so the wall-clock IS the
-    ///   generation time).
-    /// - opencode: currently `null` — requires per-harness
-    ///   derivation from part-level `time.start` / `time.end` data
-    ///   in the opencode SQLite store.  Tracked as the next step in
-    ///   the token-warden TODO (admin.org).
+    ///   generation time).  Derived from the unified transcript.
+    /// - opencode: sum of `(time.end - time.start)` over
+    ///   `text` + `reasoning` parts of the message, as derived by
+    ///   [`crate::opencode::latency::message_part_latencies`].
+    ///   `null` when opencode did not record part-level timing for
+    ///   this message (older sessions, server-crash mid-emit).
     ///
     /// This is the field downstream KPIs ("seconds per generated
     /// token", "provider latency drift") should use.  It is `null`
@@ -105,19 +106,20 @@ pub enum Field {
     /// intervened or all intervening pairs were zero-width (see
     /// below).  `ToolError` closes a gap identically to `ToolResult`.
     ///
-    /// **Cross-harness semantics caveat:**
-    /// - pi + claudecode: `tool_use` lands on the prior assistant
-    ///   message, `tool_result` lands in the next user-role message
-    ///   between turns — the gap is a clean tool-runtime measurement.
-    /// - opencode: when `part.time.start`/`part.time.end` are null in
-    ///   the source data, opencode's transcript parser collapses
-    ///   both `tool_use` and `tool_result` to `msg.time.created`,
-    ///   producing zero-width pairs that we deliberately *skip*
-    ///   (treated as "no signal" rather than "0-second tool").  When
-    ///   ALL of a message's intervening pairs are zero-width, the
-    ///   field is `null`.  Opencode-side part-walking (planned with
-    ///   `llm_generation_s`) will populate this field with the sum
-    ///   of intra-message tool-part durations.
+    /// **Cross-harness semantics:**
+    /// - pi + claudecode: derived from the transcript — `tool_use`
+    ///   lands on the prior assistant message, `tool_result` lands
+    ///   in the next user-role message between turns; the gap is a
+    ///   clean tool-runtime measurement.
+    /// - opencode: derived from part-level `time.start` / `time.end`
+    ///   data by [`crate::opencode::latency::message_part_latencies`]
+    ///   — sum of durations over `tool` parts inside the assistant
+    ///   message.  Replaces the previous transcript-fallback that
+    ///   was always-null for opencode (the transcript collapses
+    ///   part timestamps to `msg.time.created`, producing
+    ///   zero-width pairs the derivation rejected as "no signal").
+    ///   `null` when opencode did not record part-level timing for
+    ///   this message's tool parts.
     ToolLatencyBeforeS,
 }
 
@@ -850,8 +852,31 @@ pub fn run(
         // a HashMap because the list is tiny per session and ordered
         // scans are cheaper than hashing chrono types.
         type LatencyPair = (Option<f64>, Option<f64>);
-        let latency_by_ts: Vec<(DateTime<chrono::Utc>, LatencyPair)> =
+        let wall_clock_by_ts: Vec<(DateTime<chrono::Utc>, LatencyPair)> =
             assistant_ts.into_iter().zip(latencies).collect();
+
+        // Part-attributed per-message latency from the harness's
+        // native part-level timing (only opencode currently overrides
+        // the default empty map).  When a key is present, its value
+        // is the AUTHORITATIVE per-message (`llm_generation_s`,
+        // `tool_latency_s_before`).  When absent, fall back to the
+        // transcript-walked wall-clock below.
+        //
+        // On failure we proceed with an empty map rather than
+        // dropping the session's token events — same containment
+        // policy as `parse_transcript`.
+        let part_latencies = match provider_adapter.message_part_latencies(&session.base.session_id)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "Part-attributed latency skipped for session {}: {}",
+                    session.base.session_id,
+                    e
+                );
+                std::collections::HashMap::new()
+            }
+        };
 
         for msg in messages {
             if !message_passes_filters(&msg, start_utc, end_utc, &provider_ids, &models) {
@@ -864,29 +889,48 @@ pub fn run(
             if tokens.is_empty() {
                 continue;
             }
-            let (response_wall_clock_s, tool_latency_s_before) = latency_by_ts
+            let (response_wall_clock_s, tool_latency_s_before_from_transcript) = wall_clock_by_ts
                 .iter()
                 .find(|(ts, _)| *ts == msg.timestamp)
                 .map(|(_, lat)| *lat)
                 .unwrap_or((None, None));
-            // Cross-harness `llm_generation_s` mapping.  Lives here
-            // (the call site) rather than inside `derive_latencies`
-            // so the derivation stays pure and per-harness policy
-            // is one switch:
-            // - pi + claudecode: `Message.timestamp` = end of
-            //   assistant turn, tools execute in a separate
-            //   user-role turn between messages.  So wall-clock IS
-            //   generation time.
-            // - opencode: `Message.timestamp = time.created` (start),
-            //   tools execute as parts INSIDE the message.  The
-            //   clean generation signal requires walking opencode's
-            //   part-level `time.start`/`time.end` data — not yet
-            //   implemented.  Emit `None` rather than a misleading
-            //   approximation.  Tracked in admin.org.
-            let llm_generation_s = match msg.provider {
-                Provider::Pi | Provider::ClaudeCode => response_wall_clock_s,
-                Provider::OpenCode => None,
-            };
+
+            // Resolve the cross-harness-uniform `llm_generation_s`
+            // and the final `tool_latency_s_before` value.
+            //
+            // Precedence ladder (per the provider trait contract):
+            // 1. Part-attributed value when the provider supplied one
+            //    for this message timestamp.  This is authoritative
+            //    and overrides the transcript-walked value entirely
+            //    — mixing the two for the same message would conflate
+            //    "sum of tool-part durations" with "between-turn
+            //    wall-clock," which is the cross-harness confusion
+            //    we are trying to retire.
+            // 2. Fallback to the transcript-walked wall-clock.
+            //    Whether the wall-clock approximates clean LLM time
+            //    is harness-defined:
+            //    - pi + claudecode: yes (`Message.timestamp` is the
+            //      end of the assistant turn; tools execute between
+            //      turns).
+            //    - opencode: no — but opencode always provides a
+            //      part-attributed override (so we never hit this
+            //      branch for opencode messages that have any
+            //      part-level timing).  Opencode messages with NO
+            //      part-level timing fall through here with
+            //      `llm_generation_s = None` to keep the wire
+            //      contract ("opencode never returns wall-clock as
+            //      llm_generation_s").
+            let (llm_generation_s, tool_latency_s_before) =
+                if let Some((gen_override, tool_override)) = part_latencies.get(&msg.timestamp) {
+                    (*gen_override, *tool_override)
+                } else {
+                    let gen = match msg.provider {
+                        Provider::Pi | Provider::ClaudeCode => response_wall_clock_s,
+                        Provider::OpenCode => None,
+                    };
+                    (gen, tool_latency_s_before_from_transcript)
+                };
+
             events.push(TokenEvent {
                 timestamp: msg.timestamp,
                 session_id: msg.session_id,

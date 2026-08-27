@@ -13,6 +13,14 @@ use std::ops::Add;
 
 use crate::transcript::TranscriptEntry;
 
+/// `(llm_generation_s, tool_latency_s_before)` for a single assistant
+/// message.  `None` for either field means "no signal" (see
+/// [`SessionProvider::message_part_latencies`] for the contract).
+pub type MessageLatencyPair = (Option<f64>, Option<f64>);
+
+/// Map from `Message.timestamp` to its per-message latency pair.
+pub type MessagePartLatencies = std::collections::HashMap<DateTime<Utc>, MessageLatencyPair>;
+
 /// AI assistant provider identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -335,6 +343,37 @@ pub trait SessionProvider {
     /// Returns messages in chronological order. Token data is present on
     /// assistant messages; user messages have `tokens: None`.
     fn list_messages(&self, session_id: &str) -> Result<Vec<Message>>;
+
+    /// Optional per-assistant-message latency breakdown derived from
+    /// harness-native part-level timing data, keyed by
+    /// `Message.timestamp` (matches `list_messages()`).
+    ///
+    /// The tuple is `(llm_generation_s, tool_latency_s_before)` with
+    /// the same uniform meaning across harnesses:
+    /// - `llm_generation_s`: wall-clock seconds the LLM spent
+    ///   producing this message's text + reasoning output (tool
+    ///   execution time excluded).
+    /// - `tool_latency_s_before`: wall-clock seconds tools ran on
+    ///   behalf of this message.  For pi + claudecode this is the
+    ///   sum over the *previous* between-turns tool window; for
+    ///   opencode this is the sum over intra-message tool parts.
+    ///   In both cases the value attributes tool runtime to the
+    ///   assistant message that issued the calls.
+    ///
+    /// Default implementation returns an empty map, signalling
+    /// "no part-level data — caller should use the transcript-walked
+    /// fallback."  Implementations override this when the harness
+    /// records per-part `time.start` / `time.end` data that the
+    /// unified `TranscriptEntry` shape would lose.
+    ///
+    /// Keys that are missing from the returned map (e.g. a message
+    /// with no part-timed entries) MUST be treated by the caller as
+    /// "no override" — NOT as "explicit null".  Use
+    /// `Some(LatencyPair(None, None))` if a harness genuinely wants
+    /// to suppress the transcript-fallback for a specific message.
+    fn message_part_latencies(&self, _session_id: &str) -> Result<MessagePartLatencies> {
+        Ok(std::collections::HashMap::new())
+    }
 
     /// Resolve attribution metadata for the most recent assistant
     /// activity in this session — i.e. who/what wrote the code.
