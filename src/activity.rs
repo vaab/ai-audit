@@ -300,7 +300,18 @@ fn scan_opencode_sessions_to_meta_from_db(config: &Config) -> Vec<SessionMeta> {
     }
     let conn = match crate::opencode::db::open_db() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            // Not silently empty: an unreadable store is "unknown",
+            // not "no sessions".  Callers that must not confuse the
+            // two (empty-segment coverage) query the DB through
+            // ``opencode_occupancy_bounds``, which fails hard.
+            log::warn!(
+                "opencode DB {} could not be opened ({}); OpenCode sessions omitted from this scan",
+                crate::opencode::db::db_path().display(),
+                e
+            );
+            return Vec::new();
+        }
     };
     scan_opencode_sessions_to_meta_from_conn(&conn, config)
 }
@@ -312,7 +323,10 @@ fn scan_opencode_sessions_to_meta_from_conn(
 ) -> Vec<SessionMeta> {
     let sessions = match crate::opencode::db::list_sessions_from_conn(conn) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            log::warn!("opencode session listing failed ({e}); OpenCode sessions omitted");
+            return Vec::new();
+        }
     };
 
     sessions
@@ -1466,6 +1480,122 @@ pub fn enumerate_files_for_ident(ident: &str, config: &Config) -> Vec<PathBuf> {
     let filter = parse_identifier_filter(&[ident.to_string()]);
     let index = build_session_index(config, &filter);
     enumerate_files_for_ident_with_index(ident, &index)
+}
+
+/// Conservative all-time occupancy for every OpenCode message ident,
+/// read from the SQLite store in a single query.
+///
+/// Returns `ident -> Bounds`.  Idents absent from the map have no
+/// message rows at all in the DB.
+///
+/// This replaces per-ident history rescans for the OpenCode provider:
+/// the whole store is summarised once, and the DB no longer has to
+/// appear in any per-ident cache fingerprint.
+///
+/// Fails closed.  Every error — missing DB, locked DB, unreadable row
+/// — propagates.  Callers MUST NOT treat a failure as "no activity":
+/// that would turn "I could not look" into "there is nothing there"
+/// and let a consumer record coverage over events that exist.
+///
+/// The DB is authoritative for current data but is NOT a superset of
+/// history: sessions predating the SQLite migration can exist only in
+/// the legacy `storage/message/<session>/*.json` tree.  Their
+/// timestamps are unioned in, so an ident's occupancy covers both
+/// backends.
+pub fn opencode_occupancy_bounds(
+    config: &Config,
+    index: &SessionIndex,
+) -> Result<HashMap<String, crate::empty_segments::Bounds>> {
+    let t = std::time::Instant::now();
+
+    if !crate::opencode::db::db_exists() {
+        anyhow::bail!(
+            "OpenCode database not found at {}",
+            crate::opencode::db::db_path().display()
+        );
+    }
+    let conn = crate::opencode::db::open_db()?;
+    let rows = crate::opencode::db::occupancy_rows_from_conn(&conn)?;
+
+    // Fold raw directories into idents.  Several raw directories can
+    // simplify to the same categ id, so bounds are unioned.
+    let mut by_ident: HashMap<String, crate::empty_segments::Bounds> = HashMap::new();
+    let mut simplified: HashMap<String, String> = HashMap::new();
+    let add =
+        |by_ident: &mut HashMap<String, crate::empty_segments::Bounds>, ident: String, ts: i64| {
+            let day = crate::empty_segments::day_of(ts);
+            by_ident
+                .entry(ident)
+                .and_modify(|b| {
+                    b.t_first = b.t_first.min(ts);
+                    b.t_last = b.t_last.max(ts);
+                    b.days.insert(day);
+                })
+                .or_insert_with(|| crate::empty_segments::Bounds {
+                    t_first: ts,
+                    t_last: ts,
+                    days: std::iter::once(day).collect(),
+                });
+        };
+
+    let db_rows = rows.len();
+    for row in rows {
+        let categ = match simplified.get(&row.directory) {
+            Some(c) => c.clone(),
+            None => {
+                let c = config.simplify_path(&row.directory);
+                simplified.insert(row.directory.clone(), c.clone());
+                c
+            }
+        };
+        add(
+            &mut by_ident,
+            ident_for(Provider::OpenCode, ActivityType::Message, &categ),
+            row.timestamp,
+        );
+    }
+
+    // Legacy file-storage sessions.  ``project_dir`` on the index is
+    // already simplified.  Only sessions absent from the DB can
+    // contribute anything new, but scanning all of them is cheap
+    // relative to the DB query and avoids depending on the two
+    // backends agreeing about session identity.
+    let mut legacy_stamps = 0usize;
+    for meta in index.non_child() {
+        if meta.provider != Provider::OpenCode {
+            continue;
+        }
+        let msg_dir = crate::opencode_data_dir()
+            .join("storage")
+            .join("message")
+            .join(&meta.id);
+        let ident = ident_for(Provider::OpenCode, ActivityType::Message, &meta.project_dir);
+        for path in list_json_files(&msg_dir) {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            if let Some(ms) = value
+                .get("time")
+                .and_then(|t| t.get("created"))
+                .and_then(|v| v.as_i64())
+            {
+                legacy_stamps += 1;
+                add(&mut by_ident, ident.clone(), ms.div_euclid(1000));
+            }
+        }
+    }
+
+    log::debug!(
+        "opencode_occupancy_bounds: {} idents from {} db rows + {} legacy stamps in {:?}",
+        by_ident.len(),
+        db_rows,
+        legacy_stamps,
+        t.elapsed()
+    );
+    Ok(by_ident)
 }
 
 pub fn fetch_all_event_timestamps_with_index(

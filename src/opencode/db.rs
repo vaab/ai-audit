@@ -58,6 +58,69 @@ pub fn open_db_rw_at(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// One `(raw session directory, message timestamp)` observation used
+/// to build conservative activity occupancy.
+///
+/// See [`occupancy_rows_from_conn`] for what "conservative" means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccupancyRow {
+    /// Raw `session.directory` — NOT yet simplified into a categ id.
+    pub directory: String,
+    /// `message.time_created`, in **seconds**.
+    pub timestamp: i64,
+}
+
+/// Every message timestamp of every root session, as a conservative
+/// occupancy signal for empty-segment computation.
+///
+/// This deliberately ignores `role`, part contents, `session.revert`
+/// and configured noise filters: it answers "could this identifier
+/// have had activity at this instant?", not "did it emit an event?".
+///
+/// Soundness argument — every real OpenCode message event
+///
+/// 1. belongs to a `message` row of a root session, and
+/// 2. is emitted at that row's `time_created`
+///
+/// so the real event timestamps are a SUBSET of what this returns.
+/// An empty interval computed from this set therefore cannot contain
+/// a real event.  Over-reporting only costs a future re-fetch, while
+/// under-reporting would let a caller record coverage over events
+/// that exist — the asymmetry this whole design is built around.
+///
+/// Reading `time_created` from the SQL column (rather than
+/// `data.time.created`, which the event reader uses) keeps the signal
+/// independent of JSON payload edits.  The two agree on every row of
+/// the current store.
+pub fn occupancy_rows_from_conn(conn: &Connection) -> Result<Vec<OccupancyRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.directory, m.time_created \
+             FROM session s JOIN message m ON m.session_id = s.id \
+             WHERE s.parent_id IS NULL \
+               AND s.directory IS NOT NULL AND s.directory <> '' \
+               AND m.time_created IS NOT NULL",
+        )
+        .context("Failed to prepare occupancy query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let directory: String = row.get(0)?;
+            let ms: i64 = row.get(1)?;
+            Ok(OccupancyRow {
+                directory,
+                timestamp: ms.div_euclid(1000),
+            })
+        })
+        .context("Failed to run occupancy query")?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("Failed to read an occupancy row")?);
+    }
+    Ok(out)
+}
+
 /// Report from a successful per-session row deletion.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbDeleteReport {
@@ -769,6 +832,94 @@ mod tests {
         let conn = setup_test_db();
         let sessions = list_sessions_from_conn(&conn).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn occupancy_rows_reports_seconds_for_root_sessions() {
+        let conn = setup_test_db();
+        insert_session(&conn, "ses_root", None, "/proj", "t", 0, 0);
+        insert_message(&conn, "msg_1", "ses_root", "user", 1_700_000_001_500);
+
+        let rows = occupancy_rows_from_conn(&conn).unwrap();
+        assert_eq!(
+            rows,
+            vec![OccupancyRow {
+                directory: "/proj".to_string(),
+                // 1_700_000_001_500 ms floors to 1_700_000_001 s.
+                timestamp: 1_700_000_001,
+            }]
+        );
+    }
+
+    #[test]
+    fn occupancy_rows_exclude_child_sessions() {
+        let conn = setup_test_db();
+        insert_session(&conn, "ses_root", None, "/proj", "t", 0, 0);
+        insert_session(&conn, "ses_kid", Some("ses_root"), "/proj", "t", 0, 0);
+        insert_message(&conn, "msg_1", "ses_kid", "user", 1_700_000_000_000);
+
+        assert!(occupancy_rows_from_conn(&conn).unwrap().is_empty());
+    }
+
+    /// The safety property the empty-segment protocol rests on:
+    /// occupancy must cover messages that emit NO event, so a
+    /// consumer never records coverage over a range that has any
+    /// message in it.
+    #[test]
+    fn occupancy_rows_are_a_superset_of_emitted_events() {
+        let conn = setup_test_db();
+        insert_session(&conn, "ses_root", None, "/proj", "t", 0, 0);
+
+        // Emits an event: user role + non-empty text part.
+        insert_message(&conn, "msg_evt", "ses_root", "user", 1_700_000_000_000);
+        insert_part(
+            &conn,
+            "prt_1",
+            "msg_evt",
+            "ses_root",
+            1_700_000_000_000,
+            r#"{"type":"text","text":"hello"}"#,
+        );
+
+        // Emits NO event (assistant role), and NO event (user with
+        // only whitespace text) — both must still occupy their
+        // instant.
+        insert_message(
+            &conn,
+            "msg_asst",
+            "ses_root",
+            "assistant",
+            1_700_000_100_000,
+        );
+        insert_message(&conn, "msg_blank", "ses_root", "user", 1_700_000_200_000);
+        insert_part(
+            &conn,
+            "prt_2",
+            "msg_blank",
+            "ses_root",
+            1_700_000_200_000,
+            r#"{"type":"text","text":"   "}"#,
+        );
+
+        let stamps: Vec<i64> = occupancy_rows_from_conn(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.timestamp)
+            .collect();
+
+        assert!(stamps.contains(&1_700_000_000));
+        assert!(stamps.contains(&1_700_000_100));
+        assert!(stamps.contains(&1_700_000_200));
+        assert_eq!(stamps.len(), 3);
+    }
+
+    #[test]
+    fn occupancy_rows_skip_sessions_without_a_directory() {
+        let conn = setup_test_db();
+        insert_session(&conn, "ses_nodir", None, "", "t", 0, 0);
+        insert_message(&conn, "msg_1", "ses_nodir", "user", 1_700_000_000_000);
+
+        assert!(occupancy_rows_from_conn(&conn).unwrap().is_empty());
     }
 
     #[test]

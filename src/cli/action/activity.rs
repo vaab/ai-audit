@@ -133,12 +133,29 @@ pub fn run(action: ActivityAction) -> Result<()> {
                     };
                     log::info!("activity get: scanning {} idents", requested_idents.len());
 
+                    // OpenCode message idents are summarised straight
+                    // from the DB (one query, fails closed) instead of
+                    // going through the file-fingerprint cache.  The
+                    // store is a single 15GB file shared by every such
+                    // ident and rewritten continuously, so including it
+                    // in a per-ident fingerprint invalidated all of
+                    // them on essentially every run — a 100% miss rate
+                    // that made the cache pure overhead.
+                    let db_bounds = if requested_idents.iter().any(|i| is_opencode_msg_ident(i)) {
+                        activity::opencode_occupancy_bounds(&config, &session_index)?
+                    } else {
+                        HashMap::new()
+                    };
+
                     let cache = empty_segments::Cache::new()?;
                     let mut cached_bounds = HashMap::new();
                     let mut misses = Vec::new();
                     let t_cache_scan = std::time::Instant::now();
 
                     for ident in &requested_idents {
+                        if is_opencode_msg_ident(ident) {
+                            continue;
+                        }
                         // Reuse the index built once above.  The
                         // per-ident ``_via_cache`` variant re-ran each
                         // harness's ``update_and_load`` (re-reading,
@@ -188,11 +205,20 @@ pub fn run(action: ActivityAction) -> Result<()> {
                         // Resolve bounds: cache hit → cached `Option<Bounds>`;
                         // miss → derive from freshly-scanned timestamps
                         // (`None` means "no events ever for this ident").
-                        let bounds_opt: Option<Bounds> = match cached_bounds.remove(ident) {
-                            Some(b) => b,
-                            None => fresh_timestamps
-                                .get(ident)
-                                .and_then(|timestamps| Bounds::from_timestamps(timestamps)),
+                        let bounds_opt: Option<Bounds> = if is_opencode_msg_ident(ident) {
+                            // Authoritative: absent from the summary
+                            // means the DB holds no message row for
+                            // this ident (a real "no events ever"),
+                            // never "the lookup failed" — a failed
+                            // lookup aborted the command above.
+                            db_bounds.get(ident).cloned()
+                        } else {
+                            match cached_bounds.remove(ident) {
+                                Some(b) => b,
+                                None => fresh_timestamps
+                                    .get(ident)
+                                    .and_then(|timestamps| Bounds::from_timestamps(timestamps)),
+                            }
                         };
 
                         // Save cache for every miss — including `None`
@@ -283,6 +309,16 @@ pub fn run(action: ActivityAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether `ident` is an OpenCode *message* identifier.
+///
+/// Those are the idents whose empty-segment bounds come from the
+/// SQLite summary rather than the file-fingerprint cache.  OpenCode
+/// *permission* idents (if ever added) are deliberately excluded:
+/// they are not covered by the message-row occupancy query.
+fn is_opencode_msg_ident(ident: &str) -> bool {
+    ident.starts_with("opencode-msg@")
 }
 
 /// Load NUL-separated identifiers from a file or stdin.
